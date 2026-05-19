@@ -73,6 +73,7 @@ module riscv_core_4wide (
     logic replay_seen;
     logic [31:0] redirect_target;
     logic [31:0] replay_target;
+    logic [31:0] sequential_next_pc;
     logic [31:0] load_data_formatted;
 
     assign halted = halted_q;
@@ -81,6 +82,7 @@ module riscv_core_4wide (
     assign instr_stall = !rst_l || stall_core || halt_pending_q || halted_q;
     assign instr_addr = {pc_q[31:4], 2'b00};
     assign fetch_lane_offset = fetch_pc_pipe_q[1][3:2];
+    assign sequential_next_pc = {pc_q[31:4], 4'b0} + 32'd16;
 
     register_file #(.WAYS(WAYS), .FORWARD(0)) RF (
         .clk,
@@ -127,7 +129,8 @@ module riscv_core_4wide (
             decode_lanes[i].pc = fetch_lanes[i].pc;
             decode_lanes[i].instr = fetch_lanes[i].instr;
             decode_lanes[i].ctrl = lane_ctrl[i];
-            decode_lanes[i].rs1 = fetch_lanes[i].instr[19:15];
+            decode_lanes[i].rs1 = lane_ctrl[i].syscall ? 5'd10 :
+                fetch_lanes[i].instr[19:15];
             decode_lanes[i].rs2 = fetch_lanes[i].instr[24:20];
             decode_lanes[i].rd = fetch_lanes[i].instr[11:7];
             decode_lanes[i].imm = immediate_for(lane_ctrl[i].imm_mode,
@@ -158,8 +161,8 @@ module riscv_core_4wide (
         memory_seen = 1'b0;
         redirect_seen = 1'b0;
         replay_seen = 1'b0;
-        redirect_target = pc_q + 32'd16;
-        replay_target = pc_q + 32'd16;
+        redirect_target = sequential_next_pc;
+        replay_target = sequential_next_pc;
         rf_rd = '0;
         rf_rd_data = '0;
         rf_rd_we = '0;
@@ -188,7 +191,7 @@ module riscv_core_4wide (
                 load_pending_next = 1'b0;
             end
         end else if (!halted_q) begin
-            pc_next = pc_q + 32'd16;
+            pc_next = sequential_next_pc;
 
             for (int i = 0; i < WAYS; i += 1) begin
                 lane_is_memory[i] = decode_lanes[i].ctrl.memRead ||
@@ -298,17 +301,6 @@ module riscv_core_4wide (
         end
     end
 
-`ifdef TRACE_PHASE2
-    always_ff @(posedge clk) begin
-        if (rst_l && $time < 5000) begin
-            $display("p2 t=%0t pc=%08x resp_pc=%08x valid=%b issue=%b replay_load=%b data_valid=%b data_en=%b daddr=%08x mask=%b instr=%08x_%08x_%08x_%08x",
-                $time, pc_q, fetch_pc_pipe_q[1], fetch_valid_pipe_q, issue_mask,
-                load_pending_q, data_load_valid, data_load_en, {data_addr, 2'b00},
-                data_store_mask, instr[0], instr[1], instr[2], instr[3]);
-        end
-    end
-`endif
-
     function automatic logic [31:0] immediate_for(imm_mode_t mode,
             logic [31:0] raw_instr);
         case (mode)
@@ -381,7 +373,8 @@ module riscv_core_4wide (
         lane_exceptions[lane_idx] = decode_lanes[lane_idx].ctrl.illegal_instr ||
             instr_mem_excpt;
         lane_halts[lane_idx] = decode_lanes[lane_idx].ctrl.syscall &&
-            (decode_lanes[lane_idx].instr == 32'h0000_0073);
+            (decode_lanes[lane_idx].instr == 32'h0000_0073) &&
+            (lane_rs1_value[lane_idx] == ECALL_ARG_HALT);
 
         if (decode_lanes[lane_idx].ctrl.memWrite) begin
             data_addr = alu_out[31:2];
