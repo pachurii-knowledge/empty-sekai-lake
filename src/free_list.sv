@@ -27,6 +27,7 @@ module free_list
     logic [$clog2(PHYS_REGS)-1:0] head_q, head_next;
     logic [$clog2(PHYS_REGS)-1:0] tail_q, tail_next;
     logic [$clog2(PHYS_REGS+1)-1:0] count_q, count_next;
+    logic [$clog2(PHYS_REGS+1)-1:0] restore_reclaim_count;
     logic [$clog2(OOO_WIDTH+1)-1:0] alloc_count;
     logic [$clog2(OOO_WIDTH+1)-1:0] free_count;
 
@@ -41,14 +42,16 @@ module free_list
             alloc_count += alloc_req[i];
             free_count += free_valid[i];
         end
-        can_allocate = (count_q >= alloc_count);
+        restore_reclaim_count = free_distance(restore_head, head_q);
+        can_allocate = (count_q >= OOO_WIDTH);
     end
 
     always_comb begin
         entries_next = entries_q;
         head_next = restore_valid ? restore_head : head_q;
-        tail_next = restore_valid ? restore_tail : tail_q;
-        count_next = restore_valid ? restore_count : count_q;
+        tail_next = tail_q;
+        count_next = restore_valid ?
+            (count_q + restore_reclaim_count) : count_q;
         alloc_valid = '0;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             alloc_prd[i] = '0;
@@ -63,16 +66,26 @@ module free_list
                     count_next = count_next - 1'b1;
                 end
             end
+        end
 
-            for (int i = 0; i < OOO_WIDTH; i += 1) begin
-                if (free_valid[i] && (free_prd[i] != '0)) begin
-                    entries_next[tail_next] = free_prd[i];
-                    tail_next = tail_next + 1'b1;
-                    count_next = count_next + 1'b1;
-                end
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (free_valid[i] && (free_prd[i] != '0)) begin
+                entries_next[tail_next] = free_prd[i];
+                tail_next = tail_next + 1'b1;
+                count_next = count_next + 1'b1;
             end
         end
     end
+
+    function automatic logic [$clog2(PHYS_REGS+1)-1:0] free_distance(
+            input logic [$clog2(PHYS_REGS)-1:0] from_ptr,
+            input logic [$clog2(PHYS_REGS)-1:0] to_ptr);
+        if (to_ptr >= from_ptr) begin
+            free_distance = logic'($clog2(PHYS_REGS+1))'(to_ptr - from_ptr);
+        end else begin
+            free_distance = logic'($clog2(PHYS_REGS+1))'(PHYS_REGS - from_ptr + to_ptr);
+        end
+    endfunction
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin

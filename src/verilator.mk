@@ -37,6 +37,10 @@ ifeq ($(OOO),1)
 	VERILATOR_CFLAGS += -DOOO_4WIDE
 endif
 
+ifeq ($(AGENT_DEBUG),1)
+	VERILATOR_CFLAGS += -DAGENT_DEBUG
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

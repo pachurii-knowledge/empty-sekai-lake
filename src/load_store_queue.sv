@@ -84,50 +84,57 @@ module load_store_queue
             end
         end
 
-        if (entries_next[head_q].entry.valid &&
-                entries_next[head_q].entry.ctrl.memRead &&
-                entries_next[head_q].entry.src1_ready && !entries_next[head_q].issued_load) begin
+        for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
+            if ((count_next != '0) && !entries_next[head_next].entry.valid) begin
+                head_next = head_next + 1'b1;
+                count_next -= 1'b1;
+            end
+        end
+
+        if (entries_next[head_next].entry.valid &&
+                entries_next[head_next].entry.ctrl.memRead &&
+                entries_next[head_next].entry.src1_ready && !entries_next[head_next].issued_load) begin
             data_load_en = 1'b1;
-            data_addr = entries_next[head_q].addr[31:2];
-            entries_next[head_q].issued_load = 1'b1;
+            data_addr = entries_next[head_next].addr[31:2];
+            entries_next[head_next].issued_load = 1'b1;
         end
 
-        if (entries_next[head_q].entry.valid &&
-                entries_next[head_q].entry.ctrl.memWrite &&
-                entries_next[head_q].entry.src1_ready &&
-                entries_next[head_q].entry.src2_ready &&
-                !entries_next[head_q].issued_load) begin
+        if (entries_next[head_next].entry.valid &&
+                entries_next[head_next].entry.ctrl.memWrite &&
+                entries_next[head_next].entry.src1_ready &&
+                entries_next[head_next].entry.src2_ready &&
+                !entries_next[head_next].issued_load) begin
             load_writeback.valid = 1'b1;
-            load_writeback.active_id = entries_next[head_q].entry.active_id;
-            load_writeback.branch_mask = entries_next[head_q].entry.branch_mask;
+            load_writeback.active_id = entries_next[head_next].entry.active_id;
+            load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
             load_writeback.has_dest = 1'b0;
-            entries_next[head_q].issued_load = 1'b1;
+            entries_next[head_next].issued_load = 1'b1;
         end
 
-        if (entries_next[head_q].entry.valid &&
-                entries_next[head_q].entry.ctrl.memRead &&
-                entries_next[head_q].issued_load && data_load_valid) begin
+        if (entries_next[head_next].entry.valid &&
+                entries_next[head_next].entry.ctrl.memRead &&
+                entries_next[head_next].issued_load && data_load_valid) begin
             load_writeback.valid = 1'b1;
-            load_writeback.active_id = entries_next[head_q].entry.active_id;
-            load_writeback.prd = entries_next[head_q].entry.prd;
-            load_writeback.has_dest = entries_next[head_q].entry.has_dest;
-            load_writeback.branch_mask = entries_next[head_q].entry.branch_mask;
+            load_writeback.active_id = entries_next[head_next].entry.active_id;
+            load_writeback.prd = entries_next[head_next].entry.prd;
+            load_writeback.has_dest = entries_next[head_next].entry.has_dest;
+            load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
             load_writeback.data = format_load(data_load,
-                entries_next[head_q].addr[1:0],
-                entries_next[head_q].entry.ctrl.ldst_mode);
-            entries_next[head_q] = '0;
-            head_next = head_q + 1'b1;
+                entries_next[head_next].addr[1:0],
+                entries_next[head_next].entry.ctrl.ldst_mode);
+            entries_next[head_next] = '0;
+            head_next = head_next + 1'b1;
             count_next -= 1'b1;
         end
 
-        if (commit_store && entries_next[head_q].entry.valid &&
-                entries_next[head_q].entry.ctrl.memWrite &&
-                (entries_next[head_q].entry.active_id == commit_store_id)) begin
-            data_addr = entries_next[head_q].addr[31:2];
-            data_store = entries_next[head_q].store_data;
-            data_store_mask = entries_next[head_q].store_mask;
-            entries_next[head_q] = '0;
-            head_next = head_q + 1'b1;
+        if (commit_store && entries_next[head_next].entry.valid &&
+                entries_next[head_next].entry.ctrl.memWrite &&
+                (entries_next[head_next].entry.active_id == commit_store_id)) begin
+            data_addr = entries_next[head_next].addr[31:2];
+            data_store = entries_next[head_next].store_data;
+            data_store_mask = entries_next[head_next].store_mask;
+            entries_next[head_next] = '0;
+            head_next = head_next + 1'b1;
             count_next -= 1'b1;
         end
 

@@ -32,6 +32,7 @@ module branch_stack
 
     typedef struct packed {
         logic valid;
+        branch_mask_t branch_mask;
         active_id_t active_tail;
         logic [$clog2(PHYS_REGS)-1:0] free_head;
         logic [$clog2(PHYS_REGS)-1:0] free_tail;
@@ -43,6 +44,7 @@ module branch_stack
     phys_reg_t map_q [BRANCH_STACK_SIZE][32];
     phys_reg_t map_next [BRANCH_STACK_SIZE][32];
     branch_mask_t valid_mask_q, valid_mask_next;
+    branch_mask_t resolve_abort_mask;
 
     assign full = &valid_mask_q;
     assign current_mask = valid_mask_q;
@@ -51,6 +53,7 @@ module branch_stack
         meta_next = meta_q;
         map_next = map_q;
         valid_mask_next = valid_mask_q;
+        resolve_abort_mask = '0;
         allocate_valid = 1'b0;
         allocate_id = '0;
         restore_valid = 1'b0;
@@ -66,17 +69,29 @@ module branch_stack
 
         if (resolve && meta_q[resolve_id].valid) begin
             reset_mask[resolve_id] = 1'b1;
-            valid_mask_next[resolve_id] = 1'b0;
-            meta_next[resolve_id].valid = 1'b0;
+            resolve_abort_mask[resolve_id] = 1'b1;
             if (mispredict) begin
                 restore_valid = 1'b1;
                 restore_active_tail = meta_q[resolve_id].active_tail;
                 restore_free_head = meta_q[resolve_id].free_head;
                 restore_free_tail = meta_q[resolve_id].free_tail;
                 restore_free_count = meta_q[resolve_id].free_count;
-                abort_mask[resolve_id] = 1'b1;
                 for (int i = 0; i < 32; i += 1) begin
                     restore_map[i] = map_q[resolve_id][i];
+                end
+                for (int slot = 0; slot < BRANCH_STACK_SIZE; slot += 1) begin
+                    if (meta_q[slot].valid && meta_q[slot].branch_mask[resolve_id]) begin
+                        resolve_abort_mask[slot] = 1'b1;
+                    end
+                end
+            end
+            abort_mask = mispredict ? resolve_abort_mask : '0;
+            for (int slot = 0; slot < BRANCH_STACK_SIZE; slot += 1) begin
+                if (resolve_abort_mask[slot]) begin
+                    valid_mask_next[slot] = 1'b0;
+                    meta_next[slot].valid = 1'b0;
+                end else if (meta_next[slot].valid) begin
+                    meta_next[slot].branch_mask &= ~resolve_abort_mask;
                 end
             end
         end
@@ -86,8 +101,9 @@ module branch_stack
                 if (!valid_mask_next[slot] && !allocate_valid) begin
                     allocate_valid = 1'b1;
                     allocate_id = branch_id_t'(slot);
-                    valid_mask_next[slot] = 1'b1;
                     meta_next[slot].valid = 1'b1;
+                    meta_next[slot].branch_mask = valid_mask_next;
+                    valid_mask_next[slot] = 1'b1;
                     meta_next[slot].active_tail = active_tail_snapshot;
                     meta_next[slot].free_head = free_head_snapshot;
                     meta_next[slot].free_tail = free_tail_snapshot;

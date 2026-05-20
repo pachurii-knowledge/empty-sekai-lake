@@ -66,7 +66,7 @@ module active_list
         entries_next = entries_q;
         head_next = head_q;
         tail_next = restore_valid ? restore_tail : tail_q;
-        count_next = count_q;
+        count_next = restore_valid ? active_distance(head_q, restore_tail) : count_q;
         commit_valid = '0;
         free_valid = '0;
         commit_count = 0;
@@ -83,6 +83,13 @@ module active_list
             end
         end
 
+        for (int i = 0; i < ACTIVE_LIST_SIZE; i += 1) begin
+            if ((count_next != '0) && !entries_next[head_next].valid) begin
+                head_next = head_next + 1'b1;
+                count_next -= 1'b1;
+            end
+        end
+
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (writeback_valid[i]) begin
                 entries_next[writeback_id[i]].done = 1'b1;
@@ -93,7 +100,7 @@ module active_list
         end
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            if ((commit_count < count_q) && entries_next[head_next].valid &&
+            if ((count_next != '0) && entries_next[head_next].valid &&
                     entries_next[head_next].done) begin
                 commit_valid[i] = 1'b1;
                 commit_packet[i].valid = 1'b1;
@@ -112,6 +119,7 @@ module active_list
                 free_prd[i] = entries_next[head_next].old_prd;
                 entries_next[head_next] = '0;
                 head_next = head_next + 1'b1;
+                count_next -= 1'b1;
                 commit_count += 1;
                 if (commit_packet[i].halted || commit_packet[i].exception) begin
                     break;
@@ -136,12 +144,10 @@ module active_list
                     entries_next[tail_next].is_store = allocate_packet[i].ctrl.memWrite;
                     entries_next[tail_next].branch_mask = allocate_packet[i].branch_mask;
                     tail_next = tail_next + 1'b1;
+                    count_next += 1'b1;
                 end
             end
         end
-
-        count_next = restore_valid ? active_distance(head_next, restore_tail) :
-            count_q - active_count_t'(commit_count) + active_count_t'(alloc_count);
     end
 
     function automatic active_count_t active_distance(input active_id_t from_id,
