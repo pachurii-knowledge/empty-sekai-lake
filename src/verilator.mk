@@ -33,6 +33,10 @@ ifeq ($(SUPERSCALAR),4)
 	VERILATOR_CFLAGS += -DSUPERSCALAR_4WIDE
 endif
 
+ifeq ($(OOO),1)
+	VERILATOR_CFLAGS += -DOOO_4WIDE
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

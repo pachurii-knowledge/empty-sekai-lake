@@ -40,9 +40,14 @@ package RISCV_UArch;
     // Execution processing width (multiplies the number of regfile ports).
     // Phase 2 keeps the scalar core as the default and enables the 4-wide path
     // explicitly with +define+SUPERSCALAR_4WIDE/-DSUPERSCALAR_4WIDE.
-`ifdef SUPERSCALAR_4WIDE
+`ifdef OOO_4WIDE
+    parameter OOO_ENABLED               = 1;
+    parameter SUPERSCALAR_WAYS          = 4;
+`elsif SUPERSCALAR_4WIDE
+    parameter OOO_ENABLED               = 0;
     parameter SUPERSCALAR_WAYS          = 4;
 `else
+    parameter OOO_ENABLED               = 0;
     parameter SUPERSCALAR_WAYS          = 1;
 `endif
     

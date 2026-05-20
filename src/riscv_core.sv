@@ -23,7 +23,26 @@ module riscv_core (
 );
 
     generate
-        if (RISCV_UArch::SUPERSCALAR_WAYS == 4) begin : gen_4wide
+        if (RISCV_UArch::OOO_ENABLED != 0) begin : gen_ooo
+            riscv_core_ooo OoOCore (
+                .clk,
+                .rst_l,
+                .instr_mem_excpt,
+                .data_mem_excpt,
+                .instr,
+                .data_load,
+                .data_load_addr,
+                .data_load_valid,
+                .data_load_en,
+                .halted,
+                .data_store_mask,
+                .instr_addr,
+                .data_addr,
+                .instr_stall,
+                .data_stall,
+                .data_store
+            );
+        end else if (RISCV_UArch::SUPERSCALAR_WAYS == 4) begin : gen_4wide
             riscv_core_4wide Core4Wide (
                 .clk,
                 .rst_l,

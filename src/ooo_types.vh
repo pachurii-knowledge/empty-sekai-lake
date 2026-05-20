@@ -1,0 +1,94 @@
+`ifndef OOO_TYPES_VH_
+`define OOO_TYPES_VH_
+
+`include "internal_defines.vh"
+
+package OOO_Types;
+
+    localparam int OOO_WIDTH = 4;
+    localparam int PHYS_REGS = 64;
+    localparam int ACTIVE_LIST_SIZE = 32;
+    localparam int INT_IQ_SIZE = 16;
+    localparam int MEM_Q_SIZE = 16;
+    localparam int BRANCH_STACK_SIZE = 4;
+
+    localparam int ARCH_REG_BITS = 5;
+    localparam int PHYS_REG_BITS = $clog2(PHYS_REGS);
+    localparam int ACTIVE_ID_BITS = $clog2(ACTIVE_LIST_SIZE);
+    localparam int BRANCH_ID_BITS = $clog2(BRANCH_STACK_SIZE);
+
+    typedef logic [ARCH_REG_BITS-1:0] arch_reg_t;
+    typedef logic [PHYS_REG_BITS-1:0] phys_reg_t;
+    typedef logic [ACTIVE_ID_BITS-1:0] active_id_t;
+    typedef logic [BRANCH_STACK_SIZE-1:0] branch_mask_t;
+    typedef logic [BRANCH_ID_BITS-1:0] branch_id_t;
+
+    typedef struct packed {
+        logic          valid;
+        logic [31:0]   pc;
+        logic [31:0]   instr;
+        ctrl_signals_t ctrl;
+        arch_reg_t     rs1;
+        arch_reg_t     rs2;
+        arch_reg_t     rd;
+        phys_reg_t     prs1;
+        phys_reg_t     prs2;
+        phys_reg_t     prd;
+        phys_reg_t     old_prd;
+        logic          src1_ready;
+        logic          src2_ready;
+        logic          has_dest;
+        logic [31:0]   imm;
+        branch_mask_t  branch_mask;
+        branch_id_t    branch_id;
+        active_id_t    active_id;
+    } rename_packet_t;
+
+    typedef struct packed {
+        logic          valid;
+        logic [31:0]   pc;
+        logic [31:0]   instr;
+        ctrl_signals_t ctrl;
+        phys_reg_t     prs1;
+        phys_reg_t     prs2;
+        phys_reg_t     prd;
+        logic          src1_ready;
+        logic          src2_ready;
+        logic          has_dest;
+        logic [31:0]   imm;
+        branch_mask_t  branch_mask;
+        branch_id_t    branch_id;
+        active_id_t    active_id;
+    } issue_entry_t;
+
+    typedef struct packed {
+        logic          valid;
+        active_id_t    active_id;
+        phys_reg_t     prd;
+        logic          has_dest;
+        logic [31:0]   data;
+        logic          branch_valid;
+        branch_id_t    branch_id;
+        logic          branch_mispredict;
+        logic [31:0]   redirect_pc;
+        logic          exception;
+        logic          halted;
+    } writeback_packet_t;
+
+    typedef struct packed {
+        logic          valid;
+        active_id_t    active_id;
+        arch_reg_t     rd;
+        phys_reg_t     prd;
+        phys_reg_t     old_prd;
+        logic          has_dest;
+        logic [31:0]   pc;
+        logic [31:0]   instr;
+        logic          is_store;
+        logic          halted;
+        logic          exception;
+    } commit_packet_t;
+
+endpackage: OOO_Types
+
+`endif /* OOO_TYPES_VH_ */
