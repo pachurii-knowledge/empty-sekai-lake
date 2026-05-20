@@ -9,11 +9,13 @@ module ooo_dispatch_control
     input  logic [OOO_WIDTH-1:0] lane_has_dest,
     input  logic [OOO_WIDTH-1:0] lane_is_branch,
     input  logic [OOO_WIDTH-1:0] lane_is_memory,
+    input  logic [OOO_WIDTH-1:0] lane_is_terminal,
     input  logic                 active_list_full,
     input  logic                 int_iq_full,
     input  logic                 mem_queue_full,
     input  logic                 branch_stack_full,
     input  logic                 free_list_can_allocate,
+    input  logic                 suppress_dispatch,
     output logic [OOO_WIDTH-1:0] dispatch_valid,
     output logic                 dispatch_stall
 );
@@ -27,14 +29,17 @@ module ooo_dispatch_control
         stop_prefix = 1'b0;
         branch_seen = 1'b0;
         memory_seen = 1'b0;
-        dispatch_stall = active_list_full || int_iq_full || mem_queue_full ||
-            !free_list_can_allocate;
+        dispatch_stall = suppress_dispatch || active_list_full || int_iq_full ||
+            mem_queue_full || !free_list_can_allocate;
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (lane_is_branch[i] && branch_seen) begin
                 stop_prefix = 1'b1;
             end
             if (lane_is_memory[i] && memory_seen) begin
+                stop_prefix = 1'b1;
+            end
+            if (i != 0 && lane_is_terminal[i - 1]) begin
                 stop_prefix = 1'b1;
             end
             if (lane_is_branch[i] && branch_stack_full) begin
@@ -46,6 +51,7 @@ module ooo_dispatch_control
 
             if (dispatch_valid[i] && lane_is_branch[i]) begin
                 branch_seen = 1'b1;
+                stop_prefix = 1'b1;
             end
             if (dispatch_valid[i] && lane_is_memory[i]) begin
                 memory_seen = 1'b1;

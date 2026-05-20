@@ -11,6 +11,7 @@ module ooo_alu_pipe
     input  issue_entry_t     issue_entry,
     input  logic [31:0]      rs1_data,
     input  logic [31:0]      rs2_data,
+    input  branch_mask_t     abort_mask,
     output writeback_packet_t writeback
 );
 
@@ -18,12 +19,13 @@ module ooo_alu_pipe
 
     always_comb begin
         wb_next = '0;
-        if (issue_valid) begin
+        if (issue_valid && ((issue_entry.branch_mask & abort_mask) == '0)) begin
             wb_next.valid = 1'b1;
             wb_next.active_id = issue_entry.active_id;
             wb_next.prd = issue_entry.prd;
             wb_next.has_dest = issue_entry.has_dest;
             wb_next.data = result_for(issue_entry, rs1_data, rs2_data);
+            wb_next.branch_mask = issue_entry.branch_mask;
             wb_next.branch_valid = (issue_entry.ctrl.pc_source == PC_cond) ||
                 (issue_entry.ctrl.pc_source == PC_uncond) ||
                 (issue_entry.ctrl.pc_source == PC_indirect);
@@ -39,6 +41,8 @@ module ooo_alu_pipe
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             writeback <= '0;
+        end else if ((wb_next.branch_mask & abort_mask) != '0) begin
+            writeback <= '0;
         end else begin
             writeback <= wb_next;
         end
@@ -53,7 +57,8 @@ module ooo_alu_pipe
         unique case (entry.ctrl.rd_source)
             RD_PC4: result_for = entry.pc + 32'd4;
             RD_IMM: result_for = entry.imm;
-            RD_CMP: result_for = {31'b0, branch_cmp(src1, src2, entry.ctrl.alu_op)};
+            RD_CMP: result_for = {31'b0, branch_cmp(src1,
+                entry.ctrl.useImm ? entry.imm : src2, entry.ctrl.alu_op)};
             default: result_for = alu_result(alu_a, alu_b, entry.ctrl.alu_op);
         endcase
     endfunction

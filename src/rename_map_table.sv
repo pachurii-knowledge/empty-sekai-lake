@@ -13,6 +13,7 @@ module rename_map_table
     input  arch_reg_t                    rs1 [OOO_WIDTH],
     input  arch_reg_t                    rs2 [OOO_WIDTH],
     input  arch_reg_t                    rd [OOO_WIDTH],
+    input  logic [OOO_WIDTH-1:0]         rename_has_dest,
     input  phys_reg_t                    alloc_prd [OOO_WIDTH],
     output phys_reg_t                    prs1 [OOO_WIDTH],
     output phys_reg_t                    prs2 [OOO_WIDTH],
@@ -34,7 +35,8 @@ module rename_map_table
             prs1[lane] = (rs1[lane] == 5'd0) ? '0 : map_next[rs1[lane]];
             prs2[lane] = (rs2[lane] == 5'd0) ? '0 : map_next[rs2[lane]];
             old_prd[lane] = (rd[lane] == 5'd0) ? '0 : map_next[rd[lane]];
-            has_dest[lane] = rename_valid[lane] && (rd[lane] != 5'd0);
+            has_dest[lane] = rename_valid[lane] && rename_has_dest[lane] &&
+                (rd[lane] != 5'd0);
 
             if (has_dest[lane]) begin
                 map_next[rd[lane]] = alloc_prd[lane];

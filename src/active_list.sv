@@ -13,6 +13,7 @@ module active_list
     input  rename_packet_t        allocate_packet [OOO_WIDTH],
     input  logic [OOO_WIDTH-1:0]  writeback_valid,
     input  active_id_t            writeback_id [OOO_WIDTH],
+    input  logic [OOO_WIDTH-1:0][31:0] writeback_data,
     input  logic [OOO_WIDTH-1:0]  writeback_exception,
     input  logic [OOO_WIDTH-1:0]  writeback_halted,
     input  branch_mask_t          reset_mask,
@@ -32,6 +33,7 @@ module active_list
         logic halted;
         logic [31:0] pc;
         logic [31:0] instr;
+        logic [31:0] data;
         arch_reg_t rd;
         phys_reg_t prd;
         phys_reg_t old_prd;
@@ -74,15 +76,17 @@ module active_list
         end
 
         for (int i = 0; i < ACTIVE_LIST_SIZE; i += 1) begin
-            entries_next[i].branch_mask &= ~reset_mask;
             if ((entries_next[i].branch_mask & abort_mask) != '0) begin
                 entries_next[i] = '0;
+            end else if (entries_next[i].valid) begin
+                entries_next[i].branch_mask &= ~reset_mask;
             end
         end
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (writeback_valid[i]) begin
                 entries_next[writeback_id[i]].done = 1'b1;
+                entries_next[writeback_id[i]].data = writeback_data[i];
                 entries_next[writeback_id[i]].exception |= writeback_exception[i];
                 entries_next[writeback_id[i]].halted |= writeback_halted[i];
             end
@@ -100,6 +104,7 @@ module active_list
                 commit_packet[i].has_dest = entries_next[head_next].has_dest;
                 commit_packet[i].pc = entries_next[head_next].pc;
                 commit_packet[i].instr = entries_next[head_next].instr;
+                commit_packet[i].data = entries_next[head_next].data;
                 commit_packet[i].is_store = entries_next[head_next].is_store;
                 commit_packet[i].halted = entries_next[head_next].halted;
                 commit_packet[i].exception = entries_next[head_next].exception;
@@ -108,6 +113,9 @@ module active_list
                 entries_next[head_next] = '0;
                 head_next = head_next + 1'b1;
                 commit_count += 1;
+                if (commit_packet[i].halted || commit_packet[i].exception) begin
+                    break;
+                end
             end
         end
 
@@ -115,9 +123,10 @@ module active_list
             for (int i = 0; i < OOO_WIDTH; i += 1) begin
                 if (allocate_valid[i]) begin
                     entries_next[tail_next].valid = 1'b1;
-                    entries_next[tail_next].done = allocate_packet[i].ctrl.memWrite ? 1'b0 : 1'b0;
+                    entries_next[tail_next].done = 1'b0;
                     entries_next[tail_next].exception = 1'b0;
                     entries_next[tail_next].halted = 1'b0;
+                    entries_next[tail_next].data = '0;
                     entries_next[tail_next].pc = allocate_packet[i].pc;
                     entries_next[tail_next].instr = allocate_packet[i].instr;
                     entries_next[tail_next].rd = allocate_packet[i].rd;
@@ -131,9 +140,18 @@ module active_list
             end
         end
 
-        count_next = restore_valid ? count_next :
+        count_next = restore_valid ? active_distance(head_next, restore_tail) :
             count_q - active_count_t'(commit_count) + active_count_t'(alloc_count);
     end
+
+    function automatic active_count_t active_distance(input active_id_t from_id,
+            input active_id_t to_id);
+        if (to_id >= from_id) begin
+            active_distance = active_count_t'(to_id - from_id);
+        end else begin
+            active_distance = active_count_t'(ACTIVE_LIST_SIZE - from_id + to_id);
+        end
+    endfunction
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin

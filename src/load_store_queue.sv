@@ -13,6 +13,7 @@ module load_store_queue
     input  logic [OOO_WIDTH-1:0][31:0] insert_rs2_data,
     input  logic [OOO_WIDTH-1:0] wakeup_valid,
     input  phys_reg_t            wakeup_prd [OOO_WIDTH],
+    input  logic [OOO_WIDTH-1:0][31:0] wakeup_data,
     input  branch_mask_t         reset_mask,
     input  branch_mask_t         abort_mask,
     input  logic                 data_load_valid,
@@ -57,17 +58,26 @@ module load_store_queue
         load_writeback = '0;
 
         for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
-            entries_next[i].entry.branch_mask &= ~reset_mask;
             if ((entries_next[i].entry.branch_mask & abort_mask) != '0) begin
                 entries_next[i] = '0;
             end else if (entries_next[i].entry.valid) begin
+                entries_next[i].entry.branch_mask &= ~reset_mask;
                 for (int w = 0; w < OOO_WIDTH; w += 1) begin
                     if (wakeup_valid[w]) begin
                         if (entries_next[i].entry.prs1 == wakeup_prd[w]) begin
                             entries_next[i].entry.src1_ready = 1'b1;
+                            entries_next[i].addr_ready = 1'b1;
+                            entries_next[i].addr = wakeup_data[w] +
+                                entries_next[i].entry.imm;
                         end
                         if (entries_next[i].entry.prs2 == wakeup_prd[w]) begin
                             entries_next[i].entry.src2_ready = 1'b1;
+                            entries_next[i].data_ready = 1'b1;
+                            format_store(entries_next[i].entry.ctrl.ldst_mode,
+                                entries_next[i].addr[1:0],
+                                wakeup_data[w],
+                                entries_next[i].store_data,
+                                entries_next[i].store_mask);
                         end
                     end
                 end
@@ -82,13 +92,29 @@ module load_store_queue
             entries_next[head_q].issued_load = 1'b1;
         end
 
-        if (entries_next[head_q].entry.valid && entries_next[head_q].issued_load &&
-                data_load_valid) begin
+        if (entries_next[head_q].entry.valid &&
+                entries_next[head_q].entry.ctrl.memWrite &&
+                entries_next[head_q].entry.src1_ready &&
+                entries_next[head_q].entry.src2_ready &&
+                !entries_next[head_q].issued_load) begin
+            load_writeback.valid = 1'b1;
+            load_writeback.active_id = entries_next[head_q].entry.active_id;
+            load_writeback.branch_mask = entries_next[head_q].entry.branch_mask;
+            load_writeback.has_dest = 1'b0;
+            entries_next[head_q].issued_load = 1'b1;
+        end
+
+        if (entries_next[head_q].entry.valid &&
+                entries_next[head_q].entry.ctrl.memRead &&
+                entries_next[head_q].issued_load && data_load_valid) begin
             load_writeback.valid = 1'b1;
             load_writeback.active_id = entries_next[head_q].entry.active_id;
             load_writeback.prd = entries_next[head_q].entry.prd;
             load_writeback.has_dest = entries_next[head_q].entry.has_dest;
-            load_writeback.data = data_load;
+            load_writeback.branch_mask = entries_next[head_q].entry.branch_mask;
+            load_writeback.data = format_load(data_load,
+                entries_next[head_q].addr[1:0],
+                entries_next[head_q].entry.ctrl.ldst_mode);
             entries_next[head_q] = '0;
             head_next = head_q + 1'b1;
             count_next -= 1'b1;
@@ -113,13 +139,22 @@ module load_store_queue
                     entries_next[tail_next].addr_ready = insert_entry[lane].src1_ready;
                     entries_next[tail_next].data_ready = insert_entry[lane].src2_ready;
                     entries_next[tail_next].issued_load = 1'b0;
-                    entries_next[tail_next].addr = insert_rs1_data[lane] +
-                        insert_entry[lane].imm;
-                    format_store(insert_entry[lane].ctrl.ldst_mode,
-                        entries_next[tail_next].addr[1:0],
-                        insert_rs2_data[lane],
-                        entries_next[tail_next].store_data,
-                        entries_next[tail_next].store_mask);
+                    if (insert_entry[lane].src1_ready) begin
+                        entries_next[tail_next].addr = insert_rs1_data[lane] +
+                            insert_entry[lane].imm;
+                    end else begin
+                        entries_next[tail_next].addr = '0;
+                    end
+                    if (insert_entry[lane].src2_ready) begin
+                        format_store(insert_entry[lane].ctrl.ldst_mode,
+                            entries_next[tail_next].addr[1:0],
+                            insert_rs2_data[lane],
+                            entries_next[tail_next].store_data,
+                            entries_next[tail_next].store_mask);
+                    end else begin
+                        entries_next[tail_next].store_data = '0;
+                        entries_next[tail_next].store_mask = '0;
+                    end
                     tail_next = tail_next + 1'b1;
                     count_next += 1'b1;
                 end
@@ -154,6 +189,35 @@ module load_store_queue
             end
         endcase
     endtask
+
+    function automatic logic [31:0] format_load(input logic [31:0] raw_word,
+            input logic [1:0] byte_sel, input ldst_mode_t mode);
+        unique case (mode)
+            LDST_W: format_load = raw_word;
+            LDST_H: format_load = byte_sel[1] ?
+                {{16{raw_word[31]}}, raw_word[31:16]} :
+                {{16{raw_word[15]}}, raw_word[15:0]};
+            LDST_HU: format_load = byte_sel[1] ?
+                {16'b0, raw_word[31:16]} : {16'b0, raw_word[15:0]};
+            LDST_B: begin
+                unique case (byte_sel)
+                    2'd0: format_load = {{24{raw_word[7]}}, raw_word[7:0]};
+                    2'd1: format_load = {{24{raw_word[15]}}, raw_word[15:8]};
+                    2'd2: format_load = {{24{raw_word[23]}}, raw_word[23:16]};
+                    default: format_load = {{24{raw_word[31]}}, raw_word[31:24]};
+                endcase
+            end
+            LDST_BU: begin
+                unique case (byte_sel)
+                    2'd0: format_load = {24'b0, raw_word[7:0]};
+                    2'd1: format_load = {24'b0, raw_word[15:8]};
+                    2'd2: format_load = {24'b0, raw_word[23:16]};
+                    default: format_load = {24'b0, raw_word[31:24]};
+                endcase
+            end
+            default: format_load = 32'b0;
+        endcase
+    endfunction
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin

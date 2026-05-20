@@ -43,11 +43,11 @@ module int_issue_queue
         end
 
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-            entries_next[i].branch_mask &= ~reset_mask;
             if ((entries_next[i].branch_mask & abort_mask) != '0) begin
                 entries_next[i] = '0;
                 count_next -= 1'b1;
             end else if (entries_next[i].valid) begin
+                entries_next[i].branch_mask &= ~reset_mask;
                 for (int w = 0; w < OOO_WIDTH; w += 1) begin
                     if (wakeup_valid[w]) begin
                         if (entries_next[i].prs1 == wakeup_prd[w]) begin
