@@ -18,6 +18,7 @@ module load_store_queue
     input  branch_mask_t         abort_mask,
     input  logic                 data_load_valid,
     input  logic [31:0]          data_load,
+    input  logic [29:0]          data_load_addr,
     input  logic                 commit_store,
     input  active_id_t           commit_store_id,
     output logic                 full,
@@ -113,7 +114,8 @@ module load_store_queue
 
         if (entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memRead &&
-                entries_next[head_next].issued_load && data_load_valid) begin
+                entries_next[head_next].issued_load && data_load_valid &&
+                (data_load_addr == entries_next[head_next].addr[31:2])) begin
             load_writeback.valid = 1'b1;
             load_writeback.active_id = entries_next[head_next].entry.active_id;
             load_writeback.prd = entries_next[head_next].entry.prd;
@@ -225,6 +227,12 @@ module load_store_queue
             default: format_load = 32'b0;
         endcase
     endfunction
+
+
+
+
+
+
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin

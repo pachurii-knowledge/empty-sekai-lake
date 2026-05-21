@@ -354,6 +354,7 @@ module riscv_core_ooo (
         .abort_mask,
         .data_load_valid,
         .data_load(data_load[0]),
+        .data_load_addr,
         .commit_store,
         .commit_store_id,
         .full(mem_queue_full),
@@ -654,5 +655,13 @@ module riscv_core_ooo (
             abort_mask_q <= abort_mask;
         end
     end
+
+
+
+
+
+
+
+
 
 endmodule: riscv_core_ooo

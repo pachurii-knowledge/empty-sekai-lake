@@ -31,7 +31,11 @@ module ooo_alu_pipe
                 (issue_entry.ctrl.pc_source == PC_indirect);
             wb_next.branch_id = issue_entry.branch_id;
             wb_next.branch_mispredict = wb_next.branch_valid &&
-                (actual_target_for(issue_entry, rs1_data, rs2_data) != (issue_entry.pc + 32'd4));
+                (((issue_entry.ctrl.pc_source == PC_cond) &&
+                  (actual_target_for(issue_entry, rs1_data, rs2_data) !=
+                   (issue_entry.pc + 32'd4))) ||
+                 (issue_entry.ctrl.pc_source == PC_uncond) ||
+                 (issue_entry.ctrl.pc_source == PC_indirect));
             wb_next.redirect_pc = actual_target_for(issue_entry, rs1_data, rs2_data);
             wb_next.exception = issue_entry.ctrl.illegal_instr;
             wb_next.halted = issue_entry.ctrl.syscall && (rs1_data == 32'ha);
@@ -47,6 +51,7 @@ module ooo_alu_pipe
             writeback <= wb_next;
         end
     end
+
 
     function automatic logic [31:0] result_for(issue_entry_t entry,
             logic [31:0] src1, logic [31:0] src2);
