@@ -255,6 +255,7 @@ module riscv_core_ooo (
         .mem_queue_full(mem_queue_full),
         .branch_stack_full(branch_stack_full),
         .free_list_can_allocate(free_can_allocate),
+        .free_list_available(free_count_snapshot),
         .suppress_dispatch(redirect_valid || terminal_pending_q || halted_q),
         .dispatch_valid,
         .dispatch_stall

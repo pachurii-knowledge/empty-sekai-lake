@@ -43,7 +43,7 @@ module free_list
             free_count += free_valid[i];
         end
         restore_reclaim_count = free_distance(restore_head, head_q);
-        can_allocate = (count_q >= OOO_WIDTH);
+        can_allocate = (count_q != '0);
     end
 
     always_comb begin
@@ -57,7 +57,7 @@ module free_list
             alloc_prd[i] = '0;
         end
 
-        if (!restore_valid && can_allocate) begin
+        if (!restore_valid && (count_q >= alloc_count)) begin
             for (int i = 0; i < OOO_WIDTH; i += 1) begin
                 if (alloc_req[i]) begin
                     alloc_valid[i] = 1'b1;
