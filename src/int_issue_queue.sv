@@ -23,6 +23,8 @@ module int_issue_queue
     logic [$clog2(INT_IQ_SIZE+1)-1:0] count_q, count_next;
     logic [INT_IQ_SIZE-1:0] selected;
     logic [$clog2(OOO_WIDTH+1)-1:0] insert_count;
+    logic branch_issued;
+    logic branch_issue_blocked;
 
     assign full = (count_q > INT_IQ_SIZE - OOO_WIDTH);
 
@@ -38,6 +40,8 @@ module int_issue_queue
         count_next = count_q;
         issue_valid = '0;
         selected = '0;
+        branch_issued = 1'b0;
+        branch_issue_blocked = 1'b0;
         for (int i = 0; i < 2; i += 1) begin
             issue_entry[i] = '0;
         end
@@ -66,8 +70,13 @@ module int_issue_queue
                 if (!issue_valid[port] && entries_next[i].valid &&
                         entries_next[i].src1_ready && entries_next[i].src2_ready &&
                         !selected[i]) begin
+                    if (branch_issued && is_control_flow(entries_next[i])) begin
+                        branch_issue_blocked = 1'b1;
+                        continue;
+                    end
                     issue_valid[port] = 1'b1;
                     issue_entry[port] = entries_next[i];
+                    branch_issued |= is_control_flow(entries_next[i]);
                     selected[i] = 1'b1;
                     entries_next[i] = '0;
                     count_next -= 1'b1;
@@ -90,6 +99,12 @@ module int_issue_queue
             end
         end
     end
+
+    function automatic logic is_control_flow(issue_entry_t entry);
+        is_control_flow = (entry.ctrl.pc_source == PC_cond) ||
+            (entry.ctrl.pc_source == PC_uncond) ||
+            (entry.ctrl.pc_source == PC_indirect);
+    endfunction
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin

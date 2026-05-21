@@ -28,6 +28,8 @@ module riscv_core_ooo (
     logic [1:0] fetch_valid_pipe_q, fetch_valid_pipe_next;
     logic halted_q, halted_next;
     logic terminal_pending_q, terminal_pending_next;
+    logic control_pending_q, control_pending_next;
+    branch_id_t control_pending_id_q, control_pending_id_next;
     logic frontend_stall;
     logic redirect_valid;
     logic [31:0] redirect_pc;
@@ -37,6 +39,7 @@ module riscv_core_ooo (
     logic [OOO_WIDTH-1:0] lane_valid;
     logic [OOO_WIDTH-1:0] lane_has_dest;
     logic [OOO_WIDTH-1:0] lane_is_branch;
+    logic [OOO_WIDTH-1:0] lane_is_unpredicted_control;
     logic [OOO_WIDTH-1:0] lane_is_memory;
     logic [OOO_WIDTH-1:0] lane_is_terminal;
     logic [OOO_WIDTH-1:0] dispatch_valid;
@@ -46,6 +49,10 @@ module riscv_core_ooo (
     logic [2:0] dispatch_count;
     logic [2:0] valid_count;
     logic [2:0] lane_active_offset [OOO_WIDTH];
+    logic partial_resume_valid;
+    logic [2:0] partial_resume_lane;
+    logic partial_resume_lane_is_branch;
+    logic dispatched_unpredicted_control;
 
     arch_reg_t map_rs1 [OOO_WIDTH];
     arch_reg_t map_rs2 [OOO_WIDTH];
@@ -155,7 +162,8 @@ module riscv_core_ooo (
 
     assign halted = halted_q;
     assign data_stall = 1'b0;
-    assign instr_stall = !rst_l || halted_q || frontend_stall;
+    assign instr_stall = !rst_l || halted_q || frontend_stall ||
+        dispatched_unpredicted_control;
     assign instr_addr = {pc_q[31:4], 2'b00};
     assign sequential_next_pc = {pc_q[31:4], 4'b0} + 32'd16;
     assign dispatch_branch_mask = current_branch_mask & ~reset_mask & ~abort_mask;
@@ -256,7 +264,8 @@ module riscv_core_ooo (
         .branch_stack_full(branch_stack_full),
         .free_list_can_allocate(free_can_allocate),
         .free_list_available(free_count_snapshot),
-        .suppress_dispatch(redirect_valid || terminal_pending_q || halted_q),
+        .suppress_dispatch(redirect_valid || terminal_pending_q ||
+            control_pending_q || halted_q),
         .dispatch_valid,
         .dispatch_stall
     );
@@ -415,6 +424,7 @@ module riscv_core_ooo (
         lane_valid = '0;
         lane_has_dest = '0;
         lane_is_branch = '0;
+        lane_is_unpredicted_control = '0;
         lane_is_memory = '0;
         lane_is_terminal = '0;
         alloc_req = '0;
@@ -423,6 +433,10 @@ module riscv_core_ooo (
         branch_allocate = 1'b0;
         dispatch_count = '0;
         valid_count = '0;
+        partial_resume_valid = 1'b0;
+        partial_resume_lane = '0;
+        partial_resume_lane_is_branch = 1'b0;
+        dispatched_unpredicted_control = 1'b0;
         frontend_stall = dispatch_stall;
         branch_active_tail_snapshot = active_tail;
         branch_free_head_snapshot = free_head_snapshot;
@@ -443,6 +457,9 @@ module riscv_core_ooo (
                 ((decode_lanes[i].ctrl.pc_source == PC_cond) ||
                  (decode_lanes[i].ctrl.pc_source == PC_uncond) ||
                  (decode_lanes[i].ctrl.pc_source == PC_indirect));
+            lane_is_unpredicted_control[i] = lane_valid[i] &&
+                ((decode_lanes[i].ctrl.pc_source == PC_uncond) ||
+                 (decode_lanes[i].ctrl.pc_source == PC_indirect));
             lane_is_memory[i] = lane_valid[i] &&
                 (decode_lanes[i].ctrl.memRead || decode_lanes[i].ctrl.memWrite);
             lane_is_terminal[i] = lane_valid[i] &&
@@ -453,6 +470,13 @@ module riscv_core_ooo (
             end
             if (dispatch_valid[i]) begin
                 dispatch_count += 1'b1;
+                if (lane_is_unpredicted_control[i]) begin
+                    dispatched_unpredicted_control = 1'b1;
+                end
+            end else if (lane_valid[i] && !partial_resume_valid) begin
+                partial_resume_valid = 1'b1;
+                partial_resume_lane = i;
+                partial_resume_lane_is_branch = lane_is_branch[i];
             end
         end
 
@@ -559,6 +583,14 @@ module riscv_core_ooo (
         fetch_valid_pipe_next = fetch_valid_pipe_q;
         halted_next = halted_q || precise_halt || precise_exception;
         terminal_pending_next = terminal_pending_q;
+        control_pending_next = control_pending_q;
+        control_pending_id_next = control_pending_id_q;
+        if (branch_resolve_valid && control_pending_q &&
+                ((branch_resolve_id == control_pending_id_q) ||
+                 abort_mask[control_pending_id_q])) begin
+            control_pending_next = 1'b0;
+            control_pending_id_next = '0;
+        end
         if (redirect_valid || precise_halt || precise_exception) begin
             terminal_pending_next = 1'b0;
         end
@@ -574,7 +606,10 @@ module riscv_core_ooo (
             fetch_pc_pipe_next = '0;
             fetch_valid_pipe_next = '0;
         end else if (!frontend_stall && !halted_q) begin
-            if (fetch_valid_pipe_q[1] && (dispatch_count < valid_count)) begin
+            if (dispatched_unpredicted_control) begin
+                fetch_pc_pipe_next = '0;
+                fetch_valid_pipe_next = '0;
+            end else if (fetch_valid_pipe_q[1] && (dispatch_count < valid_count)) begin
                 pc_next = decode_lanes[dispatch_count].pc;
                 fetch_pc_pipe_next = '0;
                 fetch_valid_pipe_next = '0;
@@ -591,6 +626,10 @@ module riscv_core_ooo (
             if (dispatch_valid[i] && lane_is_terminal[i] && !redirect_valid) begin
                 terminal_pending_next = 1'b1;
             end
+            if (dispatch_valid[i] && lane_is_unpredicted_control[i]) begin
+                control_pending_next = 1'b1;
+                control_pending_id_next = branch_allocate_id;
+            end
         end
     end
 
@@ -601,6 +640,8 @@ module riscv_core_ooo (
             fetch_valid_pipe_q <= '0;
             halted_q <= 1'b0;
             terminal_pending_q <= 1'b0;
+            control_pending_q <= 1'b0;
+            control_pending_id_q <= '0;
             abort_mask_q <= '0;
         end else begin
             pc_q <= pc_next;
@@ -608,6 +649,8 @@ module riscv_core_ooo (
             fetch_valid_pipe_q <= fetch_valid_pipe_next;
             halted_q <= halted_next;
             terminal_pending_q <= terminal_pending_next;
+            control_pending_q <= control_pending_next;
+            control_pending_id_q <= control_pending_id_next;
             abort_mask_q <= abort_mask;
         end
     end

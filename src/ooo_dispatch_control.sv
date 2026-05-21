@@ -24,6 +24,7 @@ module ooo_dispatch_control
     logic stop_prefix;
     logic branch_seen;
     logic memory_seen;
+    logic prefix_dispatched;
     logic [$clog2(OOO_WIDTH+1)-1:0] dest_seen;
 
     always_comb begin
@@ -31,6 +32,7 @@ module ooo_dispatch_control
         stop_prefix = 1'b0;
         branch_seen = 1'b0;
         memory_seen = 1'b0;
+        prefix_dispatched = 1'b0;
         dest_seen = '0;
         dispatch_stall = suppress_dispatch || active_list_full || int_iq_full ||
             mem_queue_full;
@@ -51,10 +53,13 @@ module ooo_dispatch_control
             end
             if (lane_is_branch[i] && branch_stack_full) begin
                 stop_prefix = 1'b1;
-                dispatch_stall = 1'b1;
+                if (!prefix_dispatched) begin
+                    dispatch_stall = 1'b1;
+                end
             end
 
             dispatch_valid[i] = lane_valid[i] && !dispatch_stall && !stop_prefix;
+            prefix_dispatched |= dispatch_valid[i];
 
             if (dispatch_valid[i] && lane_is_branch[i]) begin
                 branch_seen = 1'b1;
