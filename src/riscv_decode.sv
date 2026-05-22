@@ -69,6 +69,7 @@ module riscv_decode
     stype_funct3_t      stype_funct3;
     sbtype_funct3_t     sbtype_funct3;
     itype_funct12_t     itype_funct12;
+    csr_funct3_t        csr_funct3;
 
     // Decode the opcode and various function codes for the instruction
     assign opcode           = opcode_t'(instr[6:0]);
@@ -79,6 +80,7 @@ module riscv_decode
     assign stype_funct3     = stype_funct3_t'(instr[14:12]);
     assign sbtype_funct3    = sbtype_funct3_t'(instr[14:12]);
     assign itype_funct12    = itype_funct12_t'(instr[31:20]);
+    assign csr_funct3       = csr_funct3_t'(instr[14:12]);
 
         always_comb begin
             // Default initialization to prevent latch inference
@@ -96,6 +98,19 @@ module riscv_decode
                 ldst_mode: LDST_DC,
                 pc_source: PC_DC,
                 rd_source: RD_DC,
+                exec_class: EXEC_INT,
+                csr_op: CSR_NONE,
+                amo_op: AMO_NONE,
+                fp_op: FP_NONE,
+                fp_double: 1'b0,
+                fp_uses_rs1: 1'b0,
+                fp_uses_rs2: 1'b0,
+                fp_uses_rs3: 1'b0,
+                fp_writes_fpr: 1'b0,
+                fp_writes_gpr: 1'b0,
+                csr_write: 1'b0,
+                fence_i: 1'b0,
+                serializing: 1'b0,
                 isBranch: 1'b0,
 
                 btype: sbtype_funct3,
@@ -118,6 +133,19 @@ module riscv_decode
                     ldst_mode: LDST_DC,
                     pc_source: PC_DC,
                     rd_source: RD_DC,
+                    exec_class: EXEC_INT,
+                    csr_op: CSR_NONE,
+                    amo_op: AMO_NONE,
+                    fp_op: FP_NONE,
+                    fp_double: 1'b0,
+                    fp_uses_rs1: 1'b0,
+                    fp_uses_rs2: 1'b0,
+                    fp_uses_rs3: 1'b0,
+                    fp_writes_fpr: 1'b0,
+                    fp_writes_gpr: 1'b0,
+                    csr_write: 1'b0,
+                    fence_i: 1'b0,
+                    serializing: 1'b0,
                     isBranch: 1'b0,
 
                     btype: sbtype_funct3,
@@ -152,6 +180,10 @@ module riscv_decode
                                     ctrl_signals.alu_op = ALU_SUB;
                                     ctrl_signals.rd_source = RD_ALU;
                                 end
+                                FUNCT7_MULDIV: begin
+                                    ctrl_signals.alu_op = ALU_MUL;
+                                    ctrl_signals.rd_source = RD_ALU;
+                                end
                                 default: begin
                                     `display(rst_l, "Encountered unknown/unimplemented 7-bit function code 0x%02x.",
                                             funct7);
@@ -160,19 +192,31 @@ module riscv_decode
                             endcase
                         end
                         FUNCT3_SLL: begin
-                            ctrl_signals.alu_op = ALU_SLL;
+                            ctrl_signals.alu_op = (funct7 == FUNCT7_MULDIV) ?
+                                ALU_MULH : ALU_SLL;
                             ctrl_signals.rd_source = RD_ALU;
                         end
                         FUNCT3_SLT: begin
-                            ctrl_signals.alu_op = ALU_SLT;
-                            ctrl_signals.rd_source = RD_CMP;
+                            if (funct7 == FUNCT7_MULDIV) begin
+                                ctrl_signals.alu_op = ALU_MULHSU;
+                                ctrl_signals.rd_source = RD_ALU;
+                            end else begin
+                                ctrl_signals.alu_op = ALU_SLT;
+                                ctrl_signals.rd_source = RD_CMP;
+                            end
                         end
                         FUNCT3_SLTU: begin
-                            ctrl_signals.alu_op = ALU_SLTU;
-                            ctrl_signals.rd_source = RD_CMP;
+                            if (funct7 == FUNCT7_MULDIV) begin
+                                ctrl_signals.alu_op = ALU_MULHU;
+                                ctrl_signals.rd_source = RD_ALU;
+                            end else begin
+                                ctrl_signals.alu_op = ALU_SLTU;
+                                ctrl_signals.rd_source = RD_CMP;
+                            end
                         end
                         FUNCT3_XOR: begin
-                            ctrl_signals.alu_op = ALU_XOR;
+                            ctrl_signals.alu_op = (funct7 == FUNCT7_MULDIV) ?
+                                ALU_DIV : ALU_XOR;
                             ctrl_signals.rd_source = RD_ALU;
                         end
                         FUNCT3_SRL_SRA: begin
@@ -185,6 +229,10 @@ module riscv_decode
                                     ctrl_signals.alu_op = ALU_SRA;
                                     ctrl_signals.rd_source = RD_ALU;
                                 end
+                                FUNCT7_MULDIV: begin
+                                    ctrl_signals.alu_op = ALU_DIVU;
+                                    ctrl_signals.rd_source = RD_ALU;
+                                end
                                 default: begin
                                     `display(rst_l, "Encountered unknown/unimplemented 7-bit function code 0x%02x.",
                                             funct7);
@@ -193,11 +241,13 @@ module riscv_decode
                             endcase
                         end
                         FUNCT3_OR: begin
-                            ctrl_signals.alu_op = ALU_OR;
+                            ctrl_signals.alu_op = (funct7 == FUNCT7_MULDIV) ?
+                                ALU_REM : ALU_OR;
                             ctrl_signals.rd_source = RD_ALU;
                         end
                         FUNCT3_AND: begin
-                            ctrl_signals.alu_op = ALU_AND;
+                            ctrl_signals.alu_op = (funct7 == FUNCT7_MULDIV) ?
+                                ALU_REMU : ALU_AND;
                             ctrl_signals.rd_source = RD_ALU;
                         end
                         default: begin
@@ -461,10 +511,197 @@ module riscv_decode
                     ctrl_signals.pc_source = PC_plus4;
                     ctrl_signals.rd_source = RD_IMM;
                 end
+                OP_MISC_MEM: begin
+                    ctrl_signals.exec_class = EXEC_FENCE;
+                    ctrl_signals.serializing = 1'b1;
+                    ctrl_signals.useImm = 1'b0;
+                    ctrl_signals.rfWrite = 1'b0;
+                    ctrl_signals.memRead = 1'b0;
+                    ctrl_signals.memWrite = 1'b0;
+                    ctrl_signals.pc_source = PC_plus4;
+                    ctrl_signals.rd_source = RD_DC;
+                    ctrl_signals.fence_i = (instr[14:12] == 3'b001);
+                    if ((instr[14:12] != 3'b000) && (instr[14:12] != 3'b001)) begin
+                        ctrl_signals.illegal_instr = 1'b1;
+                    end
+                end
+                OP_LOAD_FP: begin
+                    ctrl_signals.exec_class = EXEC_FP;
+                    ctrl_signals.serializing = 1'b1;
+                    ctrl_signals.useImm = 1'b1;
+                    ctrl_signals.rfWrite = 1'b0;
+                    ctrl_signals.fp_writes_fpr = 1'b1;
+                    ctrl_signals.memRead = 1'b1;
+                    ctrl_signals.memWrite = 1'b0;
+                    ctrl_signals.imm_mode = IMM_I;
+                    ctrl_signals.alu_op = ALU_ADD;
+                    ctrl_signals.pc_source = PC_plus4;
+                    ctrl_signals.rd_source = RD_MMU;
+                    unique case (instr[14:12])
+                        3'b010: begin
+                            ctrl_signals.ldst_mode = LDST_W;
+                            ctrl_signals.fp_double = 1'b0;
+                        end
+                        3'b011: begin
+                            ctrl_signals.ldst_mode = LDST_W;
+                            ctrl_signals.fp_double = 1'b1;
+                        end
+                        default: ctrl_signals.illegal_instr = 1'b1;
+                    endcase
+                end
+                OP_STORE_FP: begin
+                    ctrl_signals.exec_class = EXEC_FP;
+                    ctrl_signals.serializing = 1'b1;
+                    ctrl_signals.useImm = 1'b1;
+                    ctrl_signals.rfWrite = 1'b0;
+                    ctrl_signals.fp_uses_rs2 = 1'b1;
+                    ctrl_signals.memRead = 1'b0;
+                    ctrl_signals.memWrite = 1'b1;
+                    ctrl_signals.imm_mode = IMM_S;
+                    ctrl_signals.alu_op = ALU_ADD;
+                    ctrl_signals.pc_source = PC_plus4;
+                    unique case (instr[14:12])
+                        3'b010: begin
+                            ctrl_signals.ldst_mode = LDST_W;
+                            ctrl_signals.fp_double = 1'b0;
+                        end
+                        3'b011: begin
+                            ctrl_signals.ldst_mode = LDST_W;
+                            ctrl_signals.fp_double = 1'b1;
+                        end
+                        default: ctrl_signals.illegal_instr = 1'b1;
+                    endcase
+                end
+                OP_AMO: begin
+                    ctrl_signals.exec_class = EXEC_AMO;
+                    ctrl_signals.serializing = 1'b1;
+                    ctrl_signals.useImm = 1'b0;
+                    ctrl_signals.rfWrite = 1'b1;
+                    ctrl_signals.memRead = 1'b1;
+                    ctrl_signals.memWrite = 1'b1;
+                    ctrl_signals.ldst_mode = LDST_W;
+                    ctrl_signals.pc_source = PC_plus4;
+                    ctrl_signals.rd_source = RD_MMU;
+                    unique case (instr[31:27])
+                        5'b00010: ctrl_signals.amo_op = AMO_LR;
+                        5'b00011: ctrl_signals.amo_op = AMO_SC;
+                        5'b00001: ctrl_signals.amo_op = AMO_SWAP;
+                        5'b00000: ctrl_signals.amo_op = AMO_ADD;
+                        5'b00100: ctrl_signals.amo_op = AMO_XOR;
+                        5'b01100: ctrl_signals.amo_op = AMO_AND;
+                        5'b01000: ctrl_signals.amo_op = AMO_OR;
+                        5'b10000: ctrl_signals.amo_op = AMO_MIN;
+                        5'b10100: ctrl_signals.amo_op = AMO_MAX;
+                        5'b11000: ctrl_signals.amo_op = AMO_MINU;
+                        5'b11100: ctrl_signals.amo_op = AMO_MAXU;
+                        default: ctrl_signals.illegal_instr = 1'b1;
+                    endcase
+                    if (instr[14:12] != 3'b010) begin
+                        ctrl_signals.illegal_instr = 1'b1;
+                    end
+                    ctrl_signals.memRead = ctrl_signals.amo_op != AMO_SC;
+                    ctrl_signals.memWrite = ctrl_signals.amo_op != AMO_LR;
+                end
+                OP_MADD, OP_MSUB, OP_NMSUB, OP_NMADD: begin
+                    ctrl_signals.exec_class = EXEC_FP;
+                    ctrl_signals.serializing = 1'b1;
+                    ctrl_signals.fp_uses_rs1 = 1'b1;
+                    ctrl_signals.fp_uses_rs2 = 1'b1;
+                    ctrl_signals.fp_uses_rs3 = 1'b1;
+                    ctrl_signals.fp_writes_fpr = 1'b1;
+                    ctrl_signals.fp_double = (instr[26:25] == 2'b01);
+                    ctrl_signals.rfWrite = 1'b0;
+                    ctrl_signals.pc_source = PC_plus4;
+                    ctrl_signals.rd_source = RD_ALU;
+                    unique case (opcode)
+                        OP_MADD:  ctrl_signals.fp_op = FP_MADD;
+                        OP_MSUB:  ctrl_signals.fp_op = FP_MSUB;
+                        OP_NMSUB: ctrl_signals.fp_op = FP_NMSUB;
+                        default:  ctrl_signals.fp_op = FP_NMADD;
+                    endcase
+                    if ((instr[26:25] != 2'b00) && (instr[26:25] != 2'b01)) begin
+                        ctrl_signals.illegal_instr = 1'b1;
+                    end
+                end
+                OP_FP: begin
+                    ctrl_signals.exec_class = EXEC_FP;
+                    ctrl_signals.serializing = 1'b1;
+                    ctrl_signals.fp_double = (instr[26:25] == 2'b01);
+                    ctrl_signals.rfWrite = 1'b0;
+                    ctrl_signals.pc_source = PC_plus4;
+                    ctrl_signals.rd_source = RD_ALU;
+                    ctrl_signals.fp_uses_rs1 = 1'b1;
+                    ctrl_signals.fp_uses_rs2 = 1'b1;
+                    ctrl_signals.fp_writes_fpr = 1'b1;
+                    unique case (instr[31:27])
+                        5'b00000: ctrl_signals.fp_op = FP_ADD;
+                        5'b00001: ctrl_signals.fp_op = FP_SUB;
+                        5'b00010: ctrl_signals.fp_op = FP_MUL;
+                        5'b00011: ctrl_signals.fp_op = FP_DIV;
+                        5'b01011: begin
+                            ctrl_signals.fp_op = FP_SQRT;
+                            ctrl_signals.fp_uses_rs2 = 1'b0;
+                        end
+                        5'b00100: begin
+                            unique case (instr[14:12])
+                                3'b000: ctrl_signals.fp_op = FP_SGNJ;
+                                3'b001: ctrl_signals.fp_op = FP_SGNJN;
+                                3'b010: ctrl_signals.fp_op = FP_SGNJX;
+                                default: ctrl_signals.illegal_instr = 1'b1;
+                            endcase
+                        end
+                        5'b00101: begin
+                            ctrl_signals.fp_op = instr[12] ? FP_MAX : FP_MIN;
+                            if (instr[13:12] != 2'b00) begin
+                                ctrl_signals.illegal_instr = 1'b1;
+                            end
+                        end
+                        5'b11000: begin
+                            ctrl_signals.fp_writes_fpr = 1'b0;
+                            ctrl_signals.fp_writes_gpr = 1'b1;
+                            ctrl_signals.rfWrite = 1'b1;
+                            ctrl_signals.fp_uses_rs2 = 1'b0;
+                            ctrl_signals.fp_op = instr[20] ? FP_CVT_WU : FP_CVT_W;
+                        end
+                        5'b11010: begin
+                            ctrl_signals.fp_uses_rs1 = 1'b0;
+                            ctrl_signals.fp_uses_rs2 = 1'b0;
+                            ctrl_signals.fp_op = instr[20] ? FP_CVT_F_WU : FP_CVT_F_W;
+                        end
+                        5'b11100: begin
+                            ctrl_signals.fp_writes_fpr = 1'b0;
+                            ctrl_signals.fp_writes_gpr = 1'b1;
+                            ctrl_signals.rfWrite = 1'b1;
+                            ctrl_signals.fp_uses_rs2 = 1'b0;
+                            ctrl_signals.fp_op = instr[12] ? FP_CLASS : FP_MV_X;
+                        end
+                        5'b11110: begin
+                            ctrl_signals.fp_uses_rs1 = 1'b0;
+                            ctrl_signals.fp_uses_rs2 = 1'b0;
+                            ctrl_signals.fp_op = FP_MV_F_X;
+                        end
+                        5'b10100: begin
+                            ctrl_signals.fp_writes_fpr = 1'b0;
+                            ctrl_signals.fp_writes_gpr = 1'b1;
+                            ctrl_signals.rfWrite = 1'b1;
+                            unique case (instr[14:12])
+                                3'b010: ctrl_signals.fp_op = FP_EQ;
+                                3'b001: ctrl_signals.fp_op = FP_LT;
+                                3'b000: ctrl_signals.fp_op = FP_LE;
+                                default: ctrl_signals.illegal_instr = 1'b1;
+                            endcase
+                        end
+                        default: ctrl_signals.illegal_instr = 1'b1;
+                    endcase
+                    if ((instr[26:25] != 2'b00) && (instr[26:25] != 2'b01)) begin
+                        ctrl_signals.illegal_instr = 1'b1;
+                    end
+                end
                 // General system operation
                 OP_SYSTEM: begin
-                    unique case (itype_funct12)
-                        FUNCT12_ECALL: begin
+                    if (instr[14:12] == 3'b000) begin
+                        unique case (itype_funct12)
+                            FUNCT12_ECALL: begin
                             ctrl_signals.syscall = 1'b1;
                             ctrl_signals.useImm = 1'b0;
                             ctrl_signals.rfWrite = 1'b0;
@@ -484,7 +721,37 @@ module riscv_decode
                                     itype_funct12);
                             ctrl_signals.illegal_instr = 1'b1;
                         end
-                    endcase
+                        endcase
+                    end else begin
+                        ctrl_signals.exec_class = EXEC_CSR;
+                        ctrl_signals.serializing = 1'b1;
+                        ctrl_signals.useImm = csr_funct3[2];
+                        ctrl_signals.rfWrite = (instr[11:7] != 5'd0);
+                        ctrl_signals.memRead = 1'b0;
+                        ctrl_signals.memWrite = 1'b0;
+                        ctrl_signals.imm_mode = IMM_I;
+                        ctrl_signals.pc_source = PC_plus4;
+                        ctrl_signals.rd_source = RD_ALU;
+                        unique case (csr_funct3)
+                            FUNCT3_CSRRW:  ctrl_signals.csr_op = CSR_RW;
+                            FUNCT3_CSRRS:  ctrl_signals.csr_op = CSR_RS;
+                            FUNCT3_CSRRC:  ctrl_signals.csr_op = CSR_RC;
+                            FUNCT3_CSRRWI: ctrl_signals.csr_op = CSR_RWI;
+                            FUNCT3_CSRRSI: ctrl_signals.csr_op = CSR_RSI;
+                            FUNCT3_CSRRCI: ctrl_signals.csr_op = CSR_RCI;
+                            default: begin
+                                ctrl_signals.illegal_instr = 1'b1;
+                            end
+                        endcase
+                        ctrl_signals.csr_write = (ctrl_signals.csr_op == CSR_RW) ||
+                            (ctrl_signals.csr_op == CSR_RWI) ||
+                            (((ctrl_signals.csr_op == CSR_RS) ||
+                              (ctrl_signals.csr_op == CSR_RC)) &&
+                             (instr[19:15] != 5'd0)) ||
+                            (((ctrl_signals.csr_op == CSR_RSI) ||
+                              (ctrl_signals.csr_op == CSR_RCI)) &&
+                             (instr[19:15] != 5'd0));
+                    end
                 end
 
                 default: begin

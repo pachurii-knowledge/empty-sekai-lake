@@ -16,6 +16,12 @@ module active_list
     input  logic [OOO_WIDTH-1:0][31:0] writeback_data,
     input  logic [OOO_WIDTH-1:0]  writeback_exception,
     input  logic [OOO_WIDTH-1:0]  writeback_halted,
+    input  logic [OOO_WIDTH-1:0]  writeback_fp_write,
+    input  arch_reg_t             writeback_fp_rd [OOO_WIDTH],
+    input  fp_reg_data_t          writeback_fp_data [OOO_WIDTH],
+    input  logic [OOO_WIDTH-1:0]  writeback_csr_write,
+    input  logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr,
+    input  logic [OOO_WIDTH-1:0][31:0] writeback_csr_wdata,
     input  branch_mask_t          reset_mask,
     input  branch_mask_t          abort_mask,
     output logic                  full,
@@ -34,6 +40,13 @@ module active_list
         logic [31:0] pc;
         logic [31:0] instr;
         logic [31:0] data;
+        logic fp_write;
+        arch_reg_t fp_rd;
+        fp_reg_data_t fp_data;
+        logic csr_write;
+        logic [11:0] csr_addr;
+        logic [31:0] csr_wdata;
+        logic serializing;
         arch_reg_t rd;
         phys_reg_t prd;
         phys_reg_t old_prd;
@@ -94,6 +107,12 @@ module active_list
             if (writeback_valid[i]) begin
                 entries_next[writeback_id[i]].done = 1'b1;
                 entries_next[writeback_id[i]].data = writeback_data[i];
+                entries_next[writeback_id[i]].fp_write = writeback_fp_write[i];
+                entries_next[writeback_id[i]].fp_rd = writeback_fp_rd[i];
+                entries_next[writeback_id[i]].fp_data = writeback_fp_data[i];
+                entries_next[writeback_id[i]].csr_write = writeback_csr_write[i];
+                entries_next[writeback_id[i]].csr_addr = writeback_csr_addr[i];
+                entries_next[writeback_id[i]].csr_wdata = writeback_csr_wdata[i];
                 entries_next[writeback_id[i]].exception |= writeback_exception[i];
                 entries_next[writeback_id[i]].halted |= writeback_halted[i];
             end
@@ -112,6 +131,13 @@ module active_list
                 commit_packet[i].pc = entries_next[head_next].pc;
                 commit_packet[i].instr = entries_next[head_next].instr;
                 commit_packet[i].data = entries_next[head_next].data;
+                commit_packet[i].fp_write = entries_next[head_next].fp_write;
+                commit_packet[i].fp_rd = entries_next[head_next].fp_rd;
+                commit_packet[i].fp_data = entries_next[head_next].fp_data;
+                commit_packet[i].csr_write = entries_next[head_next].csr_write;
+                commit_packet[i].csr_addr = entries_next[head_next].csr_addr;
+                commit_packet[i].csr_wdata = entries_next[head_next].csr_wdata;
+                commit_packet[i].serializing = entries_next[head_next].serializing;
                 commit_packet[i].is_store = entries_next[head_next].is_store;
                 commit_packet[i].halted = entries_next[head_next].halted;
                 commit_packet[i].exception = entries_next[head_next].exception;
@@ -135,6 +161,14 @@ module active_list
                     entries_next[tail_next].exception = 1'b0;
                     entries_next[tail_next].halted = 1'b0;
                     entries_next[tail_next].data = '0;
+                    entries_next[tail_next].fp_write = 1'b0;
+                    entries_next[tail_next].fp_rd = allocate_packet[i].fp_rd;
+                    entries_next[tail_next].fp_data = '0;
+                    entries_next[tail_next].csr_write = 1'b0;
+                    entries_next[tail_next].csr_addr = allocate_packet[i].instr[31:20];
+                    entries_next[tail_next].csr_wdata = '0;
+                    entries_next[tail_next].serializing =
+                        allocate_packet[i].ctrl.serializing;
                     entries_next[tail_next].pc = allocate_packet[i].pc;
                     entries_next[tail_next].instr = allocate_packet[i].instr;
                     entries_next[tail_next].rd = allocate_packet[i].rd;

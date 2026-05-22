@@ -62,7 +62,11 @@ package RISCV_ISA;
 
         // Opcodes for load and store instructions (I-type and S-type)
         OP_LOAD                 = 'h03,
+        OP_LOAD_FP              = 'h07,
         OP_STORE                = 'h23,
+        OP_STORE_FP             = 'h27,
+        OP_MISC_MEM             = 'h0F,
+        OP_AMO                  = 'h2F,
 
         // Opcodes for U-type instructions (unsigned immediate)
         OP_LUI                  = 'h37,
@@ -74,6 +78,12 @@ package RISCV_ISA;
 
         // Opcode that indicates a general SB-type instruction (branch)
         OP_BRANCH               = 'h63,
+
+        OP_MADD                 = 'h43,
+        OP_MSUB                 = 'h47,
+        OP_NMSUB                = 'h4B,
+        OP_NMADD                = 'h4F,
+        OP_FP                   = 'h53,
 
         // Opcode that indicates a special system instruction (I-type)
         OP_SYSTEM               = 'h73
@@ -135,6 +145,15 @@ package RISCV_ISA;
     typedef enum logic [FUNCT12_WIDTH-1:0] {
         FUNCT12_ECALL           = 'h000     // Environment call
     } itype_funct12_t;
+
+    typedef enum logic [FUNCT3_WIDTH-1:0] {
+        FUNCT3_CSRRW            = 'h1,
+        FUNCT3_CSRRS            = 'h2,
+        FUNCT3_CSRRC            = 'h3,
+        FUNCT3_CSRRWI           = 'h5,
+        FUNCT3_CSRRSI           = 'h6,
+        FUNCT3_CSRRCI           = 'h7
+    } csr_funct3_t;
 
 /*----------------------------------------------------------------------------
  * S-type Function Codes

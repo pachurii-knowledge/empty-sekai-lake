@@ -10,6 +10,7 @@ module ooo_dispatch_control
     input  logic [OOO_WIDTH-1:0] lane_is_branch,
     input  logic [OOO_WIDTH-1:0] lane_is_memory,
     input  logic [OOO_WIDTH-1:0] lane_is_terminal,
+    input  logic [OOO_WIDTH-1:0] lane_is_serializing,
     input  logic                 active_list_full,
     input  logic                 int_iq_full,
     input  logic                 mem_queue_full,
@@ -51,11 +52,17 @@ module ooo_dispatch_control
             if (i != 0 && lane_is_terminal[i - 1]) begin
                 stop_prefix = 1'b1;
             end
+            if (i != 0 && lane_is_serializing[i - 1]) begin
+                stop_prefix = 1'b1;
+            end
             if (lane_is_branch[i] && branch_stack_full) begin
                 stop_prefix = 1'b1;
                 if (!prefix_dispatched) begin
                     dispatch_stall = 1'b1;
                 end
+            end
+            if (lane_is_serializing[i] && prefix_dispatched) begin
+                stop_prefix = 1'b1;
             end
 
             dispatch_valid[i] = lane_valid[i] && !dispatch_stall && !stop_prefix;

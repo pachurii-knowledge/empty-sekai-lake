@@ -34,8 +34,12 @@ module load_store_queue
         logic addr_ready;
         logic data_ready;
         logic issued_load;
+        logic load_complete;
+        logic double_low_valid;
         logic [31:0] addr;
+        logic [31:0] load_low_word;
         logic [31:0] store_data;
+        logic [31:0] store_data_upper;
         logic [3:0] store_mask;
     } mem_entry_t;
 
@@ -44,6 +48,11 @@ module load_store_queue
     logic [$clog2(MEM_Q_SIZE+1)-1:0] count_q, count_next;
     logic [$clog2(MEM_Q_SIZE)-1:0] head_q, head_next;
     logic [$clog2(MEM_Q_SIZE)-1:0] tail_q, tail_next;
+    logic reservation_valid_q, reservation_valid_next;
+    logic [31:0] reservation_addr_q, reservation_addr_next;
+    logic double_store_pending_q, double_store_pending_next;
+    logic [29:0] double_store_addr_q, double_store_addr_next;
+    logic [31:0] double_store_data_q, double_store_data_next;
 
     assign full = (count_q > MEM_Q_SIZE - OOO_WIDTH);
 
@@ -57,6 +66,17 @@ module load_store_queue
         data_store = '0;
         data_store_mask = '0;
         load_writeback = '0;
+        reservation_valid_next = reservation_valid_q;
+        reservation_addr_next = reservation_addr_q;
+        double_store_pending_next = 1'b0;
+        double_store_addr_next = '0;
+        double_store_data_next = '0;
+
+        if (double_store_pending_q) begin
+            data_addr = double_store_addr_q;
+            data_store = double_store_data_q;
+            data_store_mask = 4'b1111;
+        end
 
         for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
             if ((entries_next[i].entry.branch_mask & abort_mask) != '0) begin
@@ -69,7 +89,8 @@ module load_store_queue
                             entries_next[i].entry.src1_ready = 1'b1;
                             entries_next[i].addr_ready = 1'b1;
                             entries_next[i].addr = wakeup_data[w] +
-                                entries_next[i].entry.imm;
+                                ((entries_next[i].entry.ctrl.exec_class == EXEC_AMO) ?
+                                 32'b0 : entries_next[i].entry.imm);
                         end
                         if (entries_next[i].entry.prs2 == wakeup_prd[w]) begin
                             entries_next[i].entry.src2_ready = 1'b1;
@@ -92,7 +113,30 @@ module load_store_queue
             end
         end
 
-        if (entries_next[head_next].entry.valid &&
+        if (!double_store_pending_q && entries_next[head_next].entry.valid &&
+                (entries_next[head_next].entry.ctrl.exec_class == EXEC_AMO) &&
+                (entries_next[head_next].entry.ctrl.amo_op == AMO_SC) &&
+                entries_next[head_next].entry.src1_ready &&
+                entries_next[head_next].entry.src2_ready &&
+                !entries_next[head_next].issued_load) begin
+            load_writeback.valid = 1'b1;
+            load_writeback.active_id = entries_next[head_next].entry.active_id;
+            load_writeback.prd = entries_next[head_next].entry.prd;
+            load_writeback.has_dest = entries_next[head_next].entry.has_dest;
+            load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
+            load_writeback.data = (reservation_valid_q &&
+                (reservation_addr_q == entries_next[head_next].addr)) ? 32'b0 : 32'b1;
+            if (load_writeback.data == 32'b0) begin
+                entries_next[head_next].issued_load = 1'b1;
+                reservation_valid_next = 1'b0;
+            end else begin
+                entries_next[head_next] = '0;
+                head_next = head_next + 1'b1;
+                count_next -= 1'b1;
+            end
+        end
+
+        if (!double_store_pending_q && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memRead &&
                 entries_next[head_next].entry.src1_ready && !entries_next[head_next].issued_load) begin
             data_load_en = 1'b1;
@@ -100,10 +144,11 @@ module load_store_queue
             entries_next[head_next].issued_load = 1'b1;
         end
 
-        if (entries_next[head_next].entry.valid &&
+        if (!double_store_pending_q && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memWrite &&
                 entries_next[head_next].entry.src1_ready &&
                 entries_next[head_next].entry.src2_ready &&
+                !entries_next[head_next].entry.ctrl.memRead &&
                 !entries_next[head_next].issued_load) begin
             load_writeback.valid = 1'b1;
             load_writeback.active_id = entries_next[head_next].entry.active_id;
@@ -112,29 +157,77 @@ module load_store_queue
             entries_next[head_next].issued_load = 1'b1;
         end
 
-        if (entries_next[head_next].entry.valid &&
+        if (!double_store_pending_q && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memRead &&
                 entries_next[head_next].issued_load && data_load_valid &&
+                !entries_next[head_next].load_complete &&
                 (data_load_addr == entries_next[head_next].addr[31:2])) begin
             load_writeback.valid = 1'b1;
             load_writeback.active_id = entries_next[head_next].entry.active_id;
             load_writeback.prd = entries_next[head_next].entry.prd;
             load_writeback.has_dest = entries_next[head_next].entry.has_dest;
             load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
-            load_writeback.data = format_load(data_load,
-                entries_next[head_next].addr[1:0],
-                entries_next[head_next].entry.ctrl.ldst_mode);
-            entries_next[head_next] = '0;
-            head_next = head_next + 1'b1;
-            count_next -= 1'b1;
+            if (entries_next[head_next].entry.ctrl.exec_class == EXEC_AMO) begin
+                load_writeback.data = data_load;
+                if (entries_next[head_next].entry.ctrl.amo_op == AMO_LR) begin
+                    reservation_valid_next = 1'b1;
+                    reservation_addr_next = entries_next[head_next].addr;
+                    entries_next[head_next] = '0;
+                    head_next = head_next + 1'b1;
+                    count_next -= 1'b1;
+                end else begin
+                    entries_next[head_next].store_data = amo_result(
+                        entries_next[head_next].entry.ctrl.amo_op,
+                        data_load, entries_next[head_next].store_data);
+                    entries_next[head_next].store_mask = 4'b1111;
+                    entries_next[head_next].load_complete = 1'b1;
+                end
+            end else begin
+                if ((entries_next[head_next].entry.ctrl.exec_class == EXEC_FP) &&
+                        entries_next[head_next].entry.ctrl.fp_double &&
+                        !entries_next[head_next].double_low_valid) begin
+                    load_writeback = '0;
+                    entries_next[head_next].load_low_word = data_load;
+                    entries_next[head_next].double_low_valid = 1'b1;
+                    entries_next[head_next].issued_load = 1'b0;
+                    entries_next[head_next].addr =
+                        entries_next[head_next].addr + 32'd4;
+                end else begin
+                    load_writeback.data = format_load(data_load,
+                        entries_next[head_next].addr[1:0],
+                        entries_next[head_next].entry.ctrl.ldst_mode);
+                    if (entries_next[head_next].entry.ctrl.exec_class == EXEC_FP) begin
+                    load_writeback.fp_write =
+                        entries_next[head_next].entry.ctrl.fp_writes_fpr;
+                    load_writeback.fp_rd = entries_next[head_next].entry.fp_rd;
+                    load_writeback.fp_data = entries_next[head_next].entry.ctrl.fp_double ?
+                        {data_load, entries_next[head_next].load_low_word} :
+                        {32'hffff_ffff, data_load};
+                    load_writeback.has_dest = 1'b0;
+                    end
+                    entries_next[head_next] = '0;
+                    head_next = head_next + 1'b1;
+                    count_next -= 1'b1;
+                end
+            end
         end
 
-        if (commit_store && entries_next[head_next].entry.valid &&
+        if (!double_store_pending_q && commit_store && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memWrite &&
                 (entries_next[head_next].entry.active_id == commit_store_id)) begin
             data_addr = entries_next[head_next].addr[31:2];
             data_store = entries_next[head_next].store_data;
             data_store_mask = entries_next[head_next].store_mask;
+            if ((entries_next[head_next].entry.ctrl.exec_class == EXEC_FP) &&
+                    entries_next[head_next].entry.ctrl.fp_double) begin
+                double_store_pending_next = 1'b1;
+                double_store_addr_next = entries_next[head_next].addr[31:2] + 30'd1;
+                double_store_data_next = entries_next[head_next].store_data_upper;
+            end
+            if (reservation_valid_next &&
+                    (reservation_addr_next == entries_next[head_next].addr)) begin
+                reservation_valid_next = 1'b0;
+            end
             entries_next[head_next] = '0;
             head_next = head_next + 1'b1;
             count_next -= 1'b1;
@@ -148,20 +241,31 @@ module load_store_queue
                     entries_next[tail_next].addr_ready = insert_entry[lane].src1_ready;
                     entries_next[tail_next].data_ready = insert_entry[lane].src2_ready;
                     entries_next[tail_next].issued_load = 1'b0;
+                    entries_next[tail_next].load_complete = 1'b0;
+                    entries_next[tail_next].double_low_valid = 1'b0;
+                    entries_next[tail_next].load_low_word = '0;
                     if (insert_entry[lane].src1_ready) begin
                         entries_next[tail_next].addr = insert_rs1_data[lane] +
-                            insert_entry[lane].imm;
+                            ((insert_entry[lane].ctrl.exec_class == EXEC_AMO) ?
+                             32'b0 : insert_entry[lane].imm);
                     end else begin
                         entries_next[tail_next].addr = '0;
                     end
-                    if (insert_entry[lane].src2_ready) begin
+                    if (insert_entry[lane].src2_ready ||
+                            insert_entry[lane].ctrl.fp_uses_rs2) begin
                         format_store(insert_entry[lane].ctrl.ldst_mode,
                             entries_next[tail_next].addr[1:0],
-                            insert_rs2_data[lane],
+                            insert_entry[lane].ctrl.exec_class == EXEC_FP ?
+                                insert_entry[lane].fp_src2_data[31:0] :
+                                insert_rs2_data[lane],
                             entries_next[tail_next].store_data,
                             entries_next[tail_next].store_mask);
+                        entries_next[tail_next].store_data_upper =
+                            insert_entry[lane].ctrl.exec_class == EXEC_FP ?
+                                insert_entry[lane].fp_src2_data[63:32] : 32'b0;
                     end else begin
                         entries_next[tail_next].store_data = '0;
+                        entries_next[tail_next].store_data_upper = '0;
                         entries_next[tail_next].store_mask = '0;
                     end
                     tail_next = tail_next + 1'b1;
@@ -228,6 +332,24 @@ module load_store_queue
         endcase
     endfunction
 
+    function automatic logic [31:0] amo_result(input amo_op_t op,
+            input logic [31:0] old_value, input logic [31:0] operand);
+        unique case (op)
+            AMO_SWAP: amo_result = operand;
+            AMO_ADD:  amo_result = old_value + operand;
+            AMO_XOR:  amo_result = old_value ^ operand;
+            AMO_AND:  amo_result = old_value & operand;
+            AMO_OR:   amo_result = old_value | operand;
+            AMO_MIN:  amo_result = (signed'(old_value) < signed'(operand)) ?
+                old_value : operand;
+            AMO_MAX:  amo_result = (signed'(old_value) > signed'(operand)) ?
+                old_value : operand;
+            AMO_MINU: amo_result = (old_value < operand) ? old_value : operand;
+            AMO_MAXU: amo_result = (old_value > operand) ? old_value : operand;
+            default:  amo_result = old_value;
+        endcase
+    endfunction
+
 
 
 
@@ -239,6 +361,11 @@ module load_store_queue
             count_q <= '0;
             head_q <= '0;
             tail_q <= '0;
+            reservation_valid_q <= 1'b0;
+            reservation_addr_q <= '0;
+            double_store_pending_q <= 1'b0;
+            double_store_addr_q <= '0;
+            double_store_data_q <= '0;
             for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
                 entries_q[i] <= '0;
             end
@@ -246,6 +373,11 @@ module load_store_queue
             count_q <= count_next;
             head_q <= head_next;
             tail_q <= tail_next;
+            reservation_valid_q <= reservation_valid_next;
+            reservation_addr_q <= reservation_addr_next;
+            double_store_pending_q <= double_store_pending_next;
+            double_store_addr_q <= double_store_addr_next;
+            double_store_data_q <= double_store_data_next;
             entries_q <= entries_next;
         end
     end

@@ -49,6 +49,7 @@ module riscv_core_ooo (
     logic [OOO_WIDTH-1:0][31:0] lane_predicted_pc;
     logic [OOO_WIDTH-1:0] lane_is_memory;
     logic [OOO_WIDTH-1:0] lane_is_terminal;
+    logic [OOO_WIDTH-1:0] lane_is_serializing;
     logic [OOO_WIDTH-1:0] dispatch_valid;
     logic [OOO_WIDTH-1:0] alloc_req;
     logic [OOO_WIDTH-1:0] map_has_dest;
@@ -138,8 +139,25 @@ module riscv_core_ooo (
     phys_reg_t writeback_prd [OOO_WIDTH];
     logic [OOO_WIDTH-1:0][31:0] writeback_data;
     logic [OOO_WIDTH-1:0] writeback_has_dest;
+    logic [OOO_WIDTH-1:0] writeback_fp_write;
+    arch_reg_t writeback_fp_rd [OOO_WIDTH];
+    fp_reg_data_t writeback_fp_data [OOO_WIDTH];
+    logic [OOO_WIDTH-1:0] writeback_csr_write;
+    logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr;
+    logic [OOO_WIDTH-1:0][31:0] writeback_csr_wdata;
     logic [OOO_WIDTH-1:0] writeback_exception;
     logic [OOO_WIDTH-1:0] writeback_halted;
+
+    logic [31:0] csr_read_data [2];
+    logic [1:0] csr_read_illegal;
+    logic csr_commit_write;
+    logic [11:0] csr_commit_addr;
+    logic [31:0] csr_commit_wdata;
+    logic csr_retire;
+
+    fp_reg_data_t fp_regs_q [FP_REGS];
+    fp_reg_data_t fp_regs_next [FP_REGS];
+    logic serial_pending_q, serial_pending_next;
 
     logic branch_stack_full;
     logic branch_allocate;
@@ -255,6 +273,21 @@ module riscv_core_ooo (
         .src2_ready(busy_src2_ready)
     );
 
+    rv32g_csr_file CSRFile (
+        .clk,
+        .rst_l,
+        .retire(csr_retire),
+        .write_valid(csr_commit_write),
+        .write_addr(csr_commit_addr),
+        .write_data(csr_commit_wdata),
+        .read_addr0(int_issue_entry[0].instr[31:20]),
+        .read_addr1(int_issue_entry[1].instr[31:20]),
+        .read_data0(csr_read_data[0]),
+        .read_data1(csr_read_data[1]),
+        .read_illegal0(csr_read_illegal[0]),
+        .read_illegal1(csr_read_illegal[1])
+    );
+
     branch_stack BranchStack (
         .clk,
         .rst_l,
@@ -317,6 +350,7 @@ module riscv_core_ooo (
         .lane_is_branch,
         .lane_is_memory,
         .lane_is_terminal,
+        .lane_is_serializing,
         .active_list_full(active_full),
         .int_iq_full(int_iq_full),
         .mem_queue_full(mem_queue_full),
@@ -324,7 +358,7 @@ module riscv_core_ooo (
         .free_list_can_allocate(free_can_allocate),
         .free_list_available(free_count_snapshot),
         .suppress_dispatch(redirect_valid || terminal_pending_q ||
-            control_pending_q || halted_q),
+            control_pending_q || serial_pending_q || halted_q),
         .dispatch_valid,
         .dispatch_stall
     );
@@ -341,6 +375,12 @@ module riscv_core_ooo (
         .writeback_data(writeback_data),
         .writeback_exception(writeback_exception),
         .writeback_halted(writeback_halted),
+        .writeback_fp_write,
+        .writeback_fp_rd,
+        .writeback_fp_data,
+        .writeback_csr_write,
+        .writeback_csr_addr,
+        .writeback_csr_wdata,
         .reset_mask,
         .abort_mask,
         .full(active_full),
@@ -384,6 +424,8 @@ module riscv_core_ooo (
         .issue_entry(int_issue_entry[0]),
         .rs1_data(phys_rs1_data[0]),
         .rs2_data(phys_rs2_data[0]),
+        .csr_rdata(csr_read_data[0]),
+        .csr_illegal(csr_read_illegal[0]),
         .abort_mask,
         .writeback(alu0_writeback)
     );
@@ -395,6 +437,8 @@ module riscv_core_ooo (
         .issue_entry(int_issue_entry[1]),
         .rs1_data(phys_rs1_data[1]),
         .rs2_data(phys_rs2_data[1]),
+        .csr_rdata(csr_read_data[1]),
+        .csr_illegal(csr_read_illegal[1]),
         .abort_mask,
         .writeback(alu1_writeback)
     );
@@ -434,6 +478,12 @@ module riscv_core_ooo (
         .writeback_prd,
         .writeback_data,
         .writeback_has_dest,
+        .writeback_fp_write,
+        .writeback_fp_rd,
+        .writeback_fp_data,
+        .writeback_csr_write,
+        .writeback_csr_addr,
+        .writeback_csr_wdata,
         .writeback_exception,
         .writeback_halted,
         .branch_writeback
@@ -513,6 +563,7 @@ module riscv_core_ooo (
         lane_control_predicted = '0;
         lane_is_memory = '0;
         lane_is_terminal = '0;
+        lane_is_serializing = '0;
         alloc_req = '0;
         int_insert_valid = '0;
         mem_insert_valid = '0;
@@ -528,6 +579,12 @@ module riscv_core_ooo (
         predictor_redirect_valid = 1'b0;
         predictor_redirect_pc = '0;
         ras_stack_next = ras_stack_q;
+        fp_regs_next = fp_regs_q;
+        serial_pending_next = serial_pending_q;
+        csr_retire = 1'b0;
+        csr_commit_write = 1'b0;
+        csr_commit_addr = '0;
+        csr_commit_wdata = '0;
         ras_count_next = branch_restore_valid ?
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
         ras_checkpoint_count_next = ras_checkpoint_count_q;
@@ -566,6 +623,8 @@ module riscv_core_ooo (
                 (decode_lanes[i].ctrl.memRead || decode_lanes[i].ctrl.memWrite);
             lane_is_terminal[i] = lane_valid[i] &&
                 (decode_lanes[i].ctrl.syscall || decode_lanes[i].ctrl.illegal_instr);
+            lane_is_serializing[i] = lane_valid[i] &&
+                decode_lanes[i].ctrl.serializing;
             lane_predicted_pc[i] = decode_lanes[i].pc + 32'd4;
             lane_active_offset[i] = dispatch_count;
             if (lane_valid[i]) begin
@@ -668,6 +727,14 @@ module riscv_core_ooo (
             rename_packets[i].control_predicted = lane_control_predicted[i];
             rename_packets[i].predicted_pc = lane_predicted_pc[i];
             rename_packets[i].predictor_info = lane_predictor_info[i];
+            rename_packets[i].fp_rs1 = decode_lanes[i].rs1;
+            rename_packets[i].fp_rs2 = decode_lanes[i].rs2;
+            rename_packets[i].fp_rs3 = decode_lanes[i].instr[31:27];
+            rename_packets[i].fp_rd = decode_lanes[i].rd;
+            rename_packets[i].fp_src1_data = fp_regs_q[decode_lanes[i].rs1];
+            rename_packets[i].fp_src2_data = fp_regs_q[decode_lanes[i].rs2];
+            rename_packets[i].fp_src3_data =
+                fp_regs_q[decode_lanes[i].instr[31:27]];
 
             dispatch_issue_entries[i] = '0;
             dispatch_issue_entries[i].valid = dispatch_valid[i];
@@ -689,6 +756,16 @@ module riscv_core_ooo (
             dispatch_issue_entries[i].predicted_pc = rename_packets[i].predicted_pc;
             dispatch_issue_entries[i].predictor_info =
                 rename_packets[i].predictor_info;
+            dispatch_issue_entries[i].fp_rs1 = rename_packets[i].fp_rs1;
+            dispatch_issue_entries[i].fp_rs2 = rename_packets[i].fp_rs2;
+            dispatch_issue_entries[i].fp_rs3 = rename_packets[i].fp_rs3;
+            dispatch_issue_entries[i].fp_rd = rename_packets[i].fp_rd;
+            dispatch_issue_entries[i].fp_src1_data =
+                rename_packets[i].fp_src1_data;
+            dispatch_issue_entries[i].fp_src2_data =
+                rename_packets[i].fp_src2_data;
+            dispatch_issue_entries[i].fp_src3_data =
+                rename_packets[i].fp_src3_data;
 
             int_insert_valid[i] = dispatch_valid[i] && !lane_is_memory[i];
             mem_insert_valid[i] = dispatch_valid[i] && lane_is_memory[i];
@@ -786,10 +863,31 @@ module riscv_core_ooo (
             if (dispatch_valid[i] && lane_is_terminal[i] && !redirect_valid) begin
                 terminal_pending_next = 1'b1;
             end
+            if (dispatch_valid[i] && decode_lanes[i].ctrl.serializing) begin
+                serial_pending_next = 1'b1;
+            end
             if (dispatch_valid[i] && lane_is_unpredicted_control[i] &&
                     !lane_control_predicted[i]) begin
                 control_pending_next = 1'b1;
                 control_pending_id_next = branch_allocate_id;
+            end
+        end
+
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (retire_valid[i]) begin
+                csr_retire = 1'b1;
+                if (active_commit_packet[i].fp_write) begin
+                    fp_regs_next[active_commit_packet[i].fp_rd] =
+                        active_commit_packet[i].fp_data;
+                end
+                if (!csr_commit_write && active_commit_packet[i].csr_write) begin
+                    csr_commit_write = 1'b1;
+                    csr_commit_addr = active_commit_packet[i].csr_addr;
+                    csr_commit_wdata = active_commit_packet[i].csr_wdata;
+                end
+                if (active_commit_packet[i].serializing) begin
+                    serial_pending_next = 1'b0;
+                end
             end
         end
     end
@@ -803,8 +901,12 @@ module riscv_core_ooo (
             terminal_pending_q <= 1'b0;
             control_pending_q <= 1'b0;
             control_pending_id_q <= '0;
+            serial_pending_q <= 1'b0;
             abort_mask_q <= '0;
             ras_count_q <= '0;
+            for (int i = 0; i < FP_REGS; i += 1) begin
+                fp_regs_q[i] <= '0;
+            end
             for (int i = 0; i < RAS_DEPTH; i += 1) begin
                 ras_stack_q[i] <= '0;
             end
@@ -819,10 +921,12 @@ module riscv_core_ooo (
             terminal_pending_q <= terminal_pending_next;
             control_pending_q <= control_pending_next;
             control_pending_id_q <= control_pending_id_next;
+            serial_pending_q <= serial_pending_next;
             abort_mask_q <= abort_mask;
             ras_stack_q <= ras_stack_next;
             ras_count_q <= ras_count_next;
             ras_checkpoint_count_q <= ras_checkpoint_count_next;
+            fp_regs_q <= fp_regs_next;
         end
     end
 

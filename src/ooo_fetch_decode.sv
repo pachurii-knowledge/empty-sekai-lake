@@ -64,8 +64,8 @@ module ooo_fetch_decode
             decode_lanes[i].rs2 = decode_instr[i][24:20];
             decode_lanes[i].rd = decode_instr[i][11:7];
             decode_lanes[i].imm = immediate_for(lane_ctrl[i].imm_mode, decode_instr[i]);
-            decode_lanes[i].uses_rs1 = uses_rs1(decode_instr[i][6:0]);
-            decode_lanes[i].uses_rs2 = uses_rs2(decode_instr[i][6:0]);
+            decode_lanes[i].uses_rs1 = uses_rs1(decode_instr[i]);
+            decode_lanes[i].uses_rs2 = uses_rs2(decode_instr[i]);
         end
     end
 
@@ -84,16 +84,24 @@ module ooo_fetch_decode
         endcase
     endfunction
 
-    function automatic logic uses_rs1(logic [6:0] opcode);
+    function automatic logic uses_rs1(logic [31:0] raw_instr);
+        logic [6:0] opcode;
+        opcode = raw_instr[6:0];
         uses_rs1 = (opcode == RISCV_ISA::OP_OP) || (opcode == RISCV_ISA::OP_IMM) ||
             (opcode == RISCV_ISA::OP_LOAD) || (opcode == RISCV_ISA::OP_STORE) ||
             (opcode == RISCV_ISA::OP_BRANCH) || (opcode == RISCV_ISA::OP_JALR) ||
-            (opcode == RISCV_ISA::OP_SYSTEM);
+            (opcode == RISCV_ISA::OP_SYSTEM) || (opcode == RISCV_ISA::OP_LOAD_FP) ||
+            (opcode == RISCV_ISA::OP_STORE_FP) || (opcode == RISCV_ISA::OP_AMO) ||
+            ((opcode == RISCV_ISA::OP_FP) &&
+             ((raw_instr[31:27] == 5'b11010) ||
+              (raw_instr[31:27] == 5'b11110)));
     endfunction
 
-    function automatic logic uses_rs2(logic [6:0] opcode);
+    function automatic logic uses_rs2(logic [31:0] raw_instr);
+        logic [6:0] opcode;
+        opcode = raw_instr[6:0];
         uses_rs2 = (opcode == RISCV_ISA::OP_OP) || (opcode == RISCV_ISA::OP_STORE) ||
-            (opcode == RISCV_ISA::OP_BRANCH);
+            (opcode == RISCV_ISA::OP_BRANCH) || (opcode == RISCV_ISA::OP_AMO);
     endfunction
 
 endmodule: ooo_fetch_decode

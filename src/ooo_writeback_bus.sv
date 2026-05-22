@@ -14,6 +14,12 @@ module ooo_writeback_bus
     output phys_reg_t            writeback_prd [OOO_WIDTH],
     output logic [OOO_WIDTH-1:0][31:0] writeback_data,
     output logic [OOO_WIDTH-1:0] writeback_has_dest,
+    output logic [OOO_WIDTH-1:0] writeback_fp_write,
+    output arch_reg_t            writeback_fp_rd [OOO_WIDTH],
+    output fp_reg_data_t         writeback_fp_data [OOO_WIDTH],
+    output logic [OOO_WIDTH-1:0] writeback_csr_write,
+    output logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr,
+    output logic [OOO_WIDTH-1:0][31:0] writeback_csr_wdata,
     output logic [OOO_WIDTH-1:0] writeback_exception,
     output logic [OOO_WIDTH-1:0] writeback_halted,
     output writeback_packet_t    branch_writeback
@@ -35,6 +41,12 @@ module ooo_writeback_bus
             writeback_prd[i] = packets[i].prd;
             writeback_data[i] = packets[i].data;
             writeback_has_dest[i] = packets[i].has_dest;
+            writeback_fp_write[i] = packets[i].fp_write;
+            writeback_fp_rd[i] = packets[i].fp_rd;
+            writeback_fp_data[i] = packets[i].fp_data;
+            writeback_csr_write[i] = packets[i].csr_write;
+            writeback_csr_addr[i] = packets[i].csr_addr;
+            writeback_csr_wdata[i] = packets[i].csr_wdata;
             writeback_exception[i] = packets[i].exception;
             writeback_halted[i] = packets[i].halted;
             if (writeback_valid[i] && packets[i].branch_valid) begin
