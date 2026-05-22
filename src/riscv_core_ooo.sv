@@ -62,6 +62,8 @@ module riscv_core_ooo (
     logic dispatched_unpredicted_control;
     logic ras_redirect_valid;
     logic [31:0] ras_redirect_pc;
+    logic predictor_redirect_valid;
+    logic [31:0] predictor_redirect_pc;
 
     logic [31:0] ras_stack_q [RAS_DEPTH];
     logic [31:0] ras_stack_next [RAS_DEPTH];
@@ -69,6 +71,17 @@ module riscv_core_ooo (
     logic [RAS_COUNT_BITS-1:0] ras_checkpoint_count_q [BRANCH_STACK_SIZE];
     logic [RAS_COUNT_BITS-1:0] ras_checkpoint_count_next [BRANCH_STACK_SIZE];
     logic [RAS_COUNT_BITS-1:0] ras_branch_snapshot_count;
+
+    logic direct_lookup_valid;
+    logic [31:0] direct_lookup_pc;
+    logic direct_prediction;
+    predictor_info_t direct_prediction_info;
+    logic indirect_lookup_valid;
+    logic [31:0] indirect_lookup_pc;
+    logic indirect_prediction_valid;
+    logic [31:0] indirect_prediction_target;
+    predictor_info_t indirect_prediction_info;
+    predictor_info_t lane_predictor_info [OOO_WIDTH];
 
     arch_reg_t map_rs1 [OOO_WIDTH];
     arch_reg_t map_rs2 [OOO_WIDTH];
@@ -268,6 +281,36 @@ module riscv_core_ooo (
         .abort_mask(stack_abort_mask)
     );
 
+    tage_sc_l_predictor DirectBranchPredictor (
+        .clk,
+        .rst_l,
+        .lookup_valid(direct_lookup_valid),
+        .lookup_pc(direct_lookup_pc),
+        .prediction(direct_prediction),
+        .prediction_info(direct_prediction_info),
+        .update_valid(branch_writeback.valid && branch_writeback.branch_valid &&
+            (branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH)),
+        .update_pc(branch_writeback.pc),
+        .update_taken(branch_writeback.redirect_pc != (branch_writeback.pc + 32'd4)),
+        .update_info(branch_writeback.predictor_info)
+    );
+
+    ittage_predictor IndirectBranchPredictor (
+        .clk,
+        .rst_l,
+        .lookup_valid(indirect_lookup_valid),
+        .lookup_pc(indirect_lookup_pc),
+        .prediction_valid(indirect_prediction_valid),
+        .prediction_target(indirect_prediction_target),
+        .prediction_info(indirect_prediction_info),
+        .update_valid(branch_writeback.valid && branch_writeback.branch_valid &&
+            (branch_writeback.instr[6:0] == RISCV_ISA::OP_JALR) &&
+            !((branch_writeback.instr[19:15] == 5'd1) &&
+              (branch_writeback.instr[11:7] == 5'd0))),
+        .update_target(branch_writeback.redirect_pc),
+        .update_info(branch_writeback.predictor_info)
+    );
+
     ooo_dispatch_control DispatchControl (
         .lane_valid,
         .lane_has_dest,
@@ -438,6 +481,29 @@ module riscv_core_ooo (
     );
 
     always_comb begin
+        direct_lookup_valid = 1'b0;
+        direct_lookup_pc = '0;
+        indirect_lookup_valid = 1'b0;
+        indirect_lookup_pc = '0;
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (decode_lanes[i].valid && !decode_lanes[i].kill &&
+                    (decode_lanes[i].ctrl.pc_source == PC_cond) &&
+                    !direct_lookup_valid) begin
+                direct_lookup_valid = 1'b1;
+                direct_lookup_pc = decode_lanes[i].pc;
+            end
+            if (decode_lanes[i].valid && !decode_lanes[i].kill &&
+                    (decode_lanes[i].ctrl.pc_source == PC_indirect) &&
+                    !((decode_lanes[i].rs1 == 5'd1) &&
+                      (decode_lanes[i].rd == 5'd0)) &&
+                    !indirect_lookup_valid) begin
+                indirect_lookup_valid = 1'b1;
+                indirect_lookup_pc = decode_lanes[i].pc;
+            end
+        end
+    end
+
+    always_comb begin
         lane_valid = '0;
         lane_has_dest = '0;
         lane_is_branch = '0;
@@ -459,6 +525,8 @@ module riscv_core_ooo (
         dispatched_unpredicted_control = 1'b0;
         ras_redirect_valid = 1'b0;
         ras_redirect_pc = '0;
+        predictor_redirect_valid = 1'b0;
+        predictor_redirect_pc = '0;
         ras_stack_next = ras_stack_q;
         ras_count_next = branch_restore_valid ?
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
@@ -503,6 +571,7 @@ module riscv_core_ooo (
             if (lane_valid[i]) begin
                 valid_count += 1'b1;
             end
+            lane_predictor_info[i] = '0;
             if (dispatch_valid[i]) begin
                 dispatch_count += 1'b1;
             end else if (lane_valid[i] && !partial_resume_valid) begin
@@ -528,6 +597,25 @@ module riscv_core_ooo (
                     ras_redirect_pc =
                         ras_stack_next[RAS_INDEX_BITS'(ras_count_next - 1'b1)];
                     ras_count_next = ras_count_next - 1'b1;
+                end else if (decode_lanes[i].ctrl.pc_source == PC_cond) begin
+                    lane_predictor_info[i] = direct_prediction_info;
+                    if (direct_prediction) begin
+                        lane_control_predicted[i] = 1'b1;
+                        lane_predicted_pc[i] = decode_lanes[i].pc +
+                            decode_lanes[i].imm;
+                        predictor_redirect_valid = 1'b1;
+                        predictor_redirect_pc = decode_lanes[i].pc +
+                            decode_lanes[i].imm;
+                    end
+                end else if ((decode_lanes[i].ctrl.pc_source == PC_indirect) &&
+                        !lane_is_return[i]) begin
+                    lane_predictor_info[i] = indirect_prediction_info;
+                    if (indirect_prediction_valid) begin
+                        lane_control_predicted[i] = 1'b1;
+                        lane_predicted_pc[i] = indirect_prediction_target;
+                        predictor_redirect_valid = 1'b1;
+                        predictor_redirect_pc = indirect_prediction_target;
+                    end
                 end
                 if (lane_has_dest[i] && free_alloc_valid[i]) begin
                     branch_map_snapshot[decode_lanes[i].rd] = free_alloc_prd[i];
@@ -579,6 +667,7 @@ module riscv_core_ooo (
                 active_id_t'(lane_active_offset[i]);
             rename_packets[i].control_predicted = lane_control_predicted[i];
             rename_packets[i].predicted_pc = lane_predicted_pc[i];
+            rename_packets[i].predictor_info = lane_predictor_info[i];
 
             dispatch_issue_entries[i] = '0;
             dispatch_issue_entries[i].valid = dispatch_valid[i];
@@ -598,6 +687,8 @@ module riscv_core_ooo (
             dispatch_issue_entries[i].control_predicted =
                 rename_packets[i].control_predicted;
             dispatch_issue_entries[i].predicted_pc = rename_packets[i].predicted_pc;
+            dispatch_issue_entries[i].predictor_info =
+                rename_packets[i].predictor_info;
 
             int_insert_valid[i] = dispatch_valid[i] && !lane_is_memory[i];
             mem_insert_valid[i] = dispatch_valid[i] && lane_is_memory[i];
@@ -669,6 +760,10 @@ module riscv_core_ooo (
         end else if (!frontend_stall && !halted_q) begin
             if (ras_redirect_valid) begin
                 pc_next = ras_redirect_pc;
+                fetch_pc_pipe_next = '0;
+                fetch_valid_pipe_next = '0;
+            end else if (predictor_redirect_valid) begin
+                pc_next = predictor_redirect_pc;
                 fetch_pc_pipe_next = '0;
                 fetch_valid_pipe_next = '0;
             end else if (dispatched_unpredicted_control) begin

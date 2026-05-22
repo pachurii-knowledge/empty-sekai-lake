@@ -24,6 +24,21 @@ package OOO_Types;
     typedef logic [BRANCH_ID_BITS-1:0] branch_id_t;
 
     typedef struct packed {
+        logic        valid;
+        logic        predicted_taken;
+        logic        predicted_target_valid;
+        logic [31:0] predicted_target;
+        logic [1:0]  provider;
+        logic [9:0]  base_index;
+        logic [9:0]  index0;
+        logic [9:0]  index1;
+        logic [9:0]  index2;
+        logic [9:0]  tag0;
+        logic [9:0]  tag1;
+        logic [9:0]  tag2;
+    } predictor_info_t;
+
+    typedef struct packed {
         logic          valid;
         logic [31:0]   pc;
         logic [31:0]   instr;
@@ -44,6 +59,7 @@ package OOO_Types;
         active_id_t    active_id;
         logic          control_predicted;
         logic [31:0]   predicted_pc;
+        predictor_info_t predictor_info;
     } rename_packet_t;
 
     typedef struct packed {
@@ -63,6 +79,7 @@ package OOO_Types;
         active_id_t    active_id;
         logic          control_predicted;
         logic [31:0]   predicted_pc;
+        predictor_info_t predictor_info;
     } issue_entry_t;
 
     typedef struct packed {
@@ -80,6 +97,7 @@ package OOO_Types;
         logic [31:0]   redirect_pc;
         logic          control_predicted;
         logic [31:0]   predicted_pc;
+        predictor_info_t predictor_info;
         logic          exception;
         logic          halted;
     } writeback_packet_t;

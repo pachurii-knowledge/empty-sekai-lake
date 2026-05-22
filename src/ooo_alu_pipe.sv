@@ -37,6 +37,7 @@ module ooo_alu_pipe
             wb_next.redirect_pc = actual_target_for(issue_entry, rs1_data, rs2_data);
             wb_next.control_predicted = issue_entry.control_predicted;
             wb_next.predicted_pc = issue_entry.predicted_pc;
+            wb_next.predictor_info = issue_entry.predictor_info;
             wb_next.exception = issue_entry.ctrl.illegal_instr;
             wb_next.halted = issue_entry.ctrl.syscall && (rs1_data == 32'ha);
         end
