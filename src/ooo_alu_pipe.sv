@@ -22,6 +22,8 @@ module ooo_alu_pipe
         if (issue_valid && ((issue_entry.branch_mask & abort_mask) == '0)) begin
             wb_next.valid = 1'b1;
             wb_next.active_id = issue_entry.active_id;
+            wb_next.pc = issue_entry.pc;
+            wb_next.instr = issue_entry.instr;
             wb_next.prd = issue_entry.prd;
             wb_next.has_dest = issue_entry.has_dest;
             wb_next.data = result_for(issue_entry, rs1_data, rs2_data);
@@ -31,12 +33,10 @@ module ooo_alu_pipe
                 (issue_entry.ctrl.pc_source == PC_indirect);
             wb_next.branch_id = issue_entry.branch_id;
             wb_next.branch_mispredict = wb_next.branch_valid &&
-                (((issue_entry.ctrl.pc_source == PC_cond) &&
-                  (actual_target_for(issue_entry, rs1_data, rs2_data) !=
-                   (issue_entry.pc + 32'd4))) ||
-                 (issue_entry.ctrl.pc_source == PC_uncond) ||
-                 (issue_entry.ctrl.pc_source == PC_indirect));
+                branch_mispredict_for(issue_entry, rs1_data, rs2_data);
             wb_next.redirect_pc = actual_target_for(issue_entry, rs1_data, rs2_data);
+            wb_next.control_predicted = issue_entry.control_predicted;
+            wb_next.predicted_pc = issue_entry.predicted_pc;
             wb_next.exception = issue_entry.ctrl.illegal_instr;
             wb_next.halted = issue_entry.ctrl.syscall && (rs1_data == 32'ha);
         end
@@ -66,6 +66,21 @@ module ooo_alu_pipe
                 entry.ctrl.useImm ? entry.imm : src2, entry.ctrl.alu_op)};
             default: result_for = alu_result(alu_a, alu_b, entry.ctrl.alu_op);
         endcase
+    endfunction
+
+    function automatic logic branch_mispredict_for(issue_entry_t entry,
+            logic [31:0] src1, logic [31:0] src2);
+        if (entry.control_predicted) begin
+            branch_mispredict_for = actual_target_for(entry, src1, src2) !=
+                entry.predicted_pc;
+        end else if ((entry.ctrl.pc_source == PC_uncond) ||
+                (entry.ctrl.pc_source == PC_indirect)) begin
+            // Unpredicted jumps stall fetch and must redirect on resolution.
+            branch_mispredict_for = 1'b1;
+        end else begin
+            branch_mispredict_for = actual_target_for(entry, src1, src2) !=
+                (entry.pc + 32'd4);
+        end
     endfunction
 
     function automatic logic [31:0] actual_target_for(issue_entry_t entry,

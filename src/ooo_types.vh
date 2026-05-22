@@ -42,6 +42,8 @@ package OOO_Types;
         branch_mask_t  branch_mask;
         branch_id_t    branch_id;
         active_id_t    active_id;
+        logic          control_predicted;
+        logic [31:0]   predicted_pc;
     } rename_packet_t;
 
     typedef struct packed {
@@ -59,11 +61,15 @@ package OOO_Types;
         branch_mask_t  branch_mask;
         branch_id_t    branch_id;
         active_id_t    active_id;
+        logic          control_predicted;
+        logic [31:0]   predicted_pc;
     } issue_entry_t;
 
     typedef struct packed {
         logic          valid;
         active_id_t    active_id;
+        logic [31:0]   pc;
+        logic [31:0]   instr;
         phys_reg_t     prd;
         logic          has_dest;
         logic [31:0]   data;
@@ -72,6 +78,8 @@ package OOO_Types;
         branch_id_t    branch_id;
         logic          branch_mispredict;
         logic [31:0]   redirect_pc;
+        logic          control_predicted;
+        logic [31:0]   predicted_pc;
         logic          exception;
         logic          halted;
     } writeback_packet_t;

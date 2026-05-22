@@ -22,6 +22,9 @@ module riscv_core_ooo (
     import MemorySegments::USER_TEXT_START;
 
     localparam int PHYS_READ_PORTS = 2 + OOO_WIDTH;
+    localparam int RAS_DEPTH = 128;
+    localparam int RAS_INDEX_BITS = $clog2(RAS_DEPTH);
+    localparam int RAS_COUNT_BITS = $clog2(RAS_DEPTH + 1);
 
     logic [31:0] pc_q, pc_next;
     logic [1:0][31:0] fetch_pc_pipe_q, fetch_pc_pipe_next;
@@ -40,6 +43,10 @@ module riscv_core_ooo (
     logic [OOO_WIDTH-1:0] lane_has_dest;
     logic [OOO_WIDTH-1:0] lane_is_branch;
     logic [OOO_WIDTH-1:0] lane_is_unpredicted_control;
+    logic [OOO_WIDTH-1:0] lane_is_call;
+    logic [OOO_WIDTH-1:0] lane_is_return;
+    logic [OOO_WIDTH-1:0] lane_control_predicted;
+    logic [OOO_WIDTH-1:0][31:0] lane_predicted_pc;
     logic [OOO_WIDTH-1:0] lane_is_memory;
     logic [OOO_WIDTH-1:0] lane_is_terminal;
     logic [OOO_WIDTH-1:0] dispatch_valid;
@@ -53,6 +60,15 @@ module riscv_core_ooo (
     logic [2:0] partial_resume_lane;
     logic partial_resume_lane_is_branch;
     logic dispatched_unpredicted_control;
+    logic ras_redirect_valid;
+    logic [31:0] ras_redirect_pc;
+
+    logic [31:0] ras_stack_q [RAS_DEPTH];
+    logic [31:0] ras_stack_next [RAS_DEPTH];
+    logic [RAS_COUNT_BITS-1:0] ras_count_q, ras_count_next;
+    logic [RAS_COUNT_BITS-1:0] ras_checkpoint_count_q [BRANCH_STACK_SIZE];
+    logic [RAS_COUNT_BITS-1:0] ras_checkpoint_count_next [BRANCH_STACK_SIZE];
+    logic [RAS_COUNT_BITS-1:0] ras_branch_snapshot_count;
 
     arch_reg_t map_rs1 [OOO_WIDTH];
     arch_reg_t map_rs2 [OOO_WIDTH];
@@ -426,6 +442,9 @@ module riscv_core_ooo (
         lane_has_dest = '0;
         lane_is_branch = '0;
         lane_is_unpredicted_control = '0;
+        lane_is_call = '0;
+        lane_is_return = '0;
+        lane_control_predicted = '0;
         lane_is_memory = '0;
         lane_is_terminal = '0;
         alloc_req = '0;
@@ -438,6 +457,13 @@ module riscv_core_ooo (
         partial_resume_lane = '0;
         partial_resume_lane_is_branch = 1'b0;
         dispatched_unpredicted_control = 1'b0;
+        ras_redirect_valid = 1'b0;
+        ras_redirect_pc = '0;
+        ras_stack_next = ras_stack_q;
+        ras_count_next = branch_restore_valid ?
+            ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
+        ras_checkpoint_count_next = ras_checkpoint_count_q;
+        ras_branch_snapshot_count = ras_count_next;
         frontend_stall = dispatch_stall;
         branch_active_tail_snapshot = active_tail;
         branch_free_head_snapshot = free_head_snapshot;
@@ -461,22 +487,27 @@ module riscv_core_ooo (
             lane_is_unpredicted_control[i] = lane_valid[i] &&
                 ((decode_lanes[i].ctrl.pc_source == PC_uncond) ||
                  (decode_lanes[i].ctrl.pc_source == PC_indirect));
+            lane_is_call[i] = lane_valid[i] &&
+                (decode_lanes[i].ctrl.pc_source == PC_uncond) &&
+                (decode_lanes[i].rd != 5'd0);
+            lane_is_return[i] = lane_valid[i] &&
+                (decode_lanes[i].ctrl.pc_source == PC_indirect) &&
+                (decode_lanes[i].rs1 == 5'd1) &&
+                (decode_lanes[i].rd == 5'd0);
             lane_is_memory[i] = lane_valid[i] &&
                 (decode_lanes[i].ctrl.memRead || decode_lanes[i].ctrl.memWrite);
             lane_is_terminal[i] = lane_valid[i] &&
                 (decode_lanes[i].ctrl.syscall || decode_lanes[i].ctrl.illegal_instr);
+            lane_predicted_pc[i] = decode_lanes[i].pc + 32'd4;
             lane_active_offset[i] = dispatch_count;
             if (lane_valid[i]) begin
                 valid_count += 1'b1;
             end
             if (dispatch_valid[i]) begin
                 dispatch_count += 1'b1;
-                if (lane_is_unpredicted_control[i]) begin
-                    dispatched_unpredicted_control = 1'b1;
-                end
             end else if (lane_valid[i] && !partial_resume_valid) begin
                 partial_resume_valid = 1'b1;
-                partial_resume_lane = i;
+                partial_resume_lane = 3'(i);
                 partial_resume_lane_is_branch = lane_is_branch[i];
             end
         end
@@ -484,6 +515,20 @@ module riscv_core_ooo (
         branch_active_tail_snapshot = active_tail + active_id_t'(dispatch_count);
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (dispatch_valid[i]) begin
+                if (lane_is_call[i] &&
+                        (ras_count_next < RAS_COUNT_BITS'(RAS_DEPTH))) begin
+                    ras_stack_next[RAS_INDEX_BITS'(ras_count_next)] =
+                        decode_lanes[i].pc + 32'd4;
+                    ras_count_next = ras_count_next + 1'b1;
+                end else if (lane_is_return[i] && (ras_count_next != '0)) begin
+                    lane_control_predicted[i] = 1'b1;
+                    lane_predicted_pc[i] =
+                        ras_stack_next[RAS_INDEX_BITS'(ras_count_next - 1'b1)];
+                    ras_redirect_valid = 1'b1;
+                    ras_redirect_pc =
+                        ras_stack_next[RAS_INDEX_BITS'(ras_count_next - 1'b1)];
+                    ras_count_next = ras_count_next - 1'b1;
+                end
                 if (lane_has_dest[i] && free_alloc_valid[i]) begin
                     branch_map_snapshot[decode_lanes[i].rd] = free_alloc_prd[i];
                     branch_free_head_snapshot = branch_free_head_snapshot + 1'b1;
@@ -491,9 +536,19 @@ module riscv_core_ooo (
                 end
                 if (lane_is_branch[i]) begin
                     branch_active_tail_snapshot = active_tail +
-                        active_id_t'(lane_active_offset[i] + 1'b1);
+                        active_id_t'(lane_active_offset[i]) + active_id_t'(1);
+                    ras_branch_snapshot_count = ras_count_next;
                     break;
                 end
+            end
+        end
+        if (branch_allocate_valid) begin
+            ras_checkpoint_count_next[branch_allocate_id] = ras_branch_snapshot_count;
+        end
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (dispatch_valid[i] && lane_is_unpredicted_control[i] &&
+                    !lane_control_predicted[i]) begin
+                dispatched_unpredicted_control = 1'b1;
             end
         end
 
@@ -522,6 +577,8 @@ module riscv_core_ooo (
                 branch_allocate_id : '0;
             rename_packets[i].active_id = active_tail +
                 active_id_t'(lane_active_offset[i]);
+            rename_packets[i].control_predicted = lane_control_predicted[i];
+            rename_packets[i].predicted_pc = lane_predicted_pc[i];
 
             dispatch_issue_entries[i] = '0;
             dispatch_issue_entries[i].valid = dispatch_valid[i];
@@ -538,6 +595,9 @@ module riscv_core_ooo (
             dispatch_issue_entries[i].branch_mask = rename_packets[i].branch_mask;
             dispatch_issue_entries[i].branch_id = rename_packets[i].branch_id;
             dispatch_issue_entries[i].active_id = rename_packets[i].active_id;
+            dispatch_issue_entries[i].control_predicted =
+                rename_packets[i].control_predicted;
+            dispatch_issue_entries[i].predicted_pc = rename_packets[i].predicted_pc;
 
             int_insert_valid[i] = dispatch_valid[i] && !lane_is_memory[i];
             mem_insert_valid[i] = dispatch_valid[i] && lane_is_memory[i];
@@ -607,11 +667,15 @@ module riscv_core_ooo (
             fetch_pc_pipe_next = '0;
             fetch_valid_pipe_next = '0;
         end else if (!frontend_stall && !halted_q) begin
-            if (dispatched_unpredicted_control) begin
+            if (ras_redirect_valid) begin
+                pc_next = ras_redirect_pc;
+                fetch_pc_pipe_next = '0;
+                fetch_valid_pipe_next = '0;
+            end else if (dispatched_unpredicted_control) begin
                 fetch_pc_pipe_next = '0;
                 fetch_valid_pipe_next = '0;
             end else if (fetch_valid_pipe_q[1] && (dispatch_count < valid_count)) begin
-                pc_next = decode_lanes[dispatch_count].pc;
+                pc_next = decode_lanes[2'(dispatch_count)].pc;
                 fetch_pc_pipe_next = '0;
                 fetch_valid_pipe_next = '0;
             end else begin
@@ -627,7 +691,8 @@ module riscv_core_ooo (
             if (dispatch_valid[i] && lane_is_terminal[i] && !redirect_valid) begin
                 terminal_pending_next = 1'b1;
             end
-            if (dispatch_valid[i] && lane_is_unpredicted_control[i]) begin
+            if (dispatch_valid[i] && lane_is_unpredicted_control[i] &&
+                    !lane_control_predicted[i]) begin
                 control_pending_next = 1'b1;
                 control_pending_id_next = branch_allocate_id;
             end
@@ -644,6 +709,13 @@ module riscv_core_ooo (
             control_pending_q <= 1'b0;
             control_pending_id_q <= '0;
             abort_mask_q <= '0;
+            ras_count_q <= '0;
+            for (int i = 0; i < RAS_DEPTH; i += 1) begin
+                ras_stack_q[i] <= '0;
+            end
+            for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
+                ras_checkpoint_count_q[i] <= '0;
+            end
         end else begin
             pc_q <= pc_next;
             fetch_pc_pipe_q <= fetch_pc_pipe_next;
@@ -653,6 +725,9 @@ module riscv_core_ooo (
             control_pending_q <= control_pending_next;
             control_pending_id_q <= control_pending_id_next;
             abort_mask_q <= abort_mask;
+            ras_stack_q <= ras_stack_next;
+            ras_count_q <= ras_count_next;
+            ras_checkpoint_count_q <= ras_checkpoint_count_next;
         end
     end
 
@@ -663,5 +738,221 @@ module riscv_core_ooo (
 
 
 
+`ifdef SIMULATION_18447
+    localparam int PERF_STALL_BUCKETS = 8;
+    localparam int PERF_STALL_BITS = $clog2(PERF_STALL_BUCKETS);
+
+    logic [63:0] perf_cycle_counter;
+    logic [63:0] perf_dispatch_counter;
+    logic [63:0] perf_retire_counter;
+    logic [63:0] perf_frontend_stall_cycles;
+    logic [63:0] perf_branch_instructions;
+    logic [63:0] perf_mispredicted_branches;
+    logic [63:0] perf_alu_instructions;
+    logic [63:0] perf_load_instructions;
+    logic [63:0] perf_store_instructions;
+    logic [63:0] perf_total_data_reads;
+    logic [63:0] perf_total_data_writes;
+    logic [63:0] perf_stall_instr [PERF_STALL_BUCKETS];
+    logic [63:0] perf_branch_instr_counter [16];
+    logic [63:0] perf_jal_instr_counter [8];
+    logic [63:0] perf_jalr_instr_counter [8];
+    logic [63:0] perf_jalr_predicted_correct;
+    logic [63:0] perf_jalr_predicted_incorrect;
+    logic [63:0] perf_jalr_unpredicted;
+    logic [63:0] perf_return_predicted_correct;
+    logic [63:0] perf_return_predicted_incorrect;
+    logic [63:0] perf_return_unpredicted;
+    logic [63:0] perf_last_dispatch_cycle;
+    logic [63:0] perf_stall_cycles_prev;
+    logic perf_first_dispatch;
+
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin
+            perf_cycle_counter = 64'b0;
+            perf_dispatch_counter = 64'b0;
+            perf_retire_counter = 64'b0;
+            perf_frontend_stall_cycles = 64'b0;
+            perf_branch_instructions = 64'b0;
+            perf_mispredicted_branches = 64'b0;
+            perf_alu_instructions = 64'b0;
+            perf_load_instructions = 64'b0;
+            perf_store_instructions = 64'b0;
+            perf_total_data_reads = 64'b0;
+            perf_total_data_writes = 64'b0;
+            perf_jalr_predicted_correct = 64'b0;
+            perf_jalr_predicted_incorrect = 64'b0;
+            perf_jalr_unpredicted = 64'b0;
+            perf_return_predicted_correct = 64'b0;
+            perf_return_predicted_incorrect = 64'b0;
+            perf_return_unpredicted = 64'b0;
+            perf_last_dispatch_cycle = 64'b0;
+            perf_stall_cycles_prev = 64'b0;
+            perf_first_dispatch = 1'b1;
+            for (int i = 0; i < PERF_STALL_BUCKETS; i += 1) begin
+                perf_stall_instr[i] = 64'b0;
+            end
+            for (int i = 0; i < 16; i += 1) begin
+                perf_branch_instr_counter[i] = 64'b0;
+            end
+            for (int i = 0; i < 8; i += 1) begin
+                perf_jal_instr_counter[i] = 64'b0;
+                perf_jalr_instr_counter[i] = 64'b0;
+            end
+        end else if (!halted_q) begin
+            perf_cycle_counter = perf_cycle_counter + 64'd1;
+            if (frontend_stall || dispatched_unpredicted_control) begin
+                perf_frontend_stall_cycles = perf_frontend_stall_cycles + 64'd1;
+            end
+            if (data_load_en) begin
+                perf_total_data_reads = perf_total_data_reads + 64'd1;
+            end
+            if (data_store_mask != 4'b0) begin
+                perf_total_data_writes = perf_total_data_writes + 64'd1;
+            end
+
+            for (int i = 0; i < OOO_WIDTH; i += 1) begin
+                if (dispatch_valid[i]) begin
+                    perf_dispatch_counter = perf_dispatch_counter + 64'd1;
+                    if (!perf_first_dispatch) begin
+                        perf_stall_cycles_prev = perf_cycle_counter -
+                            perf_last_dispatch_cycle - 64'd1;
+                        if (perf_stall_cycles_prev < 64'(PERF_STALL_BUCKETS)) begin
+                            perf_stall_instr[PERF_STALL_BITS'(
+                                    perf_stall_cycles_prev)] =
+                                perf_stall_instr[PERF_STALL_BITS'(
+                                    perf_stall_cycles_prev)] + 64'd1;
+                        end
+                    end else begin
+                        perf_first_dispatch = 1'b0;
+                    end
+                    perf_last_dispatch_cycle = perf_cycle_counter;
+                end
+
+                if (retire_valid[i]) begin
+                    perf_retire_counter = perf_retire_counter + 64'd1;
+                    unique case (RISCV_ISA::opcode_t'(active_commit_packet[i].instr[6:0]))
+                        RISCV_ISA::OP_OP, RISCV_ISA::OP_IMM: begin
+                            perf_alu_instructions = perf_alu_instructions + 64'd1;
+                        end
+                        RISCV_ISA::OP_LOAD: begin
+                            perf_load_instructions = perf_load_instructions + 64'd1;
+                        end
+                        RISCV_ISA::OP_STORE: begin
+                            perf_store_instructions = perf_store_instructions + 64'd1;
+                        end
+                        default: begin
+                        end
+                    endcase
+                end
+            end
+
+            if (branch_writeback.valid && branch_writeback.branch_valid) begin
+                perf_branch_instructions = perf_branch_instructions + 64'd1;
+                if (branch_writeback.branch_mispredict) begin
+                    perf_mispredicted_branches = perf_mispredicted_branches + 64'd1;
+                end
+
+                unique case (RISCV_ISA::opcode_t'(branch_writeback.instr[6:0]))
+                    RISCV_ISA::OP_BRANCH: begin
+                        logic [3:0] branch_idx;
+                        branch_idx = {
+                            branch_writeback.redirect_pc < branch_writeback.pc,
+                            branch_writeback.redirect_pc != (branch_writeback.pc + 32'd4),
+                            branch_writeback.control_predicted,
+                            branch_writeback.branch_mispredict
+                        };
+                        perf_branch_instr_counter[branch_idx] =
+                            perf_branch_instr_counter[branch_idx] + 64'd1;
+                    end
+                    RISCV_ISA::OP_JAL: begin
+                        logic [2:0] jal_idx;
+                        jal_idx = {
+                            branch_writeback.instr[11:7] == 5'd1,
+                            branch_writeback.control_predicted,
+                            branch_writeback.branch_mispredict
+                        };
+                        perf_jal_instr_counter[jal_idx] =
+                            perf_jal_instr_counter[jal_idx] + 64'd1;
+                    end
+                    RISCV_ISA::OP_JALR: begin
+                        logic [2:0] jalr_idx;
+                        logic is_return;
+                        jalr_idx = {
+                            branch_writeback.instr[19:15] == 5'd1,
+                            branch_writeback.control_predicted,
+                            branch_writeback.branch_mispredict
+                        };
+                        is_return = (branch_writeback.instr[19:15] == 5'd1) &&
+                            (branch_writeback.instr[11:7] == 5'd0);
+                        perf_jalr_instr_counter[jalr_idx] =
+                            perf_jalr_instr_counter[jalr_idx] + 64'd1;
+                        if (branch_writeback.control_predicted &&
+                                !branch_writeback.branch_mispredict) begin
+                            perf_jalr_predicted_correct =
+                                perf_jalr_predicted_correct + 64'd1;
+                            if (is_return) begin
+                                perf_return_predicted_correct =
+                                    perf_return_predicted_correct + 64'd1;
+                            end
+                        end else if (branch_writeback.control_predicted) begin
+                            perf_jalr_predicted_incorrect =
+                                perf_jalr_predicted_incorrect + 64'd1;
+                            if (is_return) begin
+                                perf_return_predicted_incorrect =
+                                    perf_return_predicted_incorrect + 64'd1;
+                            end
+                        end else begin
+                            perf_jalr_unpredicted = perf_jalr_unpredicted + 64'd1;
+                            if (is_return) begin
+                                perf_return_unpredicted =
+                                    perf_return_unpredicted + 64'd1;
+                            end
+                        end
+                    end
+                    default: begin
+                    end
+                endcase
+            end
+        end
+    end
+
+    initial begin
+        wait (halted);
+        $display("FINAL OOO PERFORMANCE COUNTERS:");
+        $display("Total cycles: %0d", perf_cycle_counter);
+        $display("Instructions dispatched: %0d", perf_dispatch_counter);
+        $display("Instructions retired: %0d", perf_retire_counter);
+        $display("  ALU instructions: %0d", perf_alu_instructions);
+        $display("  Load instructions: %0d", perf_load_instructions);
+        $display("  Store instructions: %0d", perf_store_instructions);
+        $display("Frontend stall cycles: %0d", perf_frontend_stall_cycles);
+        for (int i = 0; i < PERF_STALL_BUCKETS; i += 1) begin
+            $display("Dispatched instructions with %0d stalls: %0d", i,
+                perf_stall_instr[i]);
+        end
+        for (int i = 0; i < 16; i += 1) begin
+            $display("Branch inst (idx %0d):     %0d", i,
+                perf_branch_instr_counter[i]);
+        end
+        for (int i = 0; i < 8; i += 1) begin
+            $display("JAL inst (idx %0d):        %0d", i,
+                perf_jal_instr_counter[i]);
+            $display("JALR inst (idx %0d):       %0d", i,
+                perf_jalr_instr_counter[i]);
+        end
+        $display("JALR predicted correct: %0d", perf_jalr_predicted_correct);
+        $display("JALR predicted incorrect: %0d", perf_jalr_predicted_incorrect);
+        $display("JALR unpredicted: %0d", perf_jalr_unpredicted);
+        $display("Return predicted correct: %0d", perf_return_predicted_correct);
+        $display("Return predicted incorrect: %0d", perf_return_predicted_incorrect);
+        $display("Return unpredicted: %0d", perf_return_unpredicted);
+        $display("Total data reads: %0d", perf_total_data_reads);
+        $display("Total data writes: %0d", perf_total_data_writes);
+        $display("Total control flow instructions: %0d", perf_branch_instructions);
+        $display("Mispredicted control flow instructions: %0d",
+            perf_mispredicted_branches);
+    end
+`endif /* SIMULATION_18447 */
 
 endmodule: riscv_core_ooo
