@@ -923,10 +923,16 @@ module riscv_core_ooo (
             control_pending_id_q <= control_pending_id_next;
             serial_pending_q <= serial_pending_next;
             abort_mask_q <= abort_mask;
-            ras_stack_q <= ras_stack_next;
             ras_count_q <= ras_count_next;
-            ras_checkpoint_count_q <= ras_checkpoint_count_next;
-            fp_regs_q <= fp_regs_next;
+            for (int i = 0; i < RAS_DEPTH; i += 1) begin
+                ras_stack_q[i] <= ras_stack_next[i];
+            end
+            for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
+                ras_checkpoint_count_q[i] <= ras_checkpoint_count_next[i];
+            end
+            for (int i = 0; i < FP_REGS; i += 1) begin
+                fp_regs_q[i] <= fp_regs_next[i];
+            end
         end
     end
 

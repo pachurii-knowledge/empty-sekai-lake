@@ -70,6 +70,11 @@ module int_issue_queue
                 if (!issue_valid[port] && entries_next[i].valid &&
                         entries_next[i].src1_ready && entries_next[i].src2_ready &&
                         !selected[i]) begin
+                    if (is_control_flow(entries_next[i]) &&
+                            (entries_next[i].branch_mask != '0)) begin
+                        branch_issue_blocked = 1'b1;
+                        continue;
+                    end
                     if (branch_issued && is_control_flow(entries_next[i])) begin
                         branch_issue_blocked = 1'b1;
                         continue;

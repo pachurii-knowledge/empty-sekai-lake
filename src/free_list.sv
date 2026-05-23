@@ -24,10 +24,11 @@ module free_list
 
     phys_reg_t entries_q [PHYS_REGS];
     phys_reg_t entries_next [PHYS_REGS];
+    typedef logic [$clog2(PHYS_REGS+1)-1:0] free_count_t;
     logic [$clog2(PHYS_REGS)-1:0] head_q, head_next;
     logic [$clog2(PHYS_REGS)-1:0] tail_q, tail_next;
-    logic [$clog2(PHYS_REGS+1)-1:0] count_q, count_next;
-    logic [$clog2(PHYS_REGS+1)-1:0] restore_reclaim_count;
+    free_count_t count_q, count_next;
+    free_count_t restore_reclaim_count;
     logic [$clog2(OOO_WIDTH+1)-1:0] alloc_count;
     logic [$clog2(OOO_WIDTH+1)-1:0] free_count;
 
@@ -77,13 +78,13 @@ module free_list
         end
     end
 
-    function automatic logic [$clog2(PHYS_REGS+1)-1:0] free_distance(
+    function automatic free_count_t free_distance(
             input logic [$clog2(PHYS_REGS)-1:0] from_ptr,
             input logic [$clog2(PHYS_REGS)-1:0] to_ptr);
         if (to_ptr >= from_ptr) begin
-            free_distance = logic'($clog2(PHYS_REGS+1))'(to_ptr - from_ptr);
+            free_distance = free_count_t'(to_ptr - from_ptr);
         end else begin
-            free_distance = logic'($clog2(PHYS_REGS+1))'(PHYS_REGS - from_ptr + to_ptr);
+            free_distance = free_count_t'(PHYS_REGS - from_ptr + to_ptr);
         end
     endfunction
 
