@@ -1022,12 +1022,6 @@ module riscv_core_ooo (
     end
 
 
-
-
-
-
-
-
 `ifdef SIMULATION_18447
     localparam int PERF_STALL_BUCKETS = 8;
     localparam int PERF_STALL_BITS = $clog2(PERF_STALL_BUCKETS);

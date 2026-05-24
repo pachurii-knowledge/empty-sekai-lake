@@ -652,7 +652,7 @@ module riscv_decode
                         end
                         5'b00101: begin
                             ctrl_signals.fp_op = instr[12] ? FP_MAX : FP_MIN;
-                            if (instr[13:12] != 2'b00) begin
+                            if (instr[14:13] != 2'b00) begin
                                 ctrl_signals.illegal_instr = 1'b1;
                             end
                         end

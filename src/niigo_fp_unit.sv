@@ -17,47 +17,280 @@ module niigo_fp_unit
     output writeback_packet_t writeback
 );
 
-    localparam int FP_LATENCY = 2;
+    localparam fpnew_pkg::fpu_implementation_t NIIGO_CVFPU_IMPL = '{
+        PipeRegs:   '{default: 1},
+        UnitTypes:  '{'{default: fpnew_pkg::PARALLEL},
+                      '{default: fpnew_pkg::MERGED},
+                      '{default: fpnew_pkg::PARALLEL},
+                      '{default: fpnew_pkg::MERGED}},
+        PipeConfig: fpnew_pkg::BEFORE
+    };
 
-    logic [FP_LATENCY-1:0] valid_q;
-    writeback_packet_t pipe_q [FP_LATENCY];
-    logic advance;
-    logic output_aborted;
+    issue_entry_t req_entry_q;
+    logic [31:0]  req_int_src_q;
+    logic         req_valid_q;
+    logic         req_is_simple;
+    logic         req_aborted;
 
-    assign output_aborted = valid_q[FP_LATENCY-1] &&
-        ((pipe_q[FP_LATENCY-1].branch_mask & abort_mask) != '0);
-    assign advance = writeback_ready || output_aborted || !valid_q[FP_LATENCY-1];
-    assign issue_ready = advance;
+    logic [2:0][63:0]         fpnew_operands;
+    fpnew_pkg::roundmode_e    fpnew_rnd_mode;
+    fpnew_pkg::operation_e    fpnew_op;
+    logic                     fpnew_op_mod;
+    fpnew_pkg::fp_format_e    fpnew_src_fmt;
+    fpnew_pkg::fp_format_e    fpnew_dst_fmt;
+    fpnew_pkg::int_format_e   fpnew_int_fmt;
+    logic                     fpnew_in_valid;
+    logic                     fpnew_in_ready;
+    logic [63:0]              fpnew_result;
+    fpnew_pkg::status_t       fpnew_status;
+    issue_entry_t             fpnew_tag;
+    logic                     fpnew_out_valid;
+    logic                     fpnew_out_ready;
+    logic                     fpnew_output_aborted;
+    logic                     fpnew_buffer_valid_q;
+    logic [63:0]              fpnew_buffer_result_q;
+    fpnew_pkg::status_t       fpnew_buffer_status_q;
+    issue_entry_t             fpnew_buffer_tag_q;
+    logic                     fpnew_buffer_aborted;
+    writeback_packet_t        simple_writeback;
+    writeback_packet_t        fpnew_writeback;
+    logic                     simple_writeback_valid;
+
+    assign issue_ready = !req_valid_q;
+    assign req_is_simple = is_simple_op(req_entry_q);
+    assign req_aborted = req_valid_q && ((req_entry_q.branch_mask & abort_mask) != '0);
+    assign simple_writeback_valid = req_valid_q && req_is_simple && !req_aborted;
+
+    assign fpnew_in_valid = req_valid_q && !req_is_simple && !req_aborted;
+    assign fpnew_output_aborted = fpnew_out_valid &&
+        ((fpnew_tag.branch_mask & abort_mask) != '0);
+    assign fpnew_buffer_aborted = fpnew_buffer_valid_q &&
+        ((fpnew_buffer_tag_q.branch_mask & abort_mask) != '0);
+    assign fpnew_out_ready = !fpnew_buffer_valid_q || fpnew_buffer_aborted ||
+        (writeback_ready && !simple_writeback_valid);
+
+    fpnew_top #(
+        .Features       ( fpnew_pkg::RV32D          ),
+        .Implementation ( NIIGO_CVFPU_IMPL          ),
+        .DivSqrtSel     ( fpnew_pkg::THMULTI        ),
+        .TagType        ( issue_entry_t             )
+    ) cvfpu (
+        .clk_i         ( clk                ),
+        .rst_ni        ( rst_l              ),
+        .operands_i    ( fpnew_operands     ),
+        .rnd_mode_i    ( fpnew_rnd_mode     ),
+        .op_i          ( fpnew_op           ),
+        .op_mod_i      ( fpnew_op_mod       ),
+        .src_fmt_i     ( fpnew_src_fmt      ),
+        .dst_fmt_i     ( fpnew_dst_fmt      ),
+        .int_fmt_i     ( fpnew_int_fmt      ),
+        .vectorial_op_i( 1'b0               ),
+        .tag_i         ( req_entry_q        ),
+        .simd_mask_i   ( '1                 ),
+        .in_valid_i    ( fpnew_in_valid     ),
+        .in_ready_o    ( fpnew_in_ready     ),
+        .flush_i       ( 1'b0               ),
+        .result_o      ( fpnew_result       ),
+        .status_o      ( fpnew_status       ),
+        .tag_o         ( fpnew_tag          ),
+        .out_valid_o   ( fpnew_out_valid    ),
+        .out_ready_i   ( fpnew_out_ready    ),
+        .busy_o        ( /* unused */       ),
+        .early_valid_o ( /* unused */       )
+    );
 
     always_comb begin
-        writeback = pipe_q[FP_LATENCY-1];
-        writeback.valid = valid_q[FP_LATENCY-1] && !output_aborted;
+        simple_writeback = packet_for_simple(req_entry_q, req_int_src_q);
+        fpnew_writeback = packet_for_fpnew(fpnew_buffer_tag_q,
+            fpnew_buffer_result_q, fpnew_buffer_status_q);
+        writeback = '0;
+        if (simple_writeback_valid) begin
+            writeback = simple_writeback;
+        end else if (fpnew_buffer_valid_q && !fpnew_buffer_aborted) begin
+            writeback = fpnew_writeback;
+        end
     end
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
-            valid_q <= '0;
-            for (int i = 0; i < FP_LATENCY; i += 1) begin
-                pipe_q[i] <= '0;
+            req_valid_q <= 1'b0;
+            req_entry_q <= '0;
+            req_int_src_q <= '0;
+            fpnew_buffer_valid_q <= 1'b0;
+            fpnew_buffer_result_q <= '0;
+            fpnew_buffer_status_q <= '0;
+            fpnew_buffer_tag_q <= '0;
+        end else begin
+            if (fpnew_buffer_valid_q &&
+                    (fpnew_buffer_aborted ||
+                     (writeback_ready && !simple_writeback_valid))) begin
+                fpnew_buffer_valid_q <= 1'b0;
             end
-        end else if (advance) begin
-            for (int i = FP_LATENCY - 1; i > 0; i -= 1) begin
-                valid_q[i] <= valid_q[i - 1] &&
-                    ((pipe_q[i - 1].branch_mask & abort_mask) == '0);
-                pipe_q[i] <= pipe_q[i - 1];
+            if (fpnew_out_valid && fpnew_out_ready && !fpnew_output_aborted) begin
+                fpnew_buffer_valid_q <= 1'b1;
+                fpnew_buffer_result_q <= fpnew_result;
+                fpnew_buffer_status_q <= fpnew_status;
+                fpnew_buffer_tag_q <= fpnew_tag;
             end
-            valid_q[0] <= issue_valid &&
-                ((issue_entry.branch_mask & abort_mask) == '0);
-            pipe_q[0] <= packet_for(issue_entry, rs1_data, frm);
+
+            if (req_valid_q) begin
+                if (req_aborted ||
+                        (req_is_simple && writeback_ready) ||
+                        (!req_is_simple && fpnew_in_ready)) begin
+                    req_valid_q <= 1'b0;
+                end
+            end
+
+            if (issue_valid && issue_ready &&
+                    ((issue_entry.branch_mask & abort_mask) == '0)) begin
+                req_valid_q <= 1'b1;
+                req_entry_q <= issue_entry;
+                req_int_src_q <= rs1_data;
+            end
+
         end
     end
 
-    function automatic writeback_packet_t packet_for(input issue_entry_t entry,
-            input logic [31:0] int_src, input logic [2:0] csr_frm);
-        writeback_packet_t packet;
+    always_comb begin
+        fpnew_operands = cvfpu_operands(req_entry_q, req_int_src_q);
+        fpnew_rnd_mode = cvfpu_round_mode(req_entry_q, frm);
+        fpnew_op = cvfpu_operation(req_entry_q.ctrl.fp_op);
+        fpnew_op_mod = cvfpu_op_mod(req_entry_q.ctrl.fp_op);
+        fpnew_src_fmt = cvfpu_src_format(req_entry_q);
+        fpnew_dst_fmt = cvfpu_dst_format(req_entry_q);
+        fpnew_int_fmt = fpnew_pkg::INT32;
+    end
+
+    function automatic logic is_simple_op(input issue_entry_t entry);
+        is_simple_op = (entry.ctrl.fp_op == FP_MV_X) ||
+            (entry.ctrl.fp_op == FP_MV_F_X);
+    endfunction
+
+    function automatic logic flags_write_valid(input issue_entry_t entry);
+        flags_write_valid = entry.ctrl.exec_class == EXEC_FP &&
+            !entry.ctrl.memRead && !entry.ctrl.memWrite &&
+            (entry.ctrl.fp_op != FP_MV_X) &&
+            (entry.ctrl.fp_op != FP_MV_F_X) &&
+            (entry.ctrl.fp_op != FP_SGNJ) &&
+            (entry.ctrl.fp_op != FP_SGNJN) &&
+            (entry.ctrl.fp_op != FP_SGNJX) &&
+            (entry.ctrl.fp_op != FP_CLASS);
+    endfunction
+
+    function automatic fpnew_pkg::roundmode_e cvfpu_round_mode(
+            input issue_entry_t entry, input logic [2:0] csr_frm);
         logic [2:0] rm;
-        packet = '0;
         rm = (entry.instr[14:12] == 3'b111) ? csr_frm : entry.instr[14:12];
+        unique case (entry.ctrl.fp_op)
+            FP_SGNJ:  cvfpu_round_mode = fpnew_pkg::RNE;
+            FP_SGNJN: cvfpu_round_mode = fpnew_pkg::RTZ;
+            FP_SGNJX: cvfpu_round_mode = fpnew_pkg::RDN;
+            FP_MIN:   cvfpu_round_mode = fpnew_pkg::RNE;
+            FP_MAX:   cvfpu_round_mode = fpnew_pkg::RTZ;
+            FP_LE:    cvfpu_round_mode = fpnew_pkg::RNE;
+            FP_LT:    cvfpu_round_mode = fpnew_pkg::RTZ;
+            FP_EQ:    cvfpu_round_mode = fpnew_pkg::RDN;
+            default: begin
+                unique case (rm)
+                    3'b000: cvfpu_round_mode = fpnew_pkg::RNE;
+                    3'b001: cvfpu_round_mode = fpnew_pkg::RTZ;
+                    3'b010: cvfpu_round_mode = fpnew_pkg::RDN;
+                    3'b011: cvfpu_round_mode = fpnew_pkg::RUP;
+                    3'b100: cvfpu_round_mode = fpnew_pkg::RMM;
+                    default: cvfpu_round_mode = fpnew_pkg::RNE;
+                endcase
+            end
+        endcase
+    endfunction
+
+    function automatic fpnew_pkg::operation_e cvfpu_operation(input fp_op_t op);
+        unique case (op)
+            FP_ADD,
+            FP_SUB:     cvfpu_operation = fpnew_pkg::ADD;
+            FP_MUL:     cvfpu_operation = fpnew_pkg::MUL;
+            FP_DIV:     cvfpu_operation = fpnew_pkg::DIV;
+            FP_SQRT:    cvfpu_operation = fpnew_pkg::SQRT;
+            FP_SGNJ,
+            FP_SGNJN,
+            FP_SGNJX:   cvfpu_operation = fpnew_pkg::SGNJ;
+            FP_MIN,
+            FP_MAX:     cvfpu_operation = fpnew_pkg::MINMAX;
+            FP_EQ,
+            FP_LT,
+            FP_LE:      cvfpu_operation = fpnew_pkg::CMP;
+            FP_CLASS:   cvfpu_operation = fpnew_pkg::CLASSIFY;
+            FP_CVT_W,
+            FP_CVT_WU:  cvfpu_operation = fpnew_pkg::F2I;
+            FP_CVT_F_W,
+            FP_CVT_F_WU: cvfpu_operation = fpnew_pkg::I2F;
+            FP_CVT_F_F: cvfpu_operation = fpnew_pkg::F2F;
+            FP_MADD,
+            FP_MSUB:    cvfpu_operation = fpnew_pkg::FMADD;
+            FP_NMSUB,
+            FP_NMADD:   cvfpu_operation = fpnew_pkg::FNMSUB;
+            default:    cvfpu_operation = fpnew_pkg::ADD;
+        endcase
+    endfunction
+
+    function automatic logic cvfpu_op_mod(input fp_op_t op);
+        unique case (op)
+            FP_SUB,
+            FP_MSUB,
+            FP_NMADD,
+            FP_CVT_WU,
+            FP_CVT_F_WU: cvfpu_op_mod = 1'b1;
+            default:     cvfpu_op_mod = 1'b0;
+        endcase
+    endfunction
+
+    function automatic fpnew_pkg::fp_format_e cvfpu_dst_format(
+            input issue_entry_t entry);
+        cvfpu_dst_format = entry.ctrl.fp_double ? fpnew_pkg::FP64 :
+            fpnew_pkg::FP32;
+    endfunction
+
+    function automatic fpnew_pkg::fp_format_e cvfpu_src_format(
+            input issue_entry_t entry);
+        if (entry.ctrl.fp_op == FP_CVT_F_F) begin
+            cvfpu_src_format = entry.ctrl.fp_double ? fpnew_pkg::FP32 :
+                fpnew_pkg::FP64;
+        end else begin
+            cvfpu_src_format = cvfpu_dst_format(entry);
+        end
+    endfunction
+
+    function automatic logic [2:0][63:0] cvfpu_operands(
+            input issue_entry_t entry, input logic [31:0] int_src);
+        cvfpu_operands = '0;
+        unique case (entry.ctrl.fp_op)
+            FP_ADD,
+            FP_SUB: begin
+                cvfpu_operands[1] = entry.fp_src1_data;
+                cvfpu_operands[2] = entry.fp_src2_data;
+            end
+            FP_MUL,
+            FP_MADD,
+            FP_MSUB,
+            FP_NMSUB,
+            FP_NMADD: begin
+                cvfpu_operands[0] = entry.fp_src1_data;
+                cvfpu_operands[1] = entry.fp_src2_data;
+                cvfpu_operands[2] = entry.fp_src3_data;
+            end
+            FP_CVT_F_W,
+            FP_CVT_F_WU: begin
+                cvfpu_operands[0] = {32'b0, int_src};
+            end
+            default: begin
+                cvfpu_operands[0] = entry.fp_src1_data;
+                cvfpu_operands[1] = entry.fp_src2_data;
+            end
+        endcase
+    endfunction
+
+    function automatic writeback_packet_t base_packet(input issue_entry_t entry);
+        writeback_packet_t packet;
+        packet = '0;
         packet.valid = 1'b1;
         packet.active_id = entry.active_id;
         packet.pc = entry.pc;
@@ -65,296 +298,40 @@ module niigo_fp_unit
         packet.prd = entry.prd;
         packet.has_dest = entry.has_dest;
         packet.branch_mask = entry.branch_mask;
-        packet.data = fp_gpr_result_for(entry, int_src);
         packet.fp_write = entry.ctrl.fp_writes_fpr &&
             !entry.ctrl.memRead && !entry.ctrl.memWrite;
         packet.fp_rd = entry.fp_rd;
-        packet.fp_data = fp_result_for(entry, int_src, rm);
-        packet.fp_fflags_valid = fp_flags_write_valid(entry);
-        packet.fp_fflags = fp_flags_for(entry, rm);
+        packet.fp_fflags_valid = flags_write_valid(entry);
         return packet;
     endfunction
 
-    function automatic logic fp_flags_write_valid(input issue_entry_t entry);
-        fp_flags_write_valid = entry.ctrl.exec_class == EXEC_FP &&
-            !entry.ctrl.memRead && !entry.ctrl.memWrite &&
-            (entry.ctrl.fp_op != FP_MV_X) && (entry.ctrl.fp_op != FP_MV_F_X) &&
-            (entry.ctrl.fp_op != FP_SGNJ) && (entry.ctrl.fp_op != FP_SGNJN) &&
-            (entry.ctrl.fp_op != FP_SGNJX) && (entry.ctrl.fp_op != FP_CLASS);
-    endfunction
-
-    function automatic logic [4:0] fp_flags_for(input issue_entry_t entry,
-            input logic [2:0] rm);
-        logic [4:0] flags;
-        logic src1_nan;
-        logic src2_nan;
-        logic src2_zero;
-        flags = 5'b0;
-        src1_nan = fp_is_nan(entry.ctrl.fp_double, entry.fp_src1_data);
-        src2_nan = fp_is_nan(entry.ctrl.fp_double, entry.fp_src2_data);
-        src2_zero = fp_is_zero(entry.ctrl.fp_double, entry.fp_src2_data);
-        if ((rm > 3'b100) && (entry.instr[14:12] == 3'b111)) begin
-            flags[4] = 1'b1;
-        end
-        if (src1_nan || src2_nan) begin
-            flags[4] = (entry.ctrl.fp_op == FP_LT) || (entry.ctrl.fp_op == FP_LE) ||
-                (entry.ctrl.fp_op == FP_MIN) || (entry.ctrl.fp_op == FP_MAX);
-        end
-        if ((entry.ctrl.fp_op == FP_DIV) && src2_zero &&
-                !fp_is_zero(entry.ctrl.fp_double, entry.fp_src1_data)) begin
-            flags[3] = 1'b1;
-        end
-        if ((entry.ctrl.fp_op == FP_SQRT) && fp_is_negative(entry.ctrl.fp_double,
-                entry.fp_src1_data) && !fp_is_zero(entry.ctrl.fp_double,
-                entry.fp_src1_data)) begin
-            flags[4] = 1'b1;
-        end
-        fp_flags_for = flags;
-    endfunction
-
-    function automatic logic fp_is_nan(input logic is_double,
-            input fp_reg_data_t value);
-        if (is_double) begin
-            fp_is_nan = (value[62:52] == 11'h7ff) && (value[51:0] != '0);
-        end else begin
-            fp_is_nan = (value[30:23] == 8'hff) && (value[22:0] != '0);
-        end
-    endfunction
-
-    function automatic logic fp_is_zero(input logic is_double,
-            input fp_reg_data_t value);
-        if (is_double) begin
-            fp_is_zero = value[62:0] == '0;
-        end else begin
-            fp_is_zero = value[30:0] == '0;
-        end
-    endfunction
-
-    function automatic logic fp_is_negative(input logic is_double,
-            input fp_reg_data_t value);
-        fp_is_negative = is_double ? value[63] : value[31];
-    endfunction
-
-    function automatic fp_reg_data_t fp_result_for(issue_entry_t entry,
-            logic [31:0] int_src, logic [2:0] rm);
-        real a;
-        real b;
-        real c;
-        real r;
-        logic [31:0] s_bits;
-        logic [63:0] d_bits;
-        a = entry.ctrl.fp_double ? $bitstoreal(entry.fp_src1_data) :
-            fp32_to_real(entry.fp_src1_data[31:0]);
-        b = entry.ctrl.fp_double ? $bitstoreal(entry.fp_src2_data) :
-            fp32_to_real(entry.fp_src2_data[31:0]);
-        c = entry.ctrl.fp_double ? $bitstoreal(entry.fp_src3_data) :
-            fp32_to_real(entry.fp_src3_data[31:0]);
+    function automatic writeback_packet_t packet_for_simple(
+            input issue_entry_t entry, input logic [31:0] int_src);
+        writeback_packet_t packet;
+        packet = base_packet(entry);
         unique case (entry.ctrl.fp_op)
-            FP_ADD: r = a + b;
-            FP_SUB: r = a - b;
-            FP_MUL: r = a * b;
-            FP_DIV: r = a / b;
-            FP_SQRT: r = $sqrt(a);
-            FP_MIN: r = (a < b) ? a : b;
-            FP_MAX: r = (a > b) ? a : b;
-            FP_MADD: r = (a * b) + c;
-            FP_MSUB: r = (a * b) - c;
-            FP_NMSUB: r = c - (a * b);
-            FP_NMADD: r = -(a * b) - c;
-            FP_CVT_F_W: r = real'(signed'(int_src));
-            FP_CVT_F_WU: r = real'(int_src);
-            FP_CVT_F_F: begin
-                fp_result_for = fp_convert_format(entry, rm);
-                return fp_result_for;
+            FP_MV_X: begin
+                packet.data = entry.fp_src1_data[31:0];
+                packet.fp_write = 1'b0;
             end
             FP_MV_F_X: begin
-                fp_result_for = {32'hffff_ffff, int_src};
-                return fp_result_for;
+                packet.fp_data = entry.ctrl.fp_double ? {32'b0, int_src} :
+                    {32'hffff_ffff, int_src};
             end
-            FP_SGNJ, FP_SGNJN, FP_SGNJX: begin
-                fp_result_for = fp_sign_result(entry);
-                return fp_result_for;
+            default: begin
             end
-            default: r = a;
         endcase
-        if (entry.ctrl.fp_double) begin
-            d_bits = $realtobits(r);
-            fp_result_for = d_bits;
-        end else begin
-            s_bits = real_to_fp32(r, rm);
-            fp_result_for = {32'hffff_ffff, s_bits};
-        end
+        return packet;
     endfunction
 
-    function automatic fp_reg_data_t fp_convert_format(input issue_entry_t entry,
-            input logic [2:0] rm);
-        real value;
-        if (entry.ctrl.fp_double) begin
-            value = fp32_to_real(entry.fp_src1_data[31:0]);
-            fp_convert_format = $realtobits(value);
-        end else begin
-            value = $bitstoreal(entry.fp_src1_data);
-            fp_convert_format = {32'hffff_ffff, real_to_fp32(value, rm)};
-        end
-    endfunction
-
-    function automatic fp_reg_data_t fp_sign_result(issue_entry_t entry);
-        logic [63:0] mag;
-        logic sign_bit;
-        if (entry.ctrl.fp_double) begin
-            mag = {1'b0, entry.fp_src1_data[62:0]};
-            unique case (entry.ctrl.fp_op)
-                FP_SGNJ: sign_bit = entry.fp_src2_data[63];
-                FP_SGNJN: sign_bit = ~entry.fp_src2_data[63];
-                default: sign_bit = entry.fp_src1_data[63] ^ entry.fp_src2_data[63];
-            endcase
-            fp_sign_result = {sign_bit, mag[62:0]};
-        end else begin
-            mag = {32'hffff_ffff, 1'b0, entry.fp_src1_data[30:0]};
-            unique case (entry.ctrl.fp_op)
-                FP_SGNJ: sign_bit = entry.fp_src2_data[31];
-                FP_SGNJN: sign_bit = ~entry.fp_src2_data[31];
-                default: sign_bit = entry.fp_src1_data[31] ^ entry.fp_src2_data[31];
-            endcase
-            fp_sign_result = {32'hffff_ffff, sign_bit, mag[30:0]};
-        end
-    endfunction
-
-    function automatic logic [31:0] fp_gpr_result_for(issue_entry_t entry,
-            logic [31:0] int_src);
-        real a;
-        real b;
-        a = entry.ctrl.fp_double ? $bitstoreal(entry.fp_src1_data) :
-            fp32_to_real(entry.fp_src1_data[31:0]);
-        b = entry.ctrl.fp_double ? $bitstoreal(entry.fp_src2_data) :
-            fp32_to_real(entry.fp_src2_data[31:0]);
-        unique case (entry.ctrl.fp_op)
-            FP_CVT_W:  fp_gpr_result_for = 32'($rtoi(a));
-            FP_CVT_WU: fp_gpr_result_for = 32'($rtoi(a));
-            FP_MV_X:   fp_gpr_result_for = entry.fp_src1_data[31:0];
-            FP_EQ:     fp_gpr_result_for = {31'b0, a == b};
-            FP_LT:     fp_gpr_result_for = {31'b0, a < b};
-            FP_LE:     fp_gpr_result_for = {31'b0, a <= b};
-            FP_CLASS:  fp_gpr_result_for = fp_class(entry);
-            default:   fp_gpr_result_for = int_src;
-        endcase
-    endfunction
-
-    function automatic real fp32_to_real(input logic [31:0] bits);
-        int exp;
-        int frac;
-        real mant;
-        real value;
-        exp = int'(bits[30:23]);
-        frac = int'(bits[22:0]);
-        if (exp == 0) begin
-            mant = real'(frac) / 8388608.0;
-            value = mant * pow2(-126);
-        end else if (exp == 255) begin
-            value = 0.0;
-        end else begin
-            mant = 1.0 + (real'(frac) / 8388608.0);
-            value = mant * pow2(exp - 127);
-        end
-        fp32_to_real = bits[31] ? -value : value;
-    endfunction
-
-    function automatic logic [31:0] real_to_fp32(input real value,
-            input logic [2:0] rm);
-        logic sign;
-        int exp;
-        int frac;
-        real norm;
-        real abs_value;
-        logic [7:0] exp_bits;
-        logic [22:0] frac_bits;
-        if (value == 0.0) begin
-            real_to_fp32 = 32'b0;
-        end else begin
-            sign = value < 0.0;
-            abs_value = sign ? -value : value;
-            exp = 127;
-            norm = abs_value;
-            while (norm >= 2.0) begin
-                norm = norm / 2.0;
-                exp += 1;
-            end
-            while (norm < 1.0) begin
-                norm = norm * 2.0;
-                exp -= 1;
-            end
-            frac = rounded_fraction(norm, sign, rm);
-            if (frac >= 8388608) begin
-                frac = 0;
-                exp += 1;
-            end
-            exp_bits = 8'(exp);
-            frac_bits = 23'(frac);
-            real_to_fp32 = {sign, exp_bits, frac_bits};
-        end
-    endfunction
-
-    function automatic int rounded_fraction(input real norm, input logic sign,
-            input logic [2:0] rm);
-        real scaled;
-        int trunc_value;
-        scaled = (norm - 1.0) * 8388608.0;
-        trunc_value = int'(scaled);
-        unique case (rm)
-            3'b010: rounded_fraction = trunc_value;
-            3'b011: rounded_fraction = (!sign && (scaled > real'(trunc_value))) ?
-                trunc_value + 1 : trunc_value;
-            3'b100: rounded_fraction = (sign && (scaled > real'(trunc_value))) ?
-                trunc_value + 1 : trunc_value;
-            default: rounded_fraction = int'(scaled + 0.5);
-        endcase
-    endfunction
-
-    function automatic real pow2(input int exponent);
-        real value;
-        value = 1.0;
-        if (exponent >= 0) begin
-            for (int i = 0; i < exponent; i += 1) begin
-                value = value * 2.0;
-            end
-        end else begin
-            for (int i = 0; i < -exponent; i += 1) begin
-                value = value / 2.0;
-            end
-        end
-        pow2 = value;
-    endfunction
-
-    function automatic logic [31:0] fp_class(issue_entry_t entry);
-        logic sign;
-        logic [10:0] exp_d;
-        logic [51:0] frac_d;
-        logic [7:0] exp_s;
-        logic [22:0] frac_s;
-        fp_class = 32'b0;
-        if (entry.ctrl.fp_double) begin
-            sign = entry.fp_src1_data[63];
-            exp_d = entry.fp_src1_data[62:52];
-            frac_d = entry.fp_src1_data[51:0];
-            if (exp_d == 11'h7ff) begin
-                fp_class[frac_d == 0 ? (sign ? 0 : 7) : 9] = 1'b1;
-            end else if (exp_d == 0) begin
-                fp_class[frac_d == 0 ? (sign ? 3 : 4) : (sign ? 2 : 5)] = 1'b1;
-            end else begin
-                fp_class[sign ? 1 : 6] = 1'b1;
-            end
-        end else begin
-            sign = entry.fp_src1_data[31];
-            exp_s = entry.fp_src1_data[30:23];
-            frac_s = entry.fp_src1_data[22:0];
-            if (exp_s == 8'hff) begin
-                fp_class[frac_s == 0 ? (sign ? 0 : 7) : 9] = 1'b1;
-            end else if (exp_s == 0) begin
-                fp_class[frac_s == 0 ? (sign ? 3 : 4) : (sign ? 2 : 5)] = 1'b1;
-            end else begin
-                fp_class[sign ? 1 : 6] = 1'b1;
-            end
-        end
+    function automatic writeback_packet_t packet_for_fpnew(input issue_entry_t entry,
+            input logic [63:0] result, input fpnew_pkg::status_t status);
+        writeback_packet_t packet;
+        packet = base_packet(entry);
+        packet.data = result[31:0];
+        packet.fp_data = result;
+        packet.fp_fflags = {status.NV, status.DZ, status.OF, status.UF, status.NX};
+        return packet;
     endfunction
 
 endmodule: niigo_fp_unit

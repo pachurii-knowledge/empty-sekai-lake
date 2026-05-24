@@ -92,7 +92,9 @@ module load_store_queue
                                 ((entries_next[i].entry.ctrl.exec_class == EXEC_AMO) ?
                                  32'b0 : entries_next[i].entry.imm);
                         end
-                        if (entries_next[i].entry.prs2 == wakeup_prd[w]) begin
+                        if ((entries_next[i].entry.prs2 == wakeup_prd[w]) &&
+                                !((entries_next[i].entry.ctrl.exec_class == EXEC_FP) &&
+                                  entries_next[i].entry.ctrl.memWrite)) begin
                             entries_next[i].entry.src2_ready = 1'b1;
                             entries_next[i].data_ready = 1'b1;
                             format_store(entries_next[i].entry.ctrl.ldst_mode,
@@ -349,6 +351,7 @@ module load_store_queue
             default:  amo_result = old_value;
         endcase
     endfunction
+
 
 
 

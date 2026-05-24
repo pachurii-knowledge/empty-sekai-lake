@@ -19,9 +19,48 @@ VERILATOR_EXECUTABLE := $(VERILATOR_OBJ_PATH)/V$(VERILATOR_TOP_MODULE)
 
 VERILATOR_SYNTHESIS_ONLY_SRC := $(SRC_DIR)/riscv_core_timing.sv \
 		$(SRC_DIR)/sram_synthesis.sv
-VERILATOR_SRC := $(filter-out $(VERILATOR_SYNTHESIS_ONLY_SRC), \
+CVFPU_DIR := $(SRC_DIR)/cvfpu
+VERILATOR_SRC := $(filter-out $(VERILATOR_SYNTHESIS_ONLY_SRC) $(CVFPU_DIR)/%, \
 		$(filter %.v %.sv,$(SRC)))
-VERILATOR_DESIGN_SRC := $(sort $(VERILATOR_SRC))
+CVFPU_SRC := \
+		$(CVFPU_DIR)/src/fpnew_pkg.sv \
+		$(CVFPU_DIR)/src/fpnew_cast_multi.sv \
+		$(CVFPU_DIR)/src/fpnew_classifier.sv \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/clk/rtl/gated_clk_cell.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fdsu/rtl/pa_fdsu_ctrl.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fdsu/rtl/pa_fdsu_ff1.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fdsu/rtl/pa_fdsu_pack_single.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fdsu/rtl/pa_fdsu_prepare.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fdsu/rtl/pa_fdsu_round_single.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fdsu/rtl/pa_fdsu_special.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fdsu/rtl/pa_fdsu_srt_single.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fdsu/rtl/pa_fdsu_top.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fpu/rtl/pa_fpu_dp.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fpu/rtl/pa_fpu_frbus.v \
+		$(CVFPU_DIR)/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fpu/rtl/pa_fpu_src_type.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_ctrl.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_double.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_ff1.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_pack.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_prepare.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_round.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_scalar_dp.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_srt_radix16_bound_table.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_srt_radix16_with_sqrt.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_srt.v \
+		$(CVFPU_DIR)/vendor/openc910/C910_RTL_FACTORY/gen_rtl/vfdsu/rtl/ct_vfdsu_top.v \
+		$(CVFPU_DIR)/src/fpnew_divsqrt_th_32.sv \
+		$(CVFPU_DIR)/src/fpnew_divsqrt_th_64_multi.sv \
+		$(CVFPU_DIR)/src/fpnew_divsqrt_multi.sv \
+		$(CVFPU_DIR)/src/fpnew_fma.sv \
+		$(CVFPU_DIR)/src/fpnew_fma_multi.sv \
+		$(CVFPU_DIR)/src/fpnew_noncomp.sv \
+		$(CVFPU_DIR)/src/fpnew_opgroup_block.sv \
+		$(CVFPU_DIR)/src/fpnew_opgroup_fmt_slice.sv \
+		$(CVFPU_DIR)/src/fpnew_opgroup_multifmt_slice.sv \
+		$(CVFPU_DIR)/src/fpnew_rounding.sv \
+		$(CVFPU_DIR)/src/fpnew_top.sv
+VERILATOR_DESIGN_SRC := $(CVFPU_SRC) $(sort $(VERILATOR_SRC))
 
 VERILATOR_INC_FLAGS := $(addprefix -I,$(SRC_SUBDIRS))
 VERILATOR_CFLAGS ?= --sv --timing --binary -Wno-fatal \
