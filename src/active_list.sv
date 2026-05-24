@@ -22,6 +22,8 @@ module active_list
     input  logic [OOO_WIDTH-1:0]  writeback_csr_write,
     input  logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr,
     input  logic [OOO_WIDTH-1:0][31:0] writeback_csr_wdata,
+    input  logic [OOO_WIDTH-1:0]  writeback_fp_fflags_valid,
+    input  logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags,
     input  branch_mask_t          reset_mask,
     input  branch_mask_t          abort_mask,
     output logic                  full,
@@ -46,6 +48,8 @@ module active_list
         logic csr_write;
         logic [11:0] csr_addr;
         logic [31:0] csr_wdata;
+        logic fp_fflags_valid;
+        logic [4:0] fp_fflags;
         logic serializing;
         arch_reg_t rd;
         phys_reg_t prd;
@@ -113,6 +117,9 @@ module active_list
                 entries_next[writeback_id[i]].csr_write = writeback_csr_write[i];
                 entries_next[writeback_id[i]].csr_addr = writeback_csr_addr[i];
                 entries_next[writeback_id[i]].csr_wdata = writeback_csr_wdata[i];
+                entries_next[writeback_id[i]].fp_fflags_valid =
+                    writeback_fp_fflags_valid[i];
+                entries_next[writeback_id[i]].fp_fflags = writeback_fp_fflags[i];
                 entries_next[writeback_id[i]].exception |= writeback_exception[i];
                 entries_next[writeback_id[i]].halted |= writeback_halted[i];
             end
@@ -137,6 +144,9 @@ module active_list
                 commit_packet[i].csr_write = entries_next[head_next].csr_write;
                 commit_packet[i].csr_addr = entries_next[head_next].csr_addr;
                 commit_packet[i].csr_wdata = entries_next[head_next].csr_wdata;
+                commit_packet[i].fp_fflags_valid =
+                    entries_next[head_next].fp_fflags_valid;
+                commit_packet[i].fp_fflags = entries_next[head_next].fp_fflags;
                 commit_packet[i].serializing = entries_next[head_next].serializing;
                 commit_packet[i].is_store = entries_next[head_next].is_store;
                 commit_packet[i].halted = entries_next[head_next].halted;
@@ -167,6 +177,8 @@ module active_list
                     entries_next[tail_next].csr_write = 1'b0;
                     entries_next[tail_next].csr_addr = allocate_packet[i].instr[31:20];
                     entries_next[tail_next].csr_wdata = '0;
+                    entries_next[tail_next].fp_fflags_valid = 1'b0;
+                    entries_next[tail_next].fp_fflags = '0;
                     entries_next[tail_next].serializing =
                         allocate_packet[i].ctrl.serializing;
                     entries_next[tail_next].pc = allocate_packet[i].pc;

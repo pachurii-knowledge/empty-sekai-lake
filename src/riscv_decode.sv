@@ -656,6 +656,16 @@ module riscv_decode
                                 ctrl_signals.illegal_instr = 1'b1;
                             end
                         end
+                        5'b01000: begin
+                            ctrl_signals.fp_op = FP_CVT_F_F;
+                            ctrl_signals.fp_uses_rs2 = 1'b0;
+                            if (!(((instr[26:25] == 2'b00) &&
+                                      (instr[24:20] == 5'b00001)) ||
+                                  ((instr[26:25] == 2'b01) &&
+                                      (instr[24:20] == 5'b00000)))) begin
+                                ctrl_signals.illegal_instr = 1'b1;
+                            end
+                        end
                         5'b11000: begin
                             ctrl_signals.fp_writes_fpr = 1'b0;
                             ctrl_signals.fp_writes_gpr = 1'b1;

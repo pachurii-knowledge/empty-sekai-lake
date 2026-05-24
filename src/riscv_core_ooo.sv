@@ -21,7 +21,7 @@ module riscv_core_ooo (
     import RISCV_ABI::ECALL_ARG_HALT;
     import MemorySegments::USER_TEXT_START;
 
-    localparam int PHYS_READ_PORTS = 2 + OOO_WIDTH;
+    localparam int PHYS_READ_PORTS = FU_ISSUE_PORTS + OOO_WIDTH;
     localparam int RAS_DEPTH = 128;
     localparam int RAS_INDEX_BITS = $clog2(RAS_DEPTH);
     localparam int RAS_COUNT_BITS = $clog2(RAS_DEPTH + 1);
@@ -117,8 +117,9 @@ module riscv_core_ooo (
     commit_packet_t active_commit_packet [OOO_WIDTH];
 
     logic int_iq_full;
-    logic [1:0] int_issue_valid;
-    issue_entry_t int_issue_entry [2];
+    logic [FU_ISSUE_PORTS-1:0] int_issue_valid;
+    logic [FU_ISSUE_PORTS-1:0] int_issue_ready;
+    issue_entry_t int_issue_entry [FU_ISSUE_PORTS];
 
     phys_reg_t phys_rs1 [PHYS_READ_PORTS];
     phys_reg_t phys_rs2 [PHYS_READ_PORTS];
@@ -133,7 +134,13 @@ module riscv_core_ooo (
     writeback_packet_t alu0_writeback;
     writeback_packet_t alu1_writeback;
     writeback_packet_t load_writeback;
+    writeback_packet_t mul_writeback;
+    writeback_packet_t div_writeback;
+    writeback_packet_t fp_writeback;
     writeback_packet_t branch_writeback;
+    logic mul_writeback_ready;
+    logic div_writeback_ready;
+    logic fp_writeback_ready;
     logic [OOO_WIDTH-1:0] writeback_valid;
     active_id_t writeback_active_id [OOO_WIDTH];
     phys_reg_t writeback_prd [OOO_WIDTH];
@@ -145,6 +152,8 @@ module riscv_core_ooo (
     logic [OOO_WIDTH-1:0] writeback_csr_write;
     logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr;
     logic [OOO_WIDTH-1:0][31:0] writeback_csr_wdata;
+    logic [OOO_WIDTH-1:0] writeback_fp_fflags_valid;
+    logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags;
     logic [OOO_WIDTH-1:0] writeback_exception;
     logic [OOO_WIDTH-1:0] writeback_halted;
 
@@ -153,6 +162,9 @@ module riscv_core_ooo (
     logic csr_commit_write;
     logic [11:0] csr_commit_addr;
     logic [31:0] csr_commit_wdata;
+    logic csr_fp_fflags_valid;
+    logic [4:0] csr_fp_fflags;
+    logic [2:0] csr_frm;
     logic csr_retire;
 
     fp_reg_data_t fp_regs_q [FP_REGS];
@@ -280,12 +292,15 @@ module riscv_core_ooo (
         .write_valid(csr_commit_write),
         .write_addr(csr_commit_addr),
         .write_data(csr_commit_wdata),
+        .fp_fflags_valid(csr_fp_fflags_valid),
+        .fp_fflags(csr_fp_fflags),
         .read_addr0(int_issue_entry[0].instr[31:20]),
         .read_addr1(int_issue_entry[1].instr[31:20]),
         .read_data0(csr_read_data[0]),
         .read_data1(csr_read_data[1]),
         .read_illegal0(csr_read_illegal[0]),
-        .read_illegal1(csr_read_illegal[1])
+        .read_illegal1(csr_read_illegal[1]),
+        .frm_value(csr_frm)
     );
 
     branch_stack BranchStack (
@@ -381,6 +396,8 @@ module riscv_core_ooo (
         .writeback_csr_write,
         .writeback_csr_addr,
         .writeback_csr_wdata,
+        .writeback_fp_fflags_valid,
+        .writeback_fp_fflags,
         .reset_mask,
         .abort_mask,
         .full(active_full),
@@ -398,6 +415,7 @@ module riscv_core_ooo (
         .insert_entry(dispatch_issue_entries),
         .wakeup_valid,
         .wakeup_prd,
+        .issue_ready(int_issue_ready),
         .reset_mask,
         .abort_mask,
         .full(int_iq_full),
@@ -443,6 +461,48 @@ module riscv_core_ooo (
         .writeback(alu1_writeback)
     );
 
+    assign int_issue_ready[ISSUE_ALU0] = 1'b1;
+    assign int_issue_ready[ISSUE_ALU1] = 1'b1;
+
+    ooo_mul_unit MulUnit (
+        .clk,
+        .rst_l,
+        .issue_valid(int_issue_valid[ISSUE_MUL]),
+        .issue_ready(int_issue_ready[ISSUE_MUL]),
+        .issue_entry(int_issue_entry[ISSUE_MUL]),
+        .rs1_data(phys_rs1_data[ISSUE_MUL]),
+        .rs2_data(phys_rs2_data[ISSUE_MUL]),
+        .abort_mask,
+        .writeback_ready(mul_writeback_ready),
+        .writeback(mul_writeback)
+    );
+
+    ooo_div_unit DivUnit (
+        .clk,
+        .rst_l,
+        .issue_valid(int_issue_valid[ISSUE_DIV]),
+        .issue_ready(int_issue_ready[ISSUE_DIV]),
+        .issue_entry(int_issue_entry[ISSUE_DIV]),
+        .rs1_data(phys_rs1_data[ISSUE_DIV]),
+        .rs2_data(phys_rs2_data[ISSUE_DIV]),
+        .abort_mask,
+        .writeback_ready(div_writeback_ready),
+        .writeback(div_writeback)
+    );
+
+    niigo_fp_unit FpUnit (
+        .clk,
+        .rst_l,
+        .issue_valid(int_issue_valid[ISSUE_FP]),
+        .issue_ready(int_issue_ready[ISSUE_FP]),
+        .issue_entry(int_issue_entry[ISSUE_FP]),
+        .rs1_data(phys_rs1_data[ISSUE_FP]),
+        .frm(csr_frm),
+        .abort_mask,
+        .writeback_ready(fp_writeback_ready),
+        .writeback(fp_writeback)
+    );
+
     load_store_queue LoadStoreQueue (
         .clk,
         .rst_l,
@@ -472,7 +532,13 @@ module riscv_core_ooo (
         .alu0_writeback,
         .alu1_writeback,
         .load_writeback,
+        .mul_writeback,
+        .div_writeback,
+        .fp_writeback,
         .abort_mask_q,
+        .mul_writeback_ready,
+        .div_writeback_ready,
+        .fp_writeback_ready,
         .writeback_valid,
         .writeback_active_id,
         .writeback_prd,
@@ -484,6 +550,8 @@ module riscv_core_ooo (
         .writeback_csr_write,
         .writeback_csr_addr,
         .writeback_csr_wdata,
+        .writeback_fp_fflags_valid,
+        .writeback_fp_fflags,
         .writeback_exception,
         .writeback_halted,
         .branch_writeback
@@ -585,6 +653,8 @@ module riscv_core_ooo (
         csr_commit_write = 1'b0;
         csr_commit_addr = '0;
         csr_commit_wdata = '0;
+        csr_fp_fflags_valid = 1'b0;
+        csr_fp_fflags = '0;
         ras_count_next = branch_restore_valid ?
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
         ras_checkpoint_count_next = ras_checkpoint_count_q;
@@ -735,6 +805,7 @@ module riscv_core_ooo (
             rename_packets[i].fp_src2_data = fp_regs_q[decode_lanes[i].rs2];
             rename_packets[i].fp_src3_data =
                 fp_regs_q[decode_lanes[i].instr[31:27]];
+            rename_packets[i].fu_class = fu_class_for(decode_lanes[i].ctrl);
 
             dispatch_issue_entries[i] = '0;
             dispatch_issue_entries[i].valid = dispatch_valid[i];
@@ -766,21 +837,22 @@ module riscv_core_ooo (
                 rename_packets[i].fp_src2_data;
             dispatch_issue_entries[i].fp_src3_data =
                 rename_packets[i].fp_src3_data;
+            dispatch_issue_entries[i].fu_class = rename_packets[i].fu_class;
 
             int_insert_valid[i] = dispatch_valid[i] && !lane_is_memory[i];
             mem_insert_valid[i] = dispatch_valid[i] && lane_is_memory[i];
             branch_allocate |= dispatch_valid[i] && lane_is_branch[i];
         end
 
-        phys_rs1[0] = int_issue_entry[0].prs1;
-        phys_rs2[0] = int_issue_entry[0].prs2;
-        phys_rs1[1] = int_issue_entry[1].prs1;
-        phys_rs2[1] = int_issue_entry[1].prs2;
+        for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
+            phys_rs1[i] = int_issue_entry[i].prs1;
+            phys_rs2[i] = int_issue_entry[i].prs2;
+        end
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            phys_rs1[2 + i] = dispatch_issue_entries[i].prs1;
-            phys_rs2[2 + i] = dispatch_issue_entries[i].prs2;
-            mem_insert_rs1_data[i] = phys_rs1_data[2 + i];
-            mem_insert_rs2_data[i] = phys_rs2_data[2 + i];
+            phys_rs1[FU_ISSUE_PORTS + i] = dispatch_issue_entries[i].prs1;
+            phys_rs2[FU_ISSUE_PORTS + i] = dispatch_issue_entries[i].prs2;
+            mem_insert_rs1_data[i] = phys_rs1_data[FU_ISSUE_PORTS + i];
+            mem_insert_rs2_data[i] = phys_rs2_data[FU_ISSUE_PORTS + i];
         end
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
@@ -887,6 +959,10 @@ module riscv_core_ooo (
                     csr_commit_write = 1'b1;
                     csr_commit_addr = active_commit_packet[i].csr_addr;
                     csr_commit_wdata = active_commit_packet[i].csr_wdata;
+                end
+                if (active_commit_packet[i].fp_fflags_valid) begin
+                    csr_fp_fflags_valid = 1'b1;
+                    csr_fp_fflags |= active_commit_packet[i].fp_fflags;
                 end
                 if (active_commit_packet[i].serializing) begin
                     serial_pending_next = 1'b0;

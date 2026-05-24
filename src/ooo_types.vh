@@ -12,6 +12,14 @@ package OOO_Types;
     localparam int INT_IQ_SIZE = 16;
     localparam int MEM_Q_SIZE = 16;
     localparam int BRANCH_STACK_SIZE = 4;
+    localparam int ALU_ISSUE_PORTS = 2;
+    localparam int FU_ISSUE_PORTS = 5;
+    localparam int WB_SOURCES = 6;
+    localparam int ISSUE_ALU0 = 0;
+    localparam int ISSUE_ALU1 = 1;
+    localparam int ISSUE_MUL = 2;
+    localparam int ISSUE_DIV = 3;
+    localparam int ISSUE_FP = 4;
 
     localparam int ARCH_REG_BITS = 5;
     localparam int PHYS_REG_BITS = $clog2(PHYS_REGS);
@@ -24,6 +32,15 @@ package OOO_Types;
     typedef logic [BRANCH_STACK_SIZE-1:0] branch_mask_t;
     typedef logic [BRANCH_ID_BITS-1:0] branch_id_t;
     typedef logic [63:0] fp_reg_data_t;
+
+    typedef enum logic [2:0] {
+        FU_ALU,
+        FU_MUL,
+        FU_DIV,
+        FU_FP,
+        FU_MEM,
+        FU_DC = 3'bxxx
+    } fu_class_t;
 
     typedef struct packed {
         logic        valid;
@@ -69,6 +86,7 @@ package OOO_Types;
         fp_reg_data_t   fp_src1_data;
         fp_reg_data_t   fp_src2_data;
         fp_reg_data_t   fp_src3_data;
+        fu_class_t      fu_class;
     } rename_packet_t;
 
     typedef struct packed {
@@ -96,6 +114,7 @@ package OOO_Types;
         fp_reg_data_t   fp_src1_data;
         fp_reg_data_t   fp_src2_data;
         fp_reg_data_t   fp_src3_data;
+        fu_class_t      fu_class;
     } issue_entry_t;
 
     typedef struct packed {
@@ -120,6 +139,8 @@ package OOO_Types;
         logic          csr_write;
         logic [11:0]   csr_addr;
         logic [31:0]   csr_wdata;
+        logic          fp_fflags_valid;
+        logic [4:0]    fp_fflags;
         logic          exception;
         logic          halted;
     } writeback_packet_t;
@@ -140,11 +161,37 @@ package OOO_Types;
         logic          csr_write;
         logic [11:0]   csr_addr;
         logic [31:0]   csr_wdata;
+        logic          fp_fflags_valid;
+        logic [4:0]    fp_fflags;
         logic          serializing;
         logic          is_store;
         logic          halted;
         logic          exception;
     } commit_packet_t;
+
+    function automatic logic is_mul_op(input alu_op_t op);
+        is_mul_op = (op == ALU_MUL) || (op == ALU_MULH) ||
+            (op == ALU_MULHSU) || (op == ALU_MULHU);
+    endfunction
+
+    function automatic logic is_div_op(input alu_op_t op);
+        is_div_op = (op == ALU_DIV) || (op == ALU_DIVU) ||
+            (op == ALU_REM) || (op == ALU_REMU);
+    endfunction
+
+    function automatic fu_class_t fu_class_for(input ctrl_signals_t ctrl);
+        if (ctrl.memRead || ctrl.memWrite) begin
+            fu_class_for = FU_MEM;
+        end else if (ctrl.exec_class == EXEC_FP) begin
+            fu_class_for = FU_FP;
+        end else if ((ctrl.exec_class == EXEC_INT) && is_mul_op(ctrl.alu_op)) begin
+            fu_class_for = FU_MUL;
+        end else if ((ctrl.exec_class == EXEC_INT) && is_div_op(ctrl.alu_op)) begin
+            fu_class_for = FU_DIV;
+        end else begin
+            fu_class_for = FU_ALU;
+        end
+    endfunction
 
 endpackage: OOO_Types
 

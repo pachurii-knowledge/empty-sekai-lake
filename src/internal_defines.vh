@@ -137,6 +137,7 @@ typedef enum logic [5:0] {
     FP_CVT_WU,
     FP_CVT_F_W,
     FP_CVT_F_WU,
+    FP_CVT_F_F,
     FP_MV_X,
     FP_MV_F_X,
     FP_EQ,

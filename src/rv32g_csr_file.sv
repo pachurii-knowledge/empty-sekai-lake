@@ -7,12 +7,15 @@ module rv32g_csr_file (
     input  logic        write_valid,
     input  logic [11:0] write_addr,
     input  logic [31:0] write_data,
+    input  logic        fp_fflags_valid,
+    input  logic [4:0]  fp_fflags,
     input  logic [11:0] read_addr0,
     input  logic [11:0] read_addr1,
     output logic [31:0] read_data0,
     output logic [31:0] read_data1,
     output logic        read_illegal0,
-    output logic        read_illegal1
+    output logic        read_illegal1,
+    output logic [2:0]  frm_value
 );
 
     localparam logic [11:0] CSR_FFLAGS   = 12'h001;
@@ -29,6 +32,10 @@ module rv32g_csr_file (
     logic [63:0] instret_q;
     logic [4:0] fflags_q;
     logic [2:0] frm_q;
+    logic [4:0] fflags_next;
+    logic [2:0] frm_next;
+
+    assign frm_value = frm_q;
 
     always_comb begin
         read_csr(read_addr0, read_data0, read_illegal0);
@@ -66,18 +73,28 @@ module rv32g_csr_file (
             if (retire) begin
                 instret_q <= instret_q + 64'd1;
             end
-            if (write_valid) begin
-                unique case (write_addr)
-                    CSR_FFLAGS: fflags_q <= write_data[4:0];
-                    CSR_FRM:    frm_q <= write_data[2:0];
-                    CSR_FCSR: begin
-                        fflags_q <= write_data[4:0];
-                        frm_q <= write_data[7:5];
-                    end
-                    default: begin
-                    end
-                endcase
-            end
+            fflags_q <= fflags_next;
+            frm_q <= frm_next;
+        end
+    end
+
+    always_comb begin
+        fflags_next = fflags_q;
+        frm_next = frm_q;
+        if (write_valid) begin
+            unique case (write_addr)
+                CSR_FFLAGS: fflags_next = write_data[4:0];
+                CSR_FRM:    frm_next = write_data[2:0];
+                CSR_FCSR: begin
+                    fflags_next = write_data[4:0];
+                    frm_next = write_data[7:5];
+                end
+                default: begin
+                end
+            endcase
+        end
+        if (fp_fflags_valid) begin
+            fflags_next |= fp_fflags;
         end
     end
 

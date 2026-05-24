@@ -11,11 +11,12 @@ module int_issue_queue
     input  issue_entry_t         insert_entry [OOO_WIDTH],
     input  logic [OOO_WIDTH-1:0] wakeup_valid,
     input  phys_reg_t            wakeup_prd [OOO_WIDTH],
+    input  logic [FU_ISSUE_PORTS-1:0] issue_ready,
     input  branch_mask_t         reset_mask,
     input  branch_mask_t         abort_mask,
     output logic                 full,
-    output logic [1:0]           issue_valid,
-    output issue_entry_t         issue_entry [2]
+    output logic [FU_ISSUE_PORTS-1:0] issue_valid,
+    output issue_entry_t         issue_entry [FU_ISSUE_PORTS]
 );
 
     issue_entry_t entries_q [INT_IQ_SIZE];
@@ -42,7 +43,7 @@ module int_issue_queue
         selected = '0;
         branch_issued = 1'b0;
         branch_issue_blocked = 1'b0;
-        for (int i = 0; i < 2; i += 1) begin
+        for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
             issue_entry[i] = '0;
         end
 
@@ -65,11 +66,12 @@ module int_issue_queue
             end
         end
 
-        for (int port = 0; port < 2; port += 1) begin
+        for (int port = 0; port < FU_ISSUE_PORTS; port += 1) begin
             for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-                if (!issue_valid[port] && entries_next[i].valid &&
+                if (issue_ready[port] && !issue_valid[port] &&
+                        entries_next[i].valid &&
                         entries_next[i].src1_ready && entries_next[i].src2_ready &&
-                        !selected[i]) begin
+                        !selected[i] && port_accepts_entry(port, entries_next[i])) begin
                     if (is_control_flow(entries_next[i]) &&
                             (entries_next[i].branch_mask != '0)) begin
                         branch_issue_blocked = 1'b1;
@@ -109,6 +111,17 @@ module int_issue_queue
         is_control_flow = (entry.ctrl.pc_source == PC_cond) ||
             (entry.ctrl.pc_source == PC_uncond) ||
             (entry.ctrl.pc_source == PC_indirect);
+    endfunction
+
+    function automatic logic port_accepts_entry(input int port,
+            input issue_entry_t entry);
+        unique case (port)
+            ISSUE_ALU0, ISSUE_ALU1: port_accepts_entry = entry.fu_class == FU_ALU;
+            ISSUE_MUL: port_accepts_entry = entry.fu_class == FU_MUL;
+            ISSUE_DIV: port_accepts_entry = entry.fu_class == FU_DIV;
+            ISSUE_FP: port_accepts_entry = entry.fu_class == FU_FP;
+            default: port_accepts_entry = 1'b0;
+        endcase
     endfunction
 
     always_ff @(posedge clk or negedge rst_l) begin

@@ -52,6 +52,9 @@ module ooo_dispatch_control
             if (i != 0 && lane_is_terminal[i - 1]) begin
                 stop_prefix = 1'b1;
             end
+            if (lane_is_terminal[i] && prefix_dispatched) begin
+                stop_prefix = 1'b1;
+            end
             if (i != 0 && lane_is_serializing[i - 1]) begin
                 stop_prefix = 1'b1;
             end
