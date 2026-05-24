@@ -120,7 +120,7 @@ module active_list
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if ((count_next != '0) && entries_next[head_next].valid &&
-                    entries_next[head_next].done) begin
+                    entries_q[head_next].done) begin
                 commit_valid[i] = 1'b1;
                 commit_packet[i].valid = 1'b1;
                 commit_packet[i].active_id = head_next;

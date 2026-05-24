@@ -823,6 +823,9 @@ module riscv_core_ooo (
         if (redirect_valid || precise_halt || precise_exception) begin
             terminal_pending_next = 1'b0;
         end
+        if (redirect_valid) begin
+            serial_pending_next = 1'b0;
+        end
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (active_commit_valid[i] &&
                     (active_commit_packet[i].instr == 32'h0000_0073)) begin
@@ -887,6 +890,12 @@ module riscv_core_ooo (
                 end
                 if (active_commit_packet[i].serializing) begin
                     serial_pending_next = 1'b0;
+                end
+                if ((active_commit_packet[i].instr[6:0] == RISCV_ISA::OP_MISC_MEM) &&
+                        (active_commit_packet[i].instr[14:12] == 3'b001)) begin
+                    pc_next = active_commit_packet[i].pc + 32'd4;
+                    fetch_pc_pipe_next = '0;
+                    fetch_valid_pipe_next = '0;
                 end
             end
         end
