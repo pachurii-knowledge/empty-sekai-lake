@@ -1,6 +1,8 @@
 # empty-sekai-lake
 
-`empty-sekai-lake` or `niigo-lake` is a SystemVerilog RV32G processor project with both simple in-order cores and a 4-wide out-of-order core. The current verification focus is the OoO RV32G path built with Verilator and run against RISC-V architectural tests.
+`empty-sekai-lake` or `niigo-lake` is a SystemVerilog RV32G processor project with both simple in-order cores and a 4-wide out-of-order core. The current verification focus is the OoO RV32G path built with Verilator and run against RISC-V architectural tests. 
+
+This project aims to implement all ISA extensions, privilege levels, and microarchitectural features required for booting Linux, as well as scaling to a coherent multicore system with shared cache hierarchy and interconnect.
 
 `empty-sekai-lake` is named after the lake in `Nightcord at 25:00`'s Sekai.
 ## ISA Coverage
