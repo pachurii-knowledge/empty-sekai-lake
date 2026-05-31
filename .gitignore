@@ -2,3 +2,4 @@
 output/
 references/
 .cursor/
+scripts/__pycache__/

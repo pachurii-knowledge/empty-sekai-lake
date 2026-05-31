@@ -55,6 +55,7 @@ package OOO_Types;
         logic [9:0]  tag0;
         logic [9:0]  tag1;
         logic [9:0]  tag2;
+        logic [9:0]  sc_history;
     } predictor_info_t;
 
     typedef struct packed {

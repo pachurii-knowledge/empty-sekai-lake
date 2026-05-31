@@ -25,6 +25,7 @@ module riscv_core_ooo (
     localparam int RAS_DEPTH = 128;
     localparam int RAS_INDEX_BITS = $clog2(RAS_DEPTH);
     localparam int RAS_COUNT_BITS = $clog2(RAS_DEPTH + 1);
+    localparam int DIRECT_HISTORY_BITS = 30;
 
     logic [31:0] pc_q, pc_next;
     logic [1:0][31:0] fetch_pc_pipe_q, fetch_pc_pipe_next;
@@ -72,6 +73,11 @@ module riscv_core_ooo (
     logic [RAS_COUNT_BITS-1:0] ras_checkpoint_count_q [BRANCH_STACK_SIZE];
     logic [RAS_COUNT_BITS-1:0] ras_checkpoint_count_next [BRANCH_STACK_SIZE];
     logic [RAS_COUNT_BITS-1:0] ras_branch_snapshot_count;
+
+    logic [DIRECT_HISTORY_BITS-1:0] ghr_q, ghr_next;
+    logic [DIRECT_HISTORY_BITS-1:0] ghr_checkpoint_q [BRANCH_STACK_SIZE];
+    logic [DIRECT_HISTORY_BITS-1:0] ghr_checkpoint_next [BRANCH_STACK_SIZE];
+    logic [DIRECT_HISTORY_BITS-1:0] ghr_branch_snapshot;
 
     logic direct_lookup_valid;
     logic [31:0] direct_lookup_pc;
@@ -329,11 +335,12 @@ module riscv_core_ooo (
         .abort_mask(stack_abort_mask)
     );
 
-    tage_sc_l_predictor DirectBranchPredictor (
+    tage_sc_l_predictor #(.HISTORY_BITS(DIRECT_HISTORY_BITS)) DirectBranchPredictor (
         .clk,
         .rst_l,
         .lookup_valid(direct_lookup_valid),
         .lookup_pc(direct_lookup_pc),
+        .history(ghr_q),
         .prediction(direct_prediction),
         .prediction_info(direct_prediction_info),
         .update_valid(branch_writeback.valid && branch_writeback.branch_valid &&
@@ -659,6 +666,18 @@ module riscv_core_ooo (
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
         ras_checkpoint_count_next = ras_checkpoint_count_q;
         ras_branch_snapshot_count = ras_count_next;
+        // Speculative global history: on a misprediction restore the branch's
+        // pre-push checkpoint, then re-push the resolved direction if the
+        // resolving branch was conditional (mirrors the RAS recovery above).
+        ghr_next = branch_restore_valid ?
+            ghr_checkpoint_q[branch_resolve_id] : ghr_q;
+        if (branch_restore_valid && branch_resolve_valid &&
+                (branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH)) begin
+            ghr_next = {ghr_next[DIRECT_HISTORY_BITS-2:0],
+                (branch_writeback.redirect_pc != branch_writeback.pc + 32'd4)};
+        end
+        ghr_checkpoint_next = ghr_checkpoint_q;
+        ghr_branch_snapshot = ghr_next;
         frontend_stall = dispatch_stall;
         branch_active_tail_snapshot = active_tail;
         branch_free_head_snapshot = free_head_snapshot;
@@ -755,12 +774,18 @@ module riscv_core_ooo (
                     branch_active_tail_snapshot = active_tail +
                         active_id_t'(lane_active_offset[i]) + active_id_t'(1);
                     ras_branch_snapshot_count = ras_count_next;
+                    ghr_branch_snapshot = ghr_next;
+                    if (decode_lanes[i].ctrl.pc_source == PC_cond) begin
+                        ghr_next = {ghr_next[DIRECT_HISTORY_BITS-2:0],
+                            direct_prediction};
+                    end
                     break;
                 end
             end
         end
         if (branch_allocate_valid) begin
             ras_checkpoint_count_next[branch_allocate_id] = ras_branch_snapshot_count;
+            ghr_checkpoint_next[branch_allocate_id] = ghr_branch_snapshot;
         end
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (dispatch_valid[i] && lane_is_unpredicted_control[i] &&
@@ -998,6 +1023,10 @@ module riscv_core_ooo (
             for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
                 ras_checkpoint_count_q[i] <= '0;
             end
+            ghr_q <= '0;
+            for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
+                ghr_checkpoint_q[i] <= '0;
+            end
         end else begin
             pc_q <= pc_next;
             fetch_pc_pipe_q <= fetch_pc_pipe_next;
@@ -1014,6 +1043,10 @@ module riscv_core_ooo (
             end
             for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
                 ras_checkpoint_count_q[i] <= ras_checkpoint_count_next[i];
+            end
+            ghr_q <= ghr_next;
+            for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
+                ghr_checkpoint_q[i] <= ghr_checkpoint_next[i];
             end
             for (int i = 0; i < FP_REGS; i += 1) begin
                 fp_regs_q[i] <= fp_regs_next[i];
