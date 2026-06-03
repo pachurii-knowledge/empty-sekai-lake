@@ -27,6 +27,7 @@ module active_list
     input  branch_mask_t          reset_mask,
     input  branch_mask_t          abort_mask,
     output logic                  full,
+    output logic                  empty,
     output active_id_t            tail,
     output logic [OOO_WIDTH-1:0]  commit_valid,
     output commit_packet_t        commit_packet [OOO_WIDTH],
@@ -71,6 +72,7 @@ module active_list
 
     assign tail = tail_q;
     assign full = (count_q > ACTIVE_LIST_SIZE - OOO_WIDTH);
+    assign empty = (count_q == '0);
 
     always_comb begin
         alloc_count = '0;

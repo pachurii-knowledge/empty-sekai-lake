@@ -105,7 +105,15 @@ module main_memory
      input  logic [NUM_PORTS-1:0][ADDR_WIDTH-1:0]                   addrs,
      input  logic [NUM_PORTS-1:0][WORD_WIDTH-1:0]                   store_data,
      output logic [NUM_PORTS-1:0]                                   mem_excpts,
-     output logic [NUM_PORTS-1:0][LOAD_WORDS-1:0][WORD_WIDTH-1:0]   load_data);
+     output logic [NUM_PORTS-1:0][LOAD_WORDS-1:0][WORD_WIDTH-1:0]   load_data,
+     /* Dedicated single-word page-table-walk port (combinational read,
+      * synchronous write) used by the MMU hardware page-table walker. This
+      * bypasses the data cache so the walker observes physical memory directly,
+      * which is what the architectural walk requires. */
+     input  logic [ADDR_WIDTH-1:0]                                  ptw_addr,
+     input  logic                                                   ptw_we,
+     input  logic [WORD_WIDTH-1:0]                                  ptw_wdata,
+     output logic [WORD_WIDTH-1:0]                                  ptw_rdata);
 
     /*------------------------------------------------------------------------
      * Definitions
@@ -174,8 +182,16 @@ module main_memory
                             segment_indices[i].index);
                 end
             end
+            // Page-table-walker writeback (e.g. A/D bit update).
+            if (ptw_we) begin
+                segment_write(ptw_addr, ptw_wdata, {WORD_BYTES{1'b1}},
+                        index_t'(0));
+            end
         end
     end
+
+    // Combinational page-table-walk read port.
+    assign ptw_rdata = segment_read(ptw_addr, index_t'(0));
 
     // Handle reading from memory
     always_comb begin
@@ -221,7 +237,12 @@ module main_memory
             end
         end
 
-        return '{valid: 1'b0, index: 'bx};
+        /* Virtual-memory support: page tables, supervisor/kernel images, and
+         * device structures may live anywhere in the physical address space, so
+         * treat the entire space as a flat valid DRAM window backed by the
+         * sparse `memory` associative array. Access permissions are enforced by
+         * the core's MMU/PMP, not by segment presence. */
+        return '{valid: 1'b1, index: index_t'(0)};
     endfunction: find_segment
 
     /* Computes the offset into the given segment of the address. Assumes that
@@ -249,7 +270,7 @@ module main_memory
         foreach (store_mask[i]) begin
             if (store_mask[i]) begin
                 if (!memory.exists(addr)) begin
-                    memory[addr] = '{default: 'hde};
+                    memory[addr] = '{default: 'h00};
                 end
                 memory[addr][i] = data[i];
             end
@@ -264,7 +285,11 @@ module main_memory
         if (memory.exists(addr)) begin
             return memory[addr];
         end
-        return '{default: 'hde};
+        /* Uninitialized DRAM reads back as zero. With the flat valid window this
+         * means speculative / wrong-path fetches past the program image decode as
+         * a benign zero word (treated as a NOP, masked from illegal-instruction)
+         * rather than 0xDE garbage that would spam the decoder and slow the sim. */
+        return '{default: 'h00};
     endfunction: segment_read
 
     /*------------------------------------------------------------------------

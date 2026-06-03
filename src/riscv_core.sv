@@ -19,7 +19,12 @@ module riscv_core (
     output logic [ 3:0]      data_store_mask,
     output logic [29:0]      instr_addr, data_addr,
     output logic             instr_stall, data_stall,
-    output logic [31:0]      data_store
+    output logic [31:0]      data_store,
+    // MMU page-table-walk port
+    output logic [29:0]      ptw_addr,
+    output logic             ptw_we,
+    output logic [31:0]      ptw_wdata,
+    input  logic [31:0]      ptw_rdata
 );
 
     generate
@@ -40,7 +45,11 @@ module riscv_core (
                 .data_addr,
                 .instr_stall,
                 .data_stall,
-                .data_store
+                .data_store,
+                .ptw_addr,
+                .ptw_we,
+                .ptw_wdata,
+                .ptw_rdata
             );
         end else if (RISCV_UArch::SUPERSCALAR_WAYS == 4) begin : gen_4wide
             riscv_core_4wide Core4Wide (
@@ -59,7 +68,11 @@ module riscv_core (
                 .data_addr,
                 .instr_stall,
                 .data_stall,
-                .data_store
+                .data_store,
+                .ptw_addr,
+                .ptw_we,
+                .ptw_wdata,
+                .ptw_rdata
             );
         end else begin : gen_scalar
             riscv_core_scalar ScalarCore (
@@ -78,7 +91,11 @@ module riscv_core (
                 .data_addr,
                 .instr_stall,
                 .data_stall,
-                .data_store
+                .data_store,
+                .ptw_addr,
+                .ptw_we,
+                .ptw_wdata,
+                .ptw_rdata
             );
         end
     endgenerate

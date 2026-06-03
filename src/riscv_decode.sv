@@ -115,6 +115,11 @@ module riscv_decode
 
                 btype: sbtype_funct3,
                 syscall: 1'b0,
+                is_ebreak: 1'b0,
+                is_mret: 1'b0,
+                is_sret: 1'b0,
+                is_wfi: 1'b0,
+                is_sfence_vma: 1'b0,
                 illegal_instr: 1'b0
             };
             
@@ -150,6 +155,11 @@ module riscv_decode
 
                     btype: sbtype_funct3,
                     syscall: 1'b0,
+                    is_ebreak: 1'b0,
+                    is_mret: 1'b0,
+                    is_sret: 1'b0,
+                    is_wfi: 1'b0,
+                    is_sfence_vma: 1'b0,
                     illegal_instr: 1'b0
                 };
             end
@@ -710,28 +720,37 @@ module riscv_decode
                 // General system operation
                 OP_SYSTEM: begin
                     if (instr[14:12] == 3'b000) begin
-                        unique case (itype_funct12)
-                            FUNCT12_ECALL: begin
-                            ctrl_signals.syscall = 1'b1;
-                            ctrl_signals.useImm = 1'b0;
-                            ctrl_signals.rfWrite = 1'b0;
-                            ctrl_signals.pc2RF = 1'b0;
-                            ctrl_signals.memRead = 1'b0;
-                            ctrl_signals.memWrite = 1'b0;
-                            ctrl_signals.usePC = 1'b0;
-                            ctrl_signals.imm_mode = IMM_DC;
-                            ctrl_signals.alu_op = ALU_ADD;
-                            ctrl_signals.ldst_mode = LDST_DC;
-                            ctrl_signals.pc_source = PC_plus4;
-                            ctrl_signals.rd_source = RD_DC;
+                        ctrl_signals.useImm = 1'b0;
+                        ctrl_signals.rfWrite = 1'b0;
+                        ctrl_signals.pc2RF = 1'b0;
+                        ctrl_signals.memRead = 1'b0;
+                        ctrl_signals.memWrite = 1'b0;
+                        ctrl_signals.usePC = 1'b0;
+                        ctrl_signals.imm_mode = IMM_DC;
+                        ctrl_signals.alu_op = ALU_ADD;
+                        ctrl_signals.ldst_mode = LDST_DC;
+                        ctrl_signals.pc_source = PC_plus4;
+                        ctrl_signals.rd_source = RD_DC;
+                        // All trap/return/fence instructions serialize so the
+                        // pipeline reaches a precise point before redirecting.
+                        ctrl_signals.serializing = 1'b1;
+                        if (instr[31:25] == 7'b0001001) begin
+                            // SFENCE.VMA rs1, rs2
+                            ctrl_signals.is_sfence_vma = 1'b1;
+                        end else begin
+                            unique case (instr[31:20])
+                                12'h000: ctrl_signals.syscall = 1'b1;     // ECALL
+                                12'h001: ctrl_signals.is_ebreak = 1'b1;   // EBREAK
+                                12'h102: ctrl_signals.is_sret = 1'b1;     // SRET
+                                12'h302: ctrl_signals.is_mret = 1'b1;     // MRET
+                                12'h105: ctrl_signals.is_wfi = 1'b1;      // WFI
+                                default: begin
+                                    `display(rst_l, "Encountered unknown/unimplemented 12-bit itype function code 0x%03x.",
+                                            itype_funct12);
+                                    ctrl_signals.illegal_instr = 1'b1;
+                                end
+                            endcase
                         end
-
-                        default: begin
-                            `display(rst_l, "Encountered unknown/unimplemented 12-bit itype function code 0x%03x.",
-                                    itype_funct12);
-                            ctrl_signals.illegal_instr = 1'b1;
-                        end
-                        endcase
                     end else begin
                         ctrl_signals.exec_class = EXEC_CSR;
                         ctrl_signals.serializing = 1'b1;
@@ -765,7 +784,11 @@ module riscv_decode
                 end
 
                 default: begin
-                    `display(rst_l, "Encountered unknown/unimplemented opcode 0x%02x.", opcode);
+                    // Skip the diagnostic for all-zero words: with the flat valid
+                    // memory window, speculative fetches past the program image
+                    // read back as zero and would otherwise spam the log / slow
+                    // simulation. A zero word is masked from illegal_instr below.
+                    `display(rst_l & (instr != 'h0), "Encountered unknown/unimplemented opcode 0x%02x.", opcode);
                     ctrl_signals.illegal_instr = 1'b1;
                 end
             endcase

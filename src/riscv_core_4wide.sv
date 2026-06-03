@@ -24,12 +24,21 @@ module riscv_core_4wide (
     output logic [ 3:0]      data_store_mask,
     output logic [29:0]      instr_addr, data_addr,
     output logic             instr_stall, data_stall,
-    output logic [31:0]      data_store
+    output logic [31:0]      data_store,
+    // MMU page-table-walk port (unused by this core)
+    output logic [29:0]      ptw_addr,
+    output logic             ptw_we,
+    output logic [31:0]      ptw_wdata,
+    input  logic [31:0]      ptw_rdata
 );
 
     import RISCV_ABI::ECALL_ARG_HALT;
     import RISCV_ISA::*;
     import MemorySegments::USER_TEXT_START;
+
+    assign ptw_addr  = 30'b0;
+    assign ptw_we    = 1'b0;
+    assign ptw_wdata = 32'b0;
 
     localparam int WAYS = 4;
     localparam logic [31:0] NOP = 32'h0000_0013;

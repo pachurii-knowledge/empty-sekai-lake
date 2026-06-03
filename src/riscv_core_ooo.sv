@@ -2,6 +2,7 @@
 `include "superscalar_types.vh"
 `include "riscv_abi.vh"
 `include "memory_segments.vh"
+`include "riscv_priv.vh"
 
 `default_nettype none
 
@@ -14,12 +15,22 @@ module riscv_core_ooo (
     output logic [ 3:0]      data_store_mask,
     output logic [29:0]      instr_addr, data_addr,
     output logic             instr_stall, data_stall,
-    output logic [31:0]      data_store
+    output logic [31:0]      data_store,
+    // MMU page-table-walk port (Phase 4 will drive this; tied off for now)
+    output logic [29:0]      ptw_addr,
+    output logic             ptw_we,
+    output logic [31:0]      ptw_wdata,
+    input  logic [31:0]      ptw_rdata
 );
 
     import OOO_Types::*;
     import RISCV_ABI::ECALL_ARG_HALT;
     import MemorySegments::USER_TEXT_START;
+
+    // MMU page-table-walk port tie-off (Sv32 on OoO is added in Phase 4).
+    assign ptw_addr  = 30'b0;
+    assign ptw_we    = 1'b0;
+    assign ptw_wdata = 32'b0;
 
     localparam int PHYS_READ_PORTS = FU_ISSUE_PORTS + OOO_WIDTH;
     localparam int RAS_DEPTH = 128;
@@ -118,6 +129,7 @@ module riscv_core_ooo (
     logic [OOO_WIDTH-1:0] mem_insert_valid;
 
     logic active_full;
+    logic active_empty;
     active_id_t active_tail;
     logic [OOO_WIDTH-1:0] active_commit_valid;
     commit_packet_t active_commit_packet [OOO_WIDTH];
@@ -172,6 +184,44 @@ module riscv_core_ooo (
     logic [4:0] csr_fp_fflags;
     logic [2:0] csr_frm;
     logic csr_retire;
+
+    // --- Privileged-ISA / trap state (Phase 3) ---
+    // Architectural privilege + CSR state exposed by priv_csr_file.
+    RISCV_Priv::priv_mode_t cur_priv;
+    logic [31:0] csr_mstatus, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
+    logic [31:0] csr_mtvec, csr_stvec, csr_mepc, csr_sepc, csr_satp;
+    logic [31:0] csr_pmpcfg_arr [4];
+    logic [31:0] csr_pmpaddr_arr [16];
+    logic [63:0] clint_mtime;
+    logic        irq_mtimer, irq_msoft;
+    logic        clint_load_hit;
+    logic [31:0] clint_load_data;
+
+    // Commit-time trap evaluation (driven combinationally in the commit block).
+    logic        commit_exc_valid;
+    logic [4:0]  commit_exc_cause;
+    logic [31:0] commit_exc_tval;
+    logic [31:0] commit_trap_epc;
+    logic        commit_take_trap, commit_take_ret, commit_ret_from_s;
+    // trap_controller outputs
+    logic        tc_trap_valid, tc_is_int;
+    logic [4:0]  tc_cause;
+    RISCV_Priv::priv_mode_t tc_target;
+    logic [31:0] tc_vector;
+    logic [31:0] trap_redirect_pc;
+
+    // --- Precise interrupts via ROB drain (Phase 3b) ---
+    // When an interrupt is pending+enabled we stop dispatching new instructions
+    // and let the ROB drain. Once empty, the interrupt is taken with epc set to
+    // the oldest undispatched instruction. All of this is gated by
+    // irq_pending_now, which is identically zero whenever interrupts are
+    // disabled (e.g. every RV32G test), so it has no effect there.
+    logic        irq_pending_now;
+    logic [31:0] irq_eff;
+    logic        m_irq_en, s_irq_en;
+    logic        irq_drain_q, irq_drain_next;
+    logic        commit_take_int;
+    logic [31:0] commit_int_epc;
 
     fp_reg_data_t fp_regs_q [FP_REGS];
     fp_reg_data_t fp_regs_next [FP_REGS];
@@ -291,22 +341,83 @@ module riscv_core_ooo (
         .src2_ready(busy_src2_ready)
     );
 
-    rv32g_csr_file CSRFile (
+    priv_csr_file CSRFile (
         .clk,
         .rst_l,
         .retire(csr_retire),
+        .mtime(clint_mtime),
+        .read_addr(int_issue_entry[0].instr[31:20]),
+        .read_data(csr_read_data[0]),
+        .read_illegal(csr_read_illegal[0]),
+        .read_addr1(int_issue_entry[1].instr[31:20]),
+        .read_data1(csr_read_data[1]),
+        .read_illegal1(csr_read_illegal[1]),
         .write_valid(csr_commit_write),
         .write_addr(csr_commit_addr),
         .write_data(csr_commit_wdata),
         .fp_fflags_valid(csr_fp_fflags_valid),
         .fp_fflags(csr_fp_fflags),
-        .read_addr0(int_issue_entry[0].instr[31:20]),
-        .read_addr1(int_issue_entry[1].instr[31:20]),
-        .read_data0(csr_read_data[0]),
-        .read_data1(csr_read_data[1]),
-        .read_illegal0(csr_read_illegal[0]),
-        .read_illegal1(csr_read_illegal[1]),
-        .frm_value(csr_frm)
+        .frm_value(csr_frm),
+        .irq_m_timer(irq_mtimer),
+        .irq_m_software(irq_msoft),
+        .irq_m_external(1'b0),
+        .irq_s_external(1'b0),
+        .trap_valid(commit_take_trap || commit_take_int),
+        .trap_is_interrupt(tc_is_int),
+        .trap_cause(tc_cause),
+        .trap_epc(commit_take_int ? commit_int_epc : commit_trap_epc),
+        .trap_tval(tc_is_int ? 32'b0 : commit_exc_tval),
+        .trap_target_priv(tc_target),
+        .ret_valid(commit_take_ret),
+        .ret_from_s(commit_ret_from_s),
+        .priv(cur_priv),
+        .mstatus(csr_mstatus),
+        .medeleg(csr_medeleg),
+        .mideleg(csr_mideleg),
+        .mie_csr(csr_mie),
+        .mip_csr(csr_mip),
+        .mtvec(csr_mtvec),
+        .stvec(csr_stvec),
+        .mepc(csr_mepc),
+        .sepc(csr_sepc),
+        .satp(csr_satp),
+        .pmpcfg_o(csr_pmpcfg_arr),
+        .pmpaddr_o(csr_pmpaddr_arr)
+    );
+
+    // Trap aggregation/delegation for the instruction being committed.
+    trap_controller TrapCtrl (
+        .priv(cur_priv),
+        .mstatus(csr_mstatus),
+        .mie_csr(csr_mie),
+        .mip_csr(csr_mip),
+        .medeleg(csr_medeleg),
+        .mideleg(csr_mideleg),
+        .mtvec(csr_mtvec),
+        .stvec(csr_stvec),
+        .exc_valid(commit_exc_valid),
+        .exc_cause(commit_exc_cause),
+        .trap_valid(tc_trap_valid),
+        .trap_is_interrupt(tc_is_int),
+        .trap_cause(tc_cause),
+        .trap_target_priv(tc_target),
+        .trap_vector(tc_vector)
+    );
+
+    // Minimal CLINT: snoops committed stores for mtimecmp / msip.
+    clint Clint (
+        .clk,
+        .rst_l,
+        .store_en(data_store_mask != 4'b0),
+        .store_waddr(data_addr),
+        .store_wdata(data_store),
+        .store_mask(data_store_mask),
+        .load_addr(mem_data_addr),
+        .load_hit(clint_load_hit),
+        .load_data(clint_load_data),
+        .irq_m_timer(irq_mtimer),
+        .irq_m_software(irq_msoft),
+        .mtime_out(clint_mtime)
     );
 
     branch_stack BranchStack (
@@ -380,7 +491,7 @@ module riscv_core_ooo (
         .free_list_can_allocate(free_can_allocate),
         .free_list_available(free_count_snapshot),
         .suppress_dispatch(redirect_valid || terminal_pending_q ||
-            control_pending_q || serial_pending_q || halted_q),
+            control_pending_q || serial_pending_q || halted_q || irq_drain_q),
         .dispatch_valid,
         .dispatch_stall
     );
@@ -408,6 +519,7 @@ module riscv_core_ooo (
         .reset_mask,
         .abort_mask,
         .full(active_full),
+        .empty(active_empty),
         .tail(active_tail),
         .commit_valid(active_commit_valid),
         .commit_packet(active_commit_packet),
@@ -662,6 +774,16 @@ module riscv_core_ooo (
         csr_commit_wdata = '0;
         csr_fp_fflags_valid = 1'b0;
         csr_fp_fflags = '0;
+        commit_exc_valid = 1'b0;
+        commit_exc_cause = 5'd0;
+        commit_exc_tval = 32'd0;
+        commit_trap_epc = 32'd0;
+        commit_take_trap = 1'b0;
+        commit_take_ret = 1'b0;
+        commit_ret_from_s = 1'b0;
+        commit_take_int = 1'b0;
+        commit_int_epc = 32'd0;
+        irq_drain_next = irq_drain_q;
         ras_count_next = branch_restore_valid ?
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
         ras_checkpoint_count_next = ras_checkpoint_count_q;
@@ -899,6 +1021,94 @@ module riscv_core_ooo (
             arch_rd_data[i] = active_commit_packet[i].data;
         end
 
+        // ---- Commit-time trap / return detection (Phase 3 privileged ISA) ----
+        // ecall/ebreak/illegal/csr-illegal raise synchronous exceptions; mret /
+        // sret return from a trap. All of these are serializing, so the
+        // triggering instruction commits in isolation (any older instruction in
+        // a lower lane has already updated architectural state above). The
+        // architectural state transition is applied by priv_csr_file, driven by
+        // commit_take_trap / commit_take_ret below.
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (retire_valid[i] && !commit_exc_valid && !commit_take_ret &&
+                    !active_commit_packet[i].halted) begin
+                unique case (active_commit_packet[i].instr)
+                    32'h3020_0073: begin                       // MRET
+                        commit_take_ret   = 1'b1;
+                        commit_ret_from_s = 1'b0;
+                        commit_trap_epc   = active_commit_packet[i].pc;
+                    end
+                    32'h1020_0073: begin                       // SRET
+                        commit_take_ret   = 1'b1;
+                        commit_ret_from_s = 1'b1;
+                        commit_trap_epc   = active_commit_packet[i].pc;
+                    end
+                    32'h0000_0073: begin                       // ECALL
+                        commit_exc_valid = 1'b1;
+                        commit_exc_cause = (cur_priv == RISCV_Priv::PRIV_M) ?
+                                RISCV_Priv::EXC_ECALL_M :
+                            (cur_priv == RISCV_Priv::PRIV_S) ?
+                                RISCV_Priv::EXC_ECALL_S : RISCV_Priv::EXC_ECALL_U;
+                        commit_trap_epc  = active_commit_packet[i].pc;
+                    end
+                    32'h0010_0073: begin                       // EBREAK
+                        commit_exc_valid = 1'b1;
+                        commit_exc_cause = RISCV_Priv::EXC_BREAKPOINT;
+                        commit_trap_epc  = active_commit_packet[i].pc;
+                    end
+                    default: begin
+                        if (active_commit_packet[i].exception) begin
+                            commit_exc_valid = 1'b1;
+                            commit_exc_cause = RISCV_Priv::EXC_ILLEGAL_INSTR;
+                            commit_exc_tval  = active_commit_packet[i].instr;
+                            commit_trap_epc  = active_commit_packet[i].pc;
+                        end
+                    end
+                endcase
+                if (commit_exc_valid || commit_take_ret) begin
+                    arch_rd_we[i] = 1'b0;
+                end
+            end
+        end
+        commit_take_trap = commit_exc_valid;
+
+        // ---- Precise interrupt handling via ROB drain (Phase 3b) ----
+        // Mirror trap_controller's interrupt-enable evaluation so we can stop
+        // dispatch the moment an interrupt becomes deliverable.
+        irq_eff = csr_mip & csr_mie;
+        m_irq_en = (cur_priv != RISCV_Priv::PRIV_M) ||
+            csr_mstatus[RISCV_Priv::MSTATUS_MIE_BIT];
+        s_irq_en = (cur_priv == RISCV_Priv::PRIV_U) ||
+            ((cur_priv == RISCV_Priv::PRIV_S) &&
+             csr_mstatus[RISCV_Priv::MSTATUS_SIE_BIT]);
+        irq_pending_now =
+            (m_irq_en && ((irq_eff & ~csr_mideleg) != 32'b0)) ||
+            (s_irq_en && (( irq_eff &  csr_mideleg) != 32'b0));
+
+        // Take the interrupt only once the machine has drained to a precise
+        // point (ROB empty) and the next architectural instruction is known
+        // (a valid, un-dispatched decode lane). epc is that instruction's PC.
+        // Once drained (ROB empty) the interrupt is precise. epc is the oldest
+        // instruction still in the frozen frontend (decode is oldest, then the
+        // fetch pipeline, then pc_q if the frontend is completely empty).
+        if (irq_drain_q && irq_pending_now && active_empty &&
+                !commit_take_trap && !commit_take_ret) begin
+            commit_take_int = 1'b1;
+            commit_int_epc  = lane_valid[0]         ? decode_lanes[0].pc :
+                              fetch_valid_pipe_q[1] ? fetch_pc_pipe_q[1] :
+                              fetch_valid_pipe_q[0] ? fetch_pc_pipe_q[0] :
+                                                      pc_q;
+        end
+
+        // Drain FSM: enter on a pending interrupt, leave once it is taken (or it
+        // is no longer deliverable, e.g. software cleared mie before draining).
+        if (halted_q || commit_take_int) begin
+            irq_drain_next = 1'b0;
+        end else if (irq_pending_now) begin
+            irq_drain_next = 1'b1;
+        end else begin
+            irq_drain_next = 1'b0;
+        end
+
         data_load_en = mem_data_load_en;
         data_addr = mem_data_addr;
         data_store = mem_data_store;
@@ -907,7 +1117,10 @@ module riscv_core_ooo (
         pc_next = pc_q;
         fetch_pc_pipe_next = fetch_pc_pipe_q;
         fetch_valid_pipe_next = fetch_valid_pipe_q;
-        halted_next = halted_q || precise_halt || precise_exception;
+        // Synchronous exceptions now redirect to a trap handler instead of
+        // halting the core (see commit-time trap detection above). precise_halt
+        // (ecall a0=10/11) remains the simulation's clean stop condition.
+        halted_next = halted_q || precise_halt;
         terminal_pending_next = terminal_pending_q;
         control_pending_next = control_pending_q;
         control_pending_id_next = control_pending_id_q;
@@ -980,7 +1193,8 @@ module riscv_core_ooo (
                     fp_regs_next[active_commit_packet[i].fp_rd] =
                         active_commit_packet[i].fp_data;
                 end
-                if (!csr_commit_write && active_commit_packet[i].csr_write) begin
+                if (!csr_commit_write && active_commit_packet[i].csr_write &&
+                        !active_commit_packet[i].exception) begin
                     csr_commit_write = 1'b1;
                     csr_commit_addr = active_commit_packet[i].csr_addr;
                     csr_commit_wdata = active_commit_packet[i].csr_wdata;
@@ -1000,6 +1214,17 @@ module riscv_core_ooo (
                 end
             end
         end
+
+        // Trap / return redirect overrides any sequential or fence redirect.
+        // The trapping/returning instruction is serializing, so no younger
+        // speculative work is in flight; flushing the fetch pipe is sufficient.
+        trap_redirect_pc = commit_take_ret ?
+            (commit_ret_from_s ? csr_sepc : csr_mepc) : tc_vector;
+        if (commit_take_trap || commit_take_int || commit_take_ret) begin
+            pc_next = trap_redirect_pc;
+            fetch_pc_pipe_next = '0;
+            fetch_valid_pipe_next = '0;
+        end
     end
 
     always_ff @(posedge clk or negedge rst_l) begin
@@ -1012,6 +1237,7 @@ module riscv_core_ooo (
             control_pending_q <= 1'b0;
             control_pending_id_q <= '0;
             serial_pending_q <= 1'b0;
+            irq_drain_q <= 1'b0;
             abort_mask_q <= '0;
             ras_count_q <= '0;
             for (int i = 0; i < FP_REGS; i += 1) begin
@@ -1036,6 +1262,7 @@ module riscv_core_ooo (
             control_pending_q <= control_pending_next;
             control_pending_id_q <= control_pending_id_next;
             serial_pending_q <= serial_pending_next;
+            irq_drain_q <= irq_drain_next;
             abort_mask_q <= abort_mask;
             ras_count_q <= ras_count_next;
             for (int i = 0; i < RAS_DEPTH; i += 1) begin

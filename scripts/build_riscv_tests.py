@@ -21,6 +21,12 @@ def main(argv: list[str]) -> int:
         help="ACT test_config.yaml path relative to references/riscv-tests",
     )
     parser.add_argument("--extensions", default="I", help="Comma-separated extension filter")
+    parser.add_argument(
+        "--exclude",
+        default="Sm,PMPSm",
+        help="Comma-separated extensions to exclude (set empty to build the "
+        "privileged/Sv32 suites)",
+    )
     parser.add_argument("--jobs", type=int, default=24)
     parser.add_argument("--fast", action="store_true", default=True)
     args = parser.parse_args(argv)
@@ -45,7 +51,7 @@ def main(argv: list[str]) -> int:
             test_dir=Path("tests"),
             workdir=Path("work"),
             extensions=args.extensions,
-            exclude="Sm,PMPSm",
+            exclude=args.exclude,
             jobs=args.jobs,
             fast=args.fast,
             keep_going=True,

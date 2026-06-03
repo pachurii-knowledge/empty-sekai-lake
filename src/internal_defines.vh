@@ -190,7 +190,12 @@ typedef struct packed {
     logic fence_i;
     logic serializing;
     logic [2:0] btype;      // branch FUNCT3
-    logic syscall;          // Indicates if the current instruction is a syscall
+    logic syscall;          // Indicates if the current instruction is an ECALL
+    logic is_ebreak;        // EBREAK
+    logic is_mret;          // MRET (return from machine trap)
+    logic is_sret;          // SRET (return from supervisor trap)
+    logic is_wfi;           // WFI (wait for interrupt)
+    logic is_sfence_vma;    // SFENCE.VMA (TLB shootdown)
     logic illegal_instr;    // Indicates if the current instruction is illegal
     logic isBranch;         // Indicates if the current instruction is a branch
 } ctrl_signals_t;

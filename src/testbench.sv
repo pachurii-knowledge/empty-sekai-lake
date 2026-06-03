@@ -78,6 +78,11 @@ module top;
     logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr_M, instr_P;
     logic data_valid_P;
 
+    // MMU page-table-walk port (core <-> memory)
+    logic [MEMORY_ADDR_WIDTH-1:0] ptw_addr;
+    logic                         ptw_we;
+    logic [XLEN-1:0]              ptw_wdata, ptw_rdata;
+
     // Handle resetting the processor when simulation begins
     initial begin
         rst_l = 1'b1;
@@ -105,7 +110,11 @@ module top;
         .data_addr      (data_addr),
         .data_store     (data_store),
         .data_load_addr (data_addr_P),
-        .data_load_valid(data_valid_P)
+        .data_load_valid(data_valid_P),
+        .ptw_addr       (ptw_addr),
+        .ptw_we         (ptw_we),
+        .ptw_wdata      (ptw_wdata),
+        .ptw_rdata      (ptw_rdata)
     );
 
     // Delay buffer to simulate multi-cycle pipelined memory
@@ -148,7 +157,11 @@ module top;
         .addrs      ({data_addr, instr_addr}),
         .store_data ({data_store, 32'dx}),
         .mem_excpts ({data_mem_excpt_M, instr_mem_excpt_M}),
-        .load_data  ({mem_data_load_M, instr_M})
+        .load_data  ({mem_data_load_M, instr_M}),
+        .ptw_addr   (ptw_addr),
+        .ptw_we     (ptw_we),
+        .ptw_wdata  (ptw_wdata),
+        .ptw_rdata  (ptw_rdata)
     );
 
     // Keep a count of the cycles that have passed, and the current PC value
@@ -166,6 +179,35 @@ module top;
     always @(posedge clk) begin
         #0;  // Allow all other tasks to finish
         if (rst_l && halted) begin
+            $finish;
+        end
+    end
+
+    /* HTIF tohost monitor used by the RISC-V privileged / Sv32 test suites.
+     * Enable by passing +tohost=<hex byte address>; a non-zero store to that
+     * address ends simulation. By convention a payload of 1 means PASS, and any
+     * other value V means FAIL where (V >> 1) is the failing test number. When
+     * the plusarg is absent this monitor is inert, preserving the existing
+     * ECALL-halt + register-dump flow. */
+    logic [31:0] htif_tohost_addr;
+    logic        htif_enabled;
+    initial begin
+        if ($value$plusargs("tohost=%h", htif_tohost_addr)) begin
+            htif_enabled = 1'b1;
+        end else begin
+            htif_tohost_addr = 32'b0;
+            htif_enabled = 1'b0;
+        end
+    end
+    always @(posedge clk) begin
+        if (rst_l && htif_enabled && (data_store_mask != 4'b0) &&
+                (data_addr == htif_tohost_addr[31:2])) begin
+            if (data_store == 32'h1) begin
+                $display("HTIF: tohost = 1 (PASS)");
+            end else begin
+                $display("HTIF: tohost = %0d (FAIL test %0d)", data_store,
+                    data_store >> 1);
+            end
             $finish;
         end
     end
