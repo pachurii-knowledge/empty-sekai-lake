@@ -27,11 +27,6 @@ module riscv_core_ooo (
     import RISCV_ABI::ECALL_ARG_HALT;
     import MemorySegments::USER_TEXT_START;
 
-    // MMU page-table-walk port tie-off (Sv32 on OoO is added in Phase 4).
-    assign ptw_addr  = 30'b0;
-    assign ptw_we    = 1'b0;
-    assign ptw_wdata = 32'b0;
-
     localparam int PHYS_READ_PORTS = FU_ISSUE_PORTS + OOO_WIDTH;
     localparam int RAS_DEPTH = 128;
     localparam int RAS_INDEX_BITS = $clog2(RAS_DEPTH);
@@ -39,6 +34,7 @@ module riscv_core_ooo (
     localparam int DIRECT_HISTORY_BITS = 30;
 
     logic [31:0] pc_q, pc_next;
+    logic [31:0] fetch_pa;   // translated fetch address (driven in MMU section)
     logic [1:0][31:0] fetch_pc_pipe_q, fetch_pc_pipe_next;
     logic [1:0] fetch_valid_pipe_q, fetch_valid_pipe_next;
     logic halted_q, halted_next;
@@ -173,6 +169,7 @@ module riscv_core_ooo (
     logic [OOO_WIDTH-1:0] writeback_fp_fflags_valid;
     logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags;
     logic [OOO_WIDTH-1:0] writeback_exception;
+    logic [OOO_WIDTH-1:0][4:0] writeback_exc_cause;
     logic [OOO_WIDTH-1:0] writeback_halted;
 
     logic [31:0] csr_read_data [2];
@@ -258,6 +255,7 @@ module riscv_core_ooo (
     logic [29:0] mem_data_addr;
     logic [31:0] mem_data_store;
     logic [3:0] mem_data_store_mask;
+    logic [29:0] lsq_data_load_addr;
     logic commit_store;
     active_id_t commit_store_id;
 
@@ -279,7 +277,9 @@ module riscv_core_ooo (
     assign data_stall = 1'b0;
     assign instr_stall = !rst_l || halted_q || frontend_stall ||
         dispatched_unpredicted_control;
-    assign instr_addr = {pc_q[31:4], 2'b00};
+    // instr_addr is the translated fetch block address (fetch_pa, computed in the
+    // MMU section below; identity when paging is off).
+    assign instr_addr = {fetch_pa[31:4], 2'b00};
     assign sequential_next_pc = {pc_q[31:4], 4'b0} + 32'd16;
     assign dispatch_branch_mask = current_branch_mask & ~reset_mask & ~abort_mask;
 
@@ -420,6 +420,189 @@ module riscv_core_ooo (
         .mtime_out(clint_mtime)
     );
 
+    // ===================== Sv32 MMU (Phase 4) =====================
+    // satp / mstatus-derived translation context. Identical to the scalar core.
+    logic        satp_mode;
+    logic [21:0] satp_ppn;
+    logic [8:0]  satp_asid;
+    logic        mstatus_mprv, mstatus_sum, mstatus_mxr;
+    RISCV_Priv::priv_mode_t mpp_mode, priv_data;
+    logic        paging_fetch, paging_data;
+
+    assign satp_mode    = csr_satp[31];
+    assign satp_ppn     = csr_satp[21:0];
+    assign satp_asid    = csr_satp[30:22];
+    assign mstatus_mprv = csr_mstatus[RISCV_Priv::MSTATUS_MPRV_BIT];
+    assign mstatus_sum  = csr_mstatus[RISCV_Priv::MSTATUS_SUM_BIT];
+    assign mstatus_mxr  = csr_mstatus[RISCV_Priv::MSTATUS_MXR_BIT];
+    assign mpp_mode     = RISCV_Priv::priv_mode_t'(csr_mstatus[RISCV_Priv::MSTATUS_MPP_LO+:2]);
+    assign priv_data    = mstatus_mprv ? mpp_mode : cur_priv;
+    assign paging_fetch = satp_mode && (cur_priv  != RISCV_Priv::PRIV_M);
+    assign paging_data  = satp_mode && (priv_data != RISCV_Priv::PRIV_M);
+
+    // TLB flush: SFENCE.VMA or any satp write (driven in the commit block).
+    logic tlb_flush;
+
+    // Compute a 32-bit (capped) physical byte address from a leaf translation.
+    function automatic logic [31:0] make_pa(input logic [21:0] ppn,
+            input logic superpage, input logic [31:0] va);
+        if (superpage) make_pa = {ppn[19:10], va[21:0]};
+        else           make_pa = {ppn[19:0],  va[11:0]};
+    endfunction
+
+    // Leaf-PTE permission fault (excludes A/D, which trigger a re-walk).
+    function automatic logic perm_bad(input logic [7:0] perm,
+            input logic [1:0] acc, input RISCV_Priv::priv_mode_t pr,
+            input logic sum, input logic mxr);
+        logic fail;
+        fail = 1'b0;
+        unique case (acc)
+            2'd0: if (!perm[RISCV_Priv::PTE_X]) fail = 1'b1;
+            2'd1: if (!(perm[RISCV_Priv::PTE_R] ||
+                       (perm[RISCV_Priv::PTE_X] && mxr))) fail = 1'b1;
+            2'd2: if (!perm[RISCV_Priv::PTE_W]) fail = 1'b1;
+            default: ;
+        endcase
+        if (pr == RISCV_Priv::PRIV_U) begin
+            if (!perm[RISCV_Priv::PTE_U]) fail = 1'b1;
+        end else if (pr == RISCV_Priv::PRIV_S) begin
+            if (perm[RISCV_Priv::PTE_U]) begin
+                if (acc == 2'd0) fail = 1'b1;
+                else if (!sum)   fail = 1'b1;
+            end
+        end
+        perm_bad = fail;
+    endfunction
+
+    // --- Data-side translation request exposed by the load/store queue ---
+    logic        mem_req_valid;
+    logic [31:0] mem_req_vaddr;
+    logic        mem_req_store;
+    logic [1:0]  data_acc;
+    assign data_acc = mem_req_store ? 2'd2 : 2'd1;
+
+    // --- DTLB ---
+    logic        dtlb_hit, dtlb_super;
+    logic [21:0] dtlb_ppn;
+    logic [7:0]  dtlb_perm;
+    logic        d_need_ad, dtlb_usable;
+    assign d_need_ad   = !dtlb_perm[RISCV_Priv::PTE_A] ||
+                         ((data_acc == 2'd2) && !dtlb_perm[RISCV_Priv::PTE_D]);
+    assign dtlb_usable = dtlb_hit && !d_need_ad;
+
+    // --- Page-table walker (shared; data has priority over fetch) ---
+    logic        ptw_req, ptw_done, ptw_fault, ptw_busy, ptw_super;
+    logic [21:0] ptw_ppn;
+    logic [7:0]  ptw_perm;
+    logic [19:0] ptw_vpn;
+    logic [1:0]  ptw_access;
+    RISCV_Priv::priv_mode_t ptw_priv;
+    logic [31:0] ptw_mem_addr;
+
+    logic        itlb_hit, itlb_super;
+    logic [21:0] itlb_ppn;
+    logic [7:0]  itlb_perm;
+    logic        data_need_walk, fetch_need_walk;
+    logic        ptw_for_data;
+    assign data_need_walk  = paging_data && mem_req_valid && !dtlb_usable;
+    assign fetch_need_walk = paging_fetch && !itlb_hit;
+    // Data accesses have priority over instruction fetch for the shared walker.
+    assign ptw_for_data = data_need_walk;
+    assign ptw_req    = data_need_walk || fetch_need_walk;
+    assign ptw_vpn    = ptw_for_data ? mem_req_vaddr[31:12] : pc_q[31:12];
+    assign ptw_access = ptw_for_data ? data_acc : 2'd0;
+    assign ptw_priv   = ptw_for_data ? priv_data : cur_priv;
+
+    ptw PTW (
+        .clk, .rst_l,
+        .req_valid(ptw_req),
+        .req_vpn(ptw_vpn),
+        .satp_ppn(satp_ppn),
+        .req_access(ptw_access),
+        .req_priv(ptw_priv),
+        .mstatus_sum(mstatus_sum),
+        .mstatus_mxr(mstatus_mxr),
+        .mem_req(),
+        .mem_we(ptw_we),
+        .mem_addr(ptw_mem_addr),
+        .mem_wdata(ptw_wdata),
+        .mem_ack(1'b1),
+        .mem_rdata(ptw_rdata),
+        .busy(ptw_busy),
+        .done(ptw_done),
+        .fault(ptw_fault),
+        .ppn(ptw_ppn),
+        .perm(ptw_perm),
+        .superpage(ptw_super)
+    );
+    assign ptw_addr = ptw_mem_addr[31:2];
+
+    mmu_tlb #(.ENTRIES(16)) ITLB (
+        .clk, .rst_l,
+        .lookup_en(paging_fetch),
+        .lookup_vpn(pc_q[31:12]),
+        .lookup_asid(satp_asid),
+        .hit(itlb_hit), .hit_ppn(itlb_ppn), .hit_perm(itlb_perm),
+        .hit_superpage(itlb_super),
+        .fill_en(ptw_done && !ptw_fault && !ptw_for_data),
+        .fill_vpn(pc_q[31:12]),
+        .fill_asid(satp_asid),
+        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_superpage(ptw_super),
+        .flush_en(tlb_flush)
+    );
+
+    mmu_tlb #(.ENTRIES(16)) DTLB (
+        .clk, .rst_l,
+        .lookup_en(paging_data && mem_req_valid),
+        .lookup_vpn(mem_req_vaddr[31:12]),
+        .lookup_asid(satp_asid),
+        .hit(dtlb_hit), .hit_ppn(dtlb_ppn), .hit_perm(dtlb_perm),
+        .hit_superpage(dtlb_super),
+        .fill_en(ptw_done && !ptw_fault && ptw_for_data),
+        .fill_vpn(mem_req_vaddr[31:12]),
+        .fill_asid(satp_asid),
+        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_superpage(ptw_super),
+        .flush_en(tlb_flush)
+    );
+
+    // --- Resolve the data physical address + fault/stall for the LSQ ---
+    logic        data_from_ptw;
+    logic [31:0] data_pa;
+    logic        data_perm_fault;
+    logic        lsq_xlate_stall, lsq_xlate_fault;
+    logic [4:0]  lsq_xlate_cause;
+    assign data_from_ptw = ptw_for_data && ptw_done && !ptw_fault;
+    always_comb begin
+        if (!paging_data)        data_pa = mem_req_vaddr;
+        else if (dtlb_usable)    data_pa = make_pa(dtlb_ppn, dtlb_super, mem_req_vaddr);
+        else if (data_from_ptw)  data_pa = make_pa(ptw_ppn, ptw_super, mem_req_vaddr);
+        else                     data_pa = mem_req_vaddr;
+    end
+    assign data_perm_fault =
+        (dtlb_usable && perm_bad(dtlb_perm, data_acc, priv_data,
+            mstatus_sum, mstatus_mxr)) ||
+        (data_need_walk && ptw_done && ptw_fault);
+    assign lsq_xlate_fault = paging_data && mem_req_valid && data_perm_fault;
+    assign lsq_xlate_stall = paging_data && mem_req_valid &&
+        !dtlb_usable && !data_from_ptw && !data_perm_fault;
+    assign lsq_xlate_cause = mem_req_store ? RISCV_Priv::EXC_STORE_PAGE_FAULT
+                                           : RISCV_Priv::EXC_LOAD_PAGE_FAULT;
+    assign lsq_data_load_addr = paging_data ? mem_req_vaddr[31:2] : data_load_addr;
+
+    // --- Resolve the fetch physical address + stall during a fetch walk ---
+    logic        fetch_from_ptw, ptw_fetch_done;
+    logic        fetch_xlate_stall;
+    assign fetch_from_ptw = (!ptw_for_data) && ptw_done && !ptw_fault;
+    assign ptw_fetch_done = (!ptw_for_data) && ptw_done;
+    always_comb begin
+        if (!paging_fetch)       fetch_pa = pc_q;
+        else if (itlb_hit)       fetch_pa = make_pa(itlb_ppn, itlb_super, pc_q);
+        else if (fetch_from_ptw) fetch_pa = make_pa(ptw_ppn, ptw_super, pc_q);
+        else                     fetch_pa = pc_q;
+    end
+    // Freeze the frontend while the walker resolves the fetch translation.
+    assign fetch_xlate_stall = fetch_need_walk && !ptw_fetch_done;
+
     branch_stack BranchStack (
         .clk,
         .rst_l,
@@ -507,6 +690,7 @@ module riscv_core_ooo (
         .writeback_id(writeback_active_id),
         .writeback_data(writeback_data),
         .writeback_exception(writeback_exception),
+        .writeback_exc_cause(writeback_exc_cause),
         .writeback_halted(writeback_halted),
         .writeback_fp_write,
         .writeback_fp_rd,
@@ -636,9 +820,18 @@ module riscv_core_ooo (
         .abort_mask,
         .data_load_valid,
         .data_load(data_load[0]),
-        .data_load_addr,
+        // Under paging the queue matches loads on the (virtual) head address; the
+        // physical address is applied only at the memory port below.
+        .data_load_addr(lsq_data_load_addr),
         .commit_store,
         .commit_store_id,
+        .paging_data(paging_data),
+        .xlate_stall(lsq_xlate_stall),
+        .xlate_fault(lsq_xlate_fault),
+        .xlate_cause(lsq_xlate_cause),
+        .mem_req_valid(mem_req_valid),
+        .mem_req_vaddr(mem_req_vaddr),
+        .mem_req_store(mem_req_store),
         .full(mem_queue_full),
         .data_load_en(mem_data_load_en),
         .data_addr(mem_data_addr),
@@ -672,6 +865,7 @@ module riscv_core_ooo (
         .writeback_fp_fflags_valid,
         .writeback_fp_fflags,
         .writeback_exception,
+        .writeback_exc_cause,
         .writeback_halted,
         .branch_writeback
     );
@@ -783,6 +977,7 @@ module riscv_core_ooo (
         commit_ret_from_s = 1'b0;
         commit_take_int = 1'b0;
         commit_int_epc = 32'd0;
+        tlb_flush = 1'b0;
         irq_drain_next = irq_drain_q;
         ras_count_next = branch_restore_valid ?
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
@@ -800,7 +995,7 @@ module riscv_core_ooo (
         end
         ghr_checkpoint_next = ghr_checkpoint_q;
         ghr_branch_snapshot = ghr_next;
-        frontend_stall = dispatch_stall;
+        frontend_stall = dispatch_stall || fetch_xlate_stall;
         branch_active_tail_snapshot = active_tail;
         branch_free_head_snapshot = free_head_snapshot;
         branch_free_tail_snapshot = free_tail_snapshot;
@@ -1058,8 +1253,15 @@ module riscv_core_ooo (
                     default: begin
                         if (active_commit_packet[i].exception) begin
                             commit_exc_valid = 1'b1;
-                            commit_exc_cause = RISCV_Priv::EXC_ILLEGAL_INSTR;
-                            commit_exc_tval  = active_commit_packet[i].instr;
+                            commit_exc_cause = active_commit_packet[i].exc_cause;
+                            // Illegal-instruction faults report the instruction in
+                            // mtval; memory faults report the faulting address,
+                            // which the LSQ/fetch placed in the commit data field.
+                            commit_exc_tval  =
+                                (active_commit_packet[i].exc_cause ==
+                                    RISCV_Priv::EXC_ILLEGAL_INSTR) ?
+                                        active_commit_packet[i].instr :
+                                        active_commit_packet[i].data;
                             commit_trap_epc  = active_commit_packet[i].pc;
                         end
                     end
@@ -1110,7 +1312,9 @@ module riscv_core_ooo (
         end
 
         data_load_en = mem_data_load_en;
-        data_addr = mem_data_addr;
+        // Apply Sv32 translation at the memory port: the LSQ works in virtual
+        // addresses; the physical word address is computed by the MMU above.
+        data_addr = paging_data ? data_pa[31:2] : mem_data_addr;
         data_store = mem_data_store;
         data_store_mask = mem_data_store_mask;
 
@@ -1208,6 +1412,18 @@ module riscv_core_ooo (
                 end
                 if ((active_commit_packet[i].instr[6:0] == RISCV_ISA::OP_MISC_MEM) &&
                         (active_commit_packet[i].instr[14:12] == 3'b001)) begin
+                    pc_next = active_commit_packet[i].pc + 32'd4;
+                    fetch_pc_pipe_next = '0;
+                    fetch_valid_pipe_next = '0;
+                end
+                // SFENCE.VMA: flush both TLBs (modeled as a full flush) and
+                // refetch the next instruction so younger fetches re-translate
+                // against the new page tables. SFENCE.VMA is serializing, so it
+                // commits in isolation and nothing younger is in flight.
+                if ((active_commit_packet[i].instr[6:0] == RISCV_ISA::OP_SYSTEM) &&
+                        (active_commit_packet[i].instr[14:12] == 3'b000) &&
+                        (active_commit_packet[i].instr[31:25] == 7'b0001001)) begin
+                    tlb_flush = 1'b1;
                     pc_next = active_commit_packet[i].pc + 32'd4;
                     fetch_pc_pipe_next = '0;
                     fetch_valid_pipe_next = '0;
@@ -1498,5 +1714,29 @@ module riscv_core_ooo (
             perf_mispredicted_branches);
     end
 `endif /* SIMULATION_18447 */
+
+`ifdef AGENT_DEBUG
+    integer dbg_cyc = 0;
+    always_ff @(posedge clk) begin
+        if (rst_l) begin
+            dbg_cyc <= dbg_cyc + 1;
+            for (int i = 0; i < OOO_WIDTH; i += 1) begin
+                if (retire_valid[i])
+                    $display("[%0d] retire[%0d] pc=%h instr=%h exc=%b cause=%0d satp=%h pgD=%b mrq=%b mva=%h",
+                        dbg_cyc, i, active_commit_packet[i].pc,
+                        active_commit_packet[i].instr,
+                        active_commit_packet[i].exception,
+                        active_commit_packet[i].exc_cause, csr_satp,
+                        paging_data, mem_req_valid, mem_req_vaddr);
+            end
+            if (satp_mode && (dbg_cyc % 1 == 0))
+                $display("[%0d] PG pc=%h pgD=%b mrq=%b mva=%h dh=%b du=%b ptwB=%b D=%b F=%b xs=%b xf=%b dle=%b da=%h",
+                    dbg_cyc, pc_q, paging_data, mem_req_valid,
+                    mem_req_vaddr, dtlb_hit, dtlb_usable, ptw_busy, ptw_done,
+                    ptw_fault, lsq_xlate_stall, lsq_xlate_fault, data_load_en,
+                    data_addr);
+        end
+    end
+`endif
 
 endmodule: riscv_core_ooo

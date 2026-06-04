@@ -21,6 +21,17 @@ module load_store_queue
     input  logic [29:0]          data_load_addr,
     input  logic                 commit_store,
     input  active_id_t           commit_store_id,
+    // Sv32 data-side translation (driven by the core's MMU). When paging_data is
+    // low the queue behaves exactly as before (identity mapping). When high, the
+    // head's virtual address is exposed for the DTLB lookup, and the core feeds
+    // back whether the translation is still walking (xlate_stall) or faulted.
+    input  logic                 paging_data,
+    input  logic                 xlate_stall,
+    input  logic                 xlate_fault,
+    input  logic [4:0]           xlate_cause,
+    output logic                 mem_req_valid,
+    output logic [31:0]          mem_req_vaddr,
+    output logic                 mem_req_store,
     output logic                 full,
     output logic                 data_load_en,
     output logic [29:0]          data_addr,
@@ -48,6 +59,7 @@ module load_store_queue
     logic [$clog2(MEM_Q_SIZE+1)-1:0] count_q, count_next;
     logic [$clog2(MEM_Q_SIZE)-1:0] head_q, head_next;
     logic [$clog2(MEM_Q_SIZE)-1:0] tail_q, tail_next;
+    logic head_match, head_xlate_ok, head_xlate_flt;
     logic reservation_valid_q, reservation_valid_next;
     logic [31:0] reservation_addr_q, reservation_addr_next;
     logic double_store_pending_q, double_store_pending_next;
@@ -55,6 +67,16 @@ module load_store_queue
     logic [31:0] double_store_data_q, double_store_data_next;
 
     assign full = (count_q > MEM_Q_SIZE - OOO_WIDTH);
+
+    // Expose the registered head's virtual address so the core can translate it
+    // (DTLB lookup / PTW). Only meaningful once the address operand is resolved.
+    assign mem_req_valid = entries_q[head_q].entry.valid &&
+        entries_q[head_q].addr_ready &&
+        (entries_q[head_q].entry.ctrl.memRead ||
+         entries_q[head_q].entry.ctrl.memWrite);
+    assign mem_req_vaddr = entries_q[head_q].addr;
+    // AMOs read and write; treat as a store so the walker checks W permission.
+    assign mem_req_store = entries_q[head_q].entry.ctrl.memWrite;
 
     always_comb begin
         entries_next = entries_q;
@@ -115,7 +137,37 @@ module load_store_queue
             end
         end
 
-        if (!double_store_pending_q && entries_next[head_next].entry.valid &&
+        // ---- Sv32 data translation gating ----
+        // Under paging, a head memory op may only touch memory once its
+        // translation is established (DTLB hit, walk done, no fault) and the
+        // registered head matches the entry currently processed (so the DTLB
+        // lookup driven from entries_q[head_q] corresponds to this access).
+        head_match     = (head_next == head_q);
+        head_xlate_ok  = !paging_data ||
+            (head_match && mem_req_valid && !xlate_stall && !xlate_fault);
+        head_xlate_flt = paging_data && head_match && mem_req_valid && xlate_fault;
+
+        // Faulting access: retire it with an exception instead of touching memory.
+        if (head_xlate_flt && !double_store_pending_q &&
+                entries_next[head_next].entry.valid &&
+                (entries_next[head_next].entry.ctrl.memRead ||
+                 entries_next[head_next].entry.ctrl.memWrite) &&
+                entries_next[head_next].entry.src1_ready &&
+                !entries_next[head_next].issued_load) begin
+            load_writeback.valid = 1'b1;
+            load_writeback.active_id = entries_next[head_next].entry.active_id;
+            load_writeback.prd = entries_next[head_next].entry.prd;
+            load_writeback.has_dest = entries_next[head_next].entry.has_dest;
+            load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
+            load_writeback.exception = 1'b1;
+            load_writeback.exc_cause = xlate_cause;
+            load_writeback.data = entries_next[head_next].addr;   // mtval = VA
+            entries_next[head_next] = '0;
+            head_next = head_next + 1'b1;
+            count_next -= 1'b1;
+        end
+
+        if (head_xlate_ok && !double_store_pending_q && entries_next[head_next].entry.valid &&
                 (entries_next[head_next].entry.ctrl.exec_class == EXEC_AMO) &&
                 (entries_next[head_next].entry.ctrl.amo_op == AMO_SC) &&
                 entries_next[head_next].entry.src1_ready &&
@@ -138,7 +190,7 @@ module load_store_queue
             end
         end
 
-        if (!double_store_pending_q && entries_next[head_next].entry.valid &&
+        if (head_xlate_ok && !double_store_pending_q && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memRead &&
                 entries_next[head_next].entry.src1_ready && !entries_next[head_next].issued_load) begin
             data_load_en = 1'b1;
@@ -146,7 +198,7 @@ module load_store_queue
             entries_next[head_next].issued_load = 1'b1;
         end
 
-        if (!double_store_pending_q && entries_next[head_next].entry.valid &&
+        if (head_xlate_ok && !double_store_pending_q && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memWrite &&
                 entries_next[head_next].entry.src1_ready &&
                 entries_next[head_next].entry.src2_ready &&
@@ -214,7 +266,7 @@ module load_store_queue
             end
         end
 
-        if (!double_store_pending_q && commit_store && entries_next[head_next].entry.valid &&
+        if (head_xlate_ok && !double_store_pending_q && commit_store && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memWrite &&
                 (entries_next[head_next].entry.active_id == commit_store_id)) begin
             data_addr = entries_next[head_next].addr[31:2];

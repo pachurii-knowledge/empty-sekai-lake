@@ -143,6 +143,7 @@ package OOO_Types;
         logic          fp_fflags_valid;
         logic [4:0]    fp_fflags;
         logic          exception;
+        logic [4:0]    exc_cause;
         logic          halted;
     } writeback_packet_t;
 
@@ -168,6 +169,7 @@ package OOO_Types;
         logic          is_store;
         logic          halted;
         logic          exception;
+        logic [4:0]    exc_cause;
     } commit_packet_t;
 
     function automatic logic is_mul_op(input alu_op_t op);

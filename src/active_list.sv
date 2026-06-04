@@ -15,6 +15,7 @@ module active_list
     input  active_id_t            writeback_id [OOO_WIDTH],
     input  logic [OOO_WIDTH-1:0][31:0] writeback_data,
     input  logic [OOO_WIDTH-1:0]  writeback_exception,
+    input  logic [OOO_WIDTH-1:0][4:0] writeback_exc_cause,
     input  logic [OOO_WIDTH-1:0]  writeback_halted,
     input  logic [OOO_WIDTH-1:0]  writeback_fp_write,
     input  arch_reg_t             writeback_fp_rd [OOO_WIDTH],
@@ -39,6 +40,7 @@ module active_list
         logic valid;
         logic done;
         logic exception;
+        logic [4:0] exc_cause;
         logic halted;
         logic [31:0] pc;
         logic [31:0] instr;
@@ -122,6 +124,8 @@ module active_list
                 entries_next[writeback_id[i]].fp_fflags_valid =
                     writeback_fp_fflags_valid[i];
                 entries_next[writeback_id[i]].fp_fflags = writeback_fp_fflags[i];
+                if (writeback_exception[i] && !entries_next[writeback_id[i]].exception)
+                    entries_next[writeback_id[i]].exc_cause = writeback_exc_cause[i];
                 entries_next[writeback_id[i]].exception |= writeback_exception[i];
                 entries_next[writeback_id[i]].halted |= writeback_halted[i];
             end
@@ -153,6 +157,7 @@ module active_list
                 commit_packet[i].is_store = entries_next[head_next].is_store;
                 commit_packet[i].halted = entries_next[head_next].halted;
                 commit_packet[i].exception = entries_next[head_next].exception;
+                commit_packet[i].exc_cause = entries_next[head_next].exc_cause;
                 free_valid[i] = entries_next[head_next].has_dest;
                 free_prd[i] = entries_next[head_next].old_prd;
                 entries_next[head_next] = '0;
@@ -171,6 +176,7 @@ module active_list
                     entries_next[tail_next].valid = 1'b1;
                     entries_next[tail_next].done = 1'b0;
                     entries_next[tail_next].exception = 1'b0;
+                    entries_next[tail_next].exc_cause = 5'd0;
                     entries_next[tail_next].halted = 1'b0;
                     entries_next[tail_next].data = '0;
                     entries_next[tail_next].fp_write = 1'b0;

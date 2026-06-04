@@ -52,6 +52,7 @@ module ooo_alu_pipe
                 ((issue_entry.ctrl.exec_class == EXEC_CSR) &&
                  (csr_illegal || (issue_entry.ctrl.csr_write &&
                   (issue_entry.instr[31:30] == 2'b11))));
+            wb_next.exc_cause = 5'd2;   // EXC_ILLEGAL_INSTR
             wb_next.halted = issue_entry.ctrl.syscall &&
                 ((rs1_data == 32'ha) || (rs1_data == 32'hb));
         end

@@ -29,6 +29,7 @@ module ooo_writeback_bus
     output logic [OOO_WIDTH-1:0] writeback_fp_fflags_valid,
     output logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags,
     output logic [OOO_WIDTH-1:0] writeback_exception,
+    output logic [OOO_WIDTH-1:0][4:0] writeback_exc_cause,
     output logic [OOO_WIDTH-1:0] writeback_halted,
     output writeback_packet_t    branch_writeback
 );
@@ -63,6 +64,7 @@ module ooo_writeback_bus
             writeback_fp_fflags_valid[i] = 1'b0;
             writeback_fp_fflags[i] = '0;
             writeback_exception[i] = 1'b0;
+            writeback_exc_cause[i] = 5'd0;
             writeback_halted[i] = 1'b0;
         end
 
@@ -91,6 +93,7 @@ module ooo_writeback_bus
                         packets[source].fp_fflags_valid;
                     writeback_fp_fflags[lane] = packets[source].fp_fflags;
                     writeback_exception[lane] = packets[source].exception;
+                    writeback_exc_cause[lane] = packets[source].exc_cause;
                     writeback_halted[lane] = packets[source].halted;
                     if (packets[source].branch_valid) begin
                         branch_writeback = packets[source];
