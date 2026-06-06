@@ -784,17 +784,20 @@ module riscv_decode
                 end
 
                 default: begin
-                    // Skip the diagnostic for all-zero words: with the flat valid
-                    // memory window, speculative fetches past the program image
-                    // read back as zero and would otherwise spam the log / slow
-                    // simulation. A zero word is masked from illegal_instr below.
+                    // Skip only the diagnostic $display for all-zero words: with
+                    // the flat valid memory window, speculative fetches past the
+                    // program image read back as zero and would otherwise spam the
+                    // log / slow simulation. The illegal_instr flag itself is still
+                    // asserted: 0x00000000 is a reserved (illegal) encoding that
+                    // must trap. Wrong-path zero fetches are squashed before commit
+                    // (OoO) so this never raises a spurious exception.
                     `display(rst_l & (instr != 'h0), "Encountered unknown/unimplemented opcode 0x%02x.", opcode);
                     ctrl_signals.illegal_instr = 1'b1;
                 end
             endcase
 
             // Only assert the illegal instruction exception after reset
-            ctrl_signals.illegal_instr &= (rst_l & (instr != 'h0));
+            ctrl_signals.illegal_instr &= rst_l;
         end
 
 
