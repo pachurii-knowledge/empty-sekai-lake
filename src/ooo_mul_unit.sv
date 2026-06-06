@@ -13,6 +13,10 @@ module ooo_mul_unit
     input  logic [31:0]       rs1_data,
     input  logic [31:0]       rs2_data,
     input  branch_mask_t      abort_mask,
+    // Precise-trap full flush: squash every in-flight stage so no stale
+    // writeback lands after the pipeline is reset (the active-list id this op
+    // targets may be reused by a younger instruction next cycle).
+    input  logic              flush,
     input  logic              writeback_ready,
     output writeback_packet_t writeback
 );
@@ -32,7 +36,7 @@ module ooo_mul_unit
 
     always_comb begin
         writeback = pipe_q[MUL_LATENCY-1];
-        writeback.valid = valid_q[MUL_LATENCY-1] && !output_aborted;
+        writeback.valid = valid_q[MUL_LATENCY-1] && !output_aborted && !flush;
     end
 
     always_ff @(posedge clk or negedge rst_l) begin
@@ -41,6 +45,8 @@ module ooo_mul_unit
             for (int i = 0; i < MUL_LATENCY; i += 1) begin
                 pipe_q[i] <= '0;
             end
+        end else if (flush) begin
+            valid_q <= '0;
         end else if (advance) begin
             for (int i = MUL_LATENCY - 1; i > 0; i -= 1) begin
                 valid_q[i] <= valid_q[i - 1] &&

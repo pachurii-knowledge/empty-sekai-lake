@@ -16,6 +16,10 @@ module branch_stack
     input  logic                         resolve,
     input  branch_id_t                   resolve_id,
     input  logic                         mispredict,
+    // Precise-trap flush: clear all outstanding branch checkpoints (all are
+    // younger than the trapping instruction). The architectural map/free state
+    // is restored separately by the core's RRAT/committed-free-head rollback.
+    input  logic                         flush,
     output logic                         full,
     output logic                         allocate_valid,
     output branch_id_t                   allocate_id,
@@ -113,6 +117,16 @@ module branch_stack
                     end
                 end
             end
+        end
+
+        if (flush) begin
+            valid_mask_next = '0;
+            for (int slot = 0; slot < BRANCH_STACK_SIZE; slot += 1) begin
+                meta_next[slot] = '0;
+            end
+            allocate_valid = 1'b0;
+            allocate_id = '0;
+            restore_valid = 1'b0;
         end
     end
 

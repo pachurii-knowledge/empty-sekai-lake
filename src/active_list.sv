@@ -9,6 +9,12 @@ module active_list
     input  logic                  rst_l,
     input  logic                  restore_valid,
     input  active_id_t            restore_tail,
+    // Full pipeline flush on a precise trap / interrupt / trap-return. Unlike a
+    // branch restore (which rolls back to a checkpoint), this squashes every
+    // entry still in flight behind the committing (trapping) instruction. The
+    // trapping instruction itself still commits this cycle via the loop above;
+    // `flush` then discards everything younger.
+    input  logic                  flush,
     input  logic [OOO_WIDTH-1:0]  allocate_valid,
     input  rename_packet_t        allocate_packet [OOO_WIDTH],
     input  logic [OOO_WIDTH-1:0]  writeback_valid,
@@ -158,7 +164,13 @@ module active_list
                 commit_packet[i].halted = entries_next[head_next].halted;
                 commit_packet[i].exception = entries_next[head_next].exception;
                 commit_packet[i].exc_cause = entries_next[head_next].exc_cause;
-                free_valid[i] = entries_next[head_next].has_dest;
+                // An excepting instruction discards its result: its rd keeps the
+                // old mapping (restored from the architectural map on flush), so
+                // old_prd must NOT be freed here. Its freshly allocated prd is
+                // reclaimed by rolling the free-list head back to the committed
+                // head instead.
+                free_valid[i] = entries_next[head_next].has_dest &&
+                    !entries_next[head_next].exception;
                 free_prd[i] = entries_next[head_next].old_prd;
                 entries_next[head_next] = '0;
                 head_next = head_next + 1'b1;
@@ -201,6 +213,17 @@ module active_list
                     count_next += 1'b1;
                 end
             end
+        end
+
+        // Trap flush: discard everything still in flight behind the trapping
+        // instruction (which already committed via the loop above, advancing
+        // head_next past it). Reset the queue to empty at the post-commit head.
+        if (flush) begin
+            for (int i = 0; i < ACTIVE_LIST_SIZE; i += 1) begin
+                entries_next[i] = '0;
+            end
+            tail_next = head_next;
+            count_next = '0;
         end
     end
 

@@ -265,6 +265,30 @@ module riscv_core_ooo (
     logic precise_halt;
     logic precise_exception;
 
+    // ---- Precise-trap full flush for non-serializing faults (Phase 3c) ----
+    // Memory access/page faults and instruction-fetch faults are NOT
+    // serializing, so younger instructions are in flight behind them when the
+    // fault reaches commit. Taking such a trap therefore squashes every
+    // in-flight instruction (active list / issue queues / LSQ / branch stack /
+    // multi-cycle FUs) in one cycle and rolls the rename map and free list back
+    // to the committed architectural state. The multi-cycle units (mul/div/fp)
+    // are flushed directly so no stale writeback lands on a reused active-list
+    // id; single-cycle ALU writebacks and LSQ load completions are wiped by the
+    // same-cycle active-list / LSQ flush, so no drain is required.
+    //
+    // arch_map_q is a committed (retirement) rename map (RRAT); arch_free_head_q
+    // is the free-list head as of the committed point, so squashed speculative
+    // allocations are reclaimed by rolling the free-list head back to it.
+    logic        trap_take;         // exception committed this cycle -> full flush
+    phys_reg_t   arch_map_q [32];
+    phys_reg_t   arch_map_next [32];
+    logic [$clog2(PHYS_REGS)-1:0] arch_free_head_q;
+    logic [$clog2(PHYS_REGS)-1:0] arch_free_head_next;
+    logic        map_restore_valid;
+    phys_reg_t   map_restore_map [32];
+    logic        free_restore_valid;
+    logic [$clog2(PHYS_REGS)-1:0] free_restore_head;
+
     logic [OOO_WIDTH-1:0] arch_rd_we;
     logic [OOO_WIDTH-1:0][4:0] arch_rs1;
     logic [OOO_WIDTH-1:0][4:0] arch_rs2;
@@ -295,8 +319,8 @@ module riscv_core_ooo (
     rename_map_table MapTable (
         .clk,
         .rst_l,
-        .restore_valid(branch_restore_valid),
-        .restore_map(branch_restore_map),
+        .restore_valid(map_restore_valid),
+        .restore_map(map_restore_map),
         .rename_valid(dispatch_valid),
         .rs1(map_rs1),
         .rs2(map_rs2),
@@ -313,8 +337,8 @@ module riscv_core_ooo (
     free_list FreeList (
         .clk,
         .rst_l,
-        .restore_valid(branch_restore_valid),
-        .restore_head(branch_restore_free_head),
+        .restore_valid(free_restore_valid),
+        .restore_head(free_restore_head),
         .restore_tail(branch_restore_free_tail),
         .restore_count(branch_restore_free_count),
         .alloc_req(alloc_req),
@@ -615,6 +639,7 @@ module riscv_core_ooo (
         .resolve(branch_resolve_valid),
         .resolve_id(branch_resolve_id),
         .mispredict(branch_resolve_mispredict),
+        .flush(trap_take),
         .full(branch_stack_full),
         .allocate_valid(branch_allocate_valid),
         .allocate_id(branch_allocate_id),
@@ -674,7 +699,8 @@ module riscv_core_ooo (
         .free_list_can_allocate(free_can_allocate),
         .free_list_available(free_count_snapshot),
         .suppress_dispatch(redirect_valid || terminal_pending_q ||
-            control_pending_q || serial_pending_q || halted_q || irq_drain_q),
+            control_pending_q || serial_pending_q || halted_q || irq_drain_q ||
+            commit_take_trap),
         .dispatch_valid,
         .dispatch_stall
     );
@@ -684,6 +710,7 @@ module riscv_core_ooo (
         .rst_l,
         .restore_valid(branch_restore_valid),
         .restore_tail(branch_restore_active_tail),
+        .flush(trap_take),
         .allocate_valid(dispatch_valid),
         .allocate_packet(rename_packets),
         .writeback_valid(writeback_valid),
@@ -721,6 +748,7 @@ module riscv_core_ooo (
         .issue_ready(int_issue_ready),
         .reset_mask,
         .abort_mask,
+        .flush(trap_take),
         .full(int_iq_full),
         .issue_valid(int_issue_valid),
         .issue_entry(int_issue_entry)
@@ -776,6 +804,7 @@ module riscv_core_ooo (
         .rs1_data(phys_rs1_data[ISSUE_MUL]),
         .rs2_data(phys_rs2_data[ISSUE_MUL]),
         .abort_mask,
+        .flush(trap_take),
         .writeback_ready(mul_writeback_ready),
         .writeback(mul_writeback)
     );
@@ -789,6 +818,7 @@ module riscv_core_ooo (
         .rs1_data(phys_rs1_data[ISSUE_DIV]),
         .rs2_data(phys_rs2_data[ISSUE_DIV]),
         .abort_mask,
+        .flush(trap_take),
         .writeback_ready(div_writeback_ready),
         .writeback(div_writeback)
     );
@@ -802,6 +832,7 @@ module riscv_core_ooo (
         .rs1_data(phys_rs1_data[ISSUE_FP]),
         .frm(csr_frm),
         .abort_mask,
+        .flush(trap_take),
         .writeback_ready(fp_writeback_ready),
         .writeback(fp_writeback)
     );
@@ -818,6 +849,7 @@ module riscv_core_ooo (
         .wakeup_data(writeback_data),
         .reset_mask,
         .abort_mask,
+        .flush(trap_take),
         .data_load_valid,
         .data_load(data_load[0]),
         // Under paging the queue matches loads on the (virtual) head address; the
@@ -1228,14 +1260,34 @@ module riscv_core_ooo (
                     !active_commit_packet[i].halted) begin
                 unique case (active_commit_packet[i].instr)
                     32'h3020_0073: begin                       // MRET
-                        commit_take_ret   = 1'b1;
-                        commit_ret_from_s = 1'b0;
-                        commit_trap_epc   = active_commit_packet[i].pc;
+                        // MRET is legal only from M-mode; otherwise it is an
+                        // illegal instruction.
+                        if (cur_priv != RISCV_Priv::PRIV_M) begin
+                            commit_exc_valid = 1'b1;
+                            commit_exc_cause = RISCV_Priv::EXC_ILLEGAL_INSTR;
+                            commit_exc_tval  = active_commit_packet[i].instr;
+                            commit_trap_epc  = active_commit_packet[i].pc;
+                        end else begin
+                            commit_take_ret   = 1'b1;
+                            commit_ret_from_s = 1'b0;
+                            commit_trap_epc   = active_commit_packet[i].pc;
+                        end
                     end
                     32'h1020_0073: begin                       // SRET
-                        commit_take_ret   = 1'b1;
-                        commit_ret_from_s = 1'b1;
-                        commit_trap_epc   = active_commit_packet[i].pc;
+                        // SRET is illegal from U-mode, and illegal from S-mode
+                        // when mstatus.TSR=1 (Trap SRET). M-mode may always SRET.
+                        if ((cur_priv == RISCV_Priv::PRIV_U) ||
+                            ((cur_priv == RISCV_Priv::PRIV_S) &&
+                             csr_mstatus[RISCV_Priv::MSTATUS_TSR_BIT])) begin
+                            commit_exc_valid = 1'b1;
+                            commit_exc_cause = RISCV_Priv::EXC_ILLEGAL_INSTR;
+                            commit_exc_tval  = active_commit_packet[i].instr;
+                            commit_trap_epc  = active_commit_packet[i].pc;
+                        end else begin
+                            commit_take_ret   = 1'b1;
+                            commit_ret_from_s = 1'b1;
+                            commit_trap_epc   = active_commit_packet[i].pc;
+                        end
                     end
                     32'h0000_0073: begin                       // ECALL
                         commit_exc_valid = 1'b1;
@@ -1249,9 +1301,27 @@ module riscv_core_ooo (
                         commit_exc_valid = 1'b1;
                         commit_exc_cause = RISCV_Priv::EXC_BREAKPOINT;
                         commit_trap_epc  = active_commit_packet[i].pc;
+                        // A breakpoint exception reports the PC of the EBREAK in
+                        // m/stval (unlike most synchronous exceptions, which
+                        // report zero or a faulting data address).
+                        commit_exc_tval  = active_commit_packet[i].pc;
                     end
                     default: begin
-                        if (active_commit_packet[i].exception) begin
+                        // SFENCE.VMA is illegal from U-mode, and illegal from
+                        // S-mode when mstatus.TVM=1 (Trap Virtual Memory). It is
+                        // encoded as SYSTEM / funct3=000 / funct7=0001001.
+                        if ((active_commit_packet[i].instr[6:0] ==
+                                 RISCV_ISA::OP_SYSTEM) &&
+                            (active_commit_packet[i].instr[14:12] == 3'b000) &&
+                            (active_commit_packet[i].instr[31:25] == 7'b0001001) &&
+                            ((cur_priv == RISCV_Priv::PRIV_U) ||
+                             ((cur_priv == RISCV_Priv::PRIV_S) &&
+                              csr_mstatus[RISCV_Priv::MSTATUS_TVM_BIT]))) begin
+                            commit_exc_valid = 1'b1;
+                            commit_exc_cause = RISCV_Priv::EXC_ILLEGAL_INSTR;
+                            commit_exc_tval  = active_commit_packet[i].instr;
+                            commit_trap_epc  = active_commit_packet[i].pc;
+                        end else if (active_commit_packet[i].exception) begin
                             commit_exc_valid = 1'b1;
                             commit_exc_cause = active_commit_packet[i].exc_cause;
                             // Illegal-instruction faults report the instruction in
@@ -1272,6 +1342,44 @@ module riscv_core_ooo (
             end
         end
         commit_take_trap = commit_exc_valid;
+
+        // ---- Precise-trap full flush + architectural rollback (Phase 3c) ----
+        // A committed exception is taken precisely: every younger in-flight
+        // instruction is squashed this cycle (active list / issue queues / LSQ /
+        // branch stack / multi-cycle FUs all see `trap_take`) and the speculative
+        // rename map and free-list head are restored to the committed (RRAT)
+        // state. The faulting instruction does not architecturally complete --
+        // arch_rd_we is already cleared for it above -- so it neither updates the
+        // RRAT nor advances the architectural free-list head, and the physical
+        // register it speculatively allocated is reclaimed by the head rollback.
+        // Interrupts already wait for an empty ROB and returns are serializing,
+        // so only exceptions need this; serializing exceptions simply see an
+        // empty younger window and the rollback is a no-op.
+        trap_take = commit_take_trap;
+
+        arch_free_head_next = arch_free_head_q;
+        for (int i = 0; i < 32; i += 1) begin
+            arch_map_next[i] = arch_map_q[i];
+        end
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (arch_rd_we[i]) begin
+                arch_map_next[arch_rd[i]] = active_commit_packet[i].prd;
+                arch_free_head_next = arch_free_head_next + 1'b1;
+            end
+        end
+
+        // Restore muxes: a trap flush rolls back to the architectural state and
+        // takes priority over a branch misprediction recovery (the mispredicting
+        // branch is necessarily younger than the trapping head, so it is part of
+        // the squashed window).
+        map_restore_valid  = trap_take || branch_restore_valid;
+        free_restore_valid = trap_take || branch_restore_valid;
+        free_restore_head  = trap_take ? arch_free_head_next :
+                                         branch_restore_free_head;
+        for (int i = 0; i < 32; i += 1) begin
+            map_restore_map[i] = trap_take ? arch_map_next[i] :
+                                             branch_restore_map[i];
+        end
 
         // ---- Precise interrupt handling via ROB drain (Phase 3b) ----
         // Mirror trap_controller's interrupt-enable evaluation so we can stop
@@ -1339,6 +1447,17 @@ module riscv_core_ooo (
         end
         if (redirect_valid) begin
             serial_pending_next = 1'b0;
+        end
+        // A precise-trap flush squashes every younger in-flight instruction, so
+        // any frontend "pending" interlock those squashed instructions raised
+        // (a not-yet-committed serializing op, an unresolved unpredicted control
+        // transfer, or a pending terminal ecall) must be released here -- the
+        // instruction that would have cleared it no longer exists.
+        if (trap_take) begin
+            serial_pending_next = 1'b0;
+            control_pending_next = 1'b0;
+            control_pending_id_next = '0;
+            terminal_pending_next = 1'b0;
         end
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (active_commit_valid[i] &&
@@ -1422,7 +1541,8 @@ module riscv_core_ooo (
                 // commits in isolation and nothing younger is in flight.
                 if ((active_commit_packet[i].instr[6:0] == RISCV_ISA::OP_SYSTEM) &&
                         (active_commit_packet[i].instr[14:12] == 3'b000) &&
-                        (active_commit_packet[i].instr[31:25] == 7'b0001001)) begin
+                        (active_commit_packet[i].instr[31:25] == 7'b0001001) &&
+                        !commit_take_trap) begin
                     tlb_flush = 1'b1;
                     pc_next = active_commit_packet[i].pc + 32'd4;
                     fetch_pc_pipe_next = '0;
@@ -1469,6 +1589,12 @@ module riscv_core_ooo (
             for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
                 ghr_checkpoint_q[i] <= '0;
             end
+            // RRAT / architectural free-list head mirror the rename map table and
+            // free list reset state (identity map; head at 0).
+            for (int i = 0; i < 32; i += 1) begin
+                arch_map_q[i] <= phys_reg_t'(i);
+            end
+            arch_free_head_q <= '0;
         end else begin
             pc_q <= pc_next;
             fetch_pc_pipe_q <= fetch_pc_pipe_next;
@@ -1488,6 +1614,10 @@ module riscv_core_ooo (
                 ras_checkpoint_count_q[i] <= ras_checkpoint_count_next[i];
             end
             ghr_q <= ghr_next;
+            for (int i = 0; i < 32; i += 1) begin
+                arch_map_q[i] <= arch_map_next[i];
+            end
+            arch_free_head_q <= arch_free_head_next;
             for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
                 ghr_checkpoint_q[i] <= ghr_checkpoint_next[i];
             end
@@ -1729,6 +1859,16 @@ module riscv_core_ooo (
                         active_commit_packet[i].exc_cause, csr_satp,
                         paging_data, mem_req_valid, mem_req_vaddr);
             end
+            if (commit_take_trap)
+                $display("[%0d] TRAP cause=%0d epc=%h tval=%h priv=%0d->vec=%h",
+                    dbg_cyc, commit_exc_cause, commit_trap_epc, commit_exc_tval,
+                    cur_priv, tc_vector);
+            if (commit_take_int)
+                $display("[%0d] INT  epc=%h mip=%h mie=%h priv=%0d->vec=%h",
+                    dbg_cyc, commit_int_epc, csr_mip, csr_mie, cur_priv, tc_vector);
+            if (commit_take_ret)
+                $display("[%0d] RET  from_s=%b epc=%h", dbg_cyc,
+                    commit_ret_from_s, trap_redirect_pc);
             if (satp_mode && (dbg_cyc % 1 == 0))
                 $display("[%0d] PG pc=%h pgD=%b mrq=%b mva=%h dh=%b du=%b ptwB=%b D=%b F=%b xs=%b xf=%b dle=%b da=%h",
                     dbg_cyc, pc_q, paging_data, mem_req_valid,

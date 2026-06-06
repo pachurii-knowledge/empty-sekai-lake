@@ -93,6 +93,10 @@ module priv_csr_file
     // Software-writable / S-mode visible interrupt mask
     localparam logic [31:0] S_INT_MASK = 32'h0000_0222;  // SSI|STI|SEI
     localparam logic [31:0] M_INT_MASK = 32'h0000_0AAA;  // all M+S enables
+    /* m/scounteren WARL mask: only CY (bit0), TM (bit1) and IR (bit2) are
+     * implemented; the programmable HPM counters (bits 3-31) are read-zero, so
+     * their enable bits are hardwired to zero. */
+    localparam logic [31:0] COUNTEREN_MASK = 32'h0000_0007;
 
     /*------------------------------------------------------------------------
      * Architectural state
@@ -116,7 +120,7 @@ module priv_csr_file
     logic [31:0] satp_q;
     logic [31:0] mcounteren_q, scounteren_q;
     logic [31:0] menvcfg_q;
-
+    logic        senvcfg_fiom_q;        // senvcfg.FIOM (bit 0); other fields 0
     // Software-writable interrupt-pending bits (S-mode bits)
     logic        ssip_q, stip_q, seip_sw_q;
 
@@ -240,7 +244,9 @@ module priv_csr_file
                 // satp inaccessible from S-mode when mstatus.TVM=1
                 if ((priv_q == PRIV_S) && st_tvm_q) illegal = 1'b1;
             end
-            CSR_SENVCFG:   data = 32'b0;
+            // senvcfg: only FIOM (bit 0) is implemented (no Zicbom/Zicboz), the
+            // rest read as zero (WARL).
+            CSR_SENVCFG:   data = {31'b0, senvcfg_fiom_q};
 
             // Machine information
             CSR_MVENDORID: data = 32'b0;
@@ -258,6 +264,11 @@ module priv_csr_file
             CSR_MTVEC:     data = mtvec_q;
             CSR_MCOUNTEREN:data = mcounteren_q;
             CSR_MENVCFG:   data = menvcfg_q;
+            // menvcfgh holds the upper 32 bits of menvcfg on RV32. niigo supports
+            // none of those features (STCE/PBMTE/ADUE/...), so it reads as zero and
+            // ignores writes (WARL). It must still decode (not trap) once U-mode
+            // exists, otherwise the arch-test boot code faults setting it up.
+            CSR_MENVCFGH:  data = 32'b0;
 
             // Machine trap handling
             CSR_MSCRATCH:  data = mscratch_q;
@@ -274,6 +285,27 @@ module priv_csr_file
             default: begin
                 if ((addr >= CSR_PMPADDR0) && (addr <= CSR_PMPADDR0 + 12'd15)) begin
                     data = pmpaddr_q[addr - CSR_PMPADDR0];
+                // Hardware performance-monitor CSRs. niigo implements none of the
+                // programmable event counters, but the privileged spec requires
+                // mcountinhibit, mhpmevent3-31 and mhpmcounter3-31 (plus the high
+                // halves and the U-mode-readable mirrors) to exist as WARL
+                // registers once any counter is implemented. Model them as
+                // read-zero / ignore-write so the arch-test boot code that zeroes
+                // them does not take a spurious illegal-instruction trap.
+                end else if (addr == CSR_MCOUNTINHIBIT) begin
+                    data = 32'b0;
+                end else if ((addr >= CSR_MHPMEVENT3)   && (addr <= CSR_MHPMEVENT31))  begin
+                    data = 32'b0;                       // mhpmevent3-31   (0x323-0x33F)
+                end else if ((addr >= CSR_MHPMEVENT3H)  && (addr <= CSR_MHPMEVENT31H)) begin
+                    data = 32'b0;                       // mhpmevent3h-31h (0x723-0x73F)
+                end else if ((addr >= CSR_MHPMCOUNTER3)  && (addr <= CSR_MHPMCOUNTER31))  begin
+                    data = 32'b0;                       // mhpmcounter3-31  (0xB03-0xB1F)
+                end else if ((addr >= CSR_MHPMCOUNTER3H) && (addr <= CSR_MHPMCOUNTER31H)) begin
+                    data = 32'b0;                       // mhpmcounter3h-31h(0xB83-0xB9F)
+                end else if ((addr >= CSR_HPMCOUNTER3)   && (addr <= CSR_HPMCOUNTER31))  begin
+                    data = 32'b0;                       // hpmcounter3-31   (0xC03-0xC1F)
+                end else if ((addr >= CSR_HPMCOUNTER3H)  && (addr <= CSR_HPMCOUNTER31H)) begin
+                    data = 32'b0;                       // hpmcounter3h-31h (0xC83-0xC9F)
                 end else begin
                     data = 32'b0;
                     illegal = 1'b1;
@@ -319,6 +351,7 @@ module priv_csr_file
             mcounteren_q<= 32'b0;
             scounteren_q<= 32'b0;
             menvcfg_q   <= 32'b0;
+            senvcfg_fiom_q <= 1'b0;
             ssip_q      <= 1'b0;
             stip_q      <= 1'b0;
             seip_sw_q   <= 1'b0;
@@ -339,14 +372,14 @@ module priv_csr_file
             if (trap_valid) begin
                 // Trap entry. Save state into the target privilege's CSRs.
                 if (trap_target_priv == PRIV_M) begin
-                    mepc_q   <= {trap_epc[31:1], 1'b0};
+                    mepc_q   <= {trap_epc[31:2], 2'b0};
                     mcause_q <= {trap_is_interrupt, 26'b0, trap_cause};
                     mtval_q  <= trap_tval;
                     st_mpie_q <= st_mie_q;
                     st_mie_q  <= 1'b0;
                     st_mpp_q  <= priv_q;
                 end else begin
-                    sepc_q   <= {trap_epc[31:1], 1'b0};
+                    sepc_q   <= {trap_epc[31:2], 2'b0};
                     scause_q <= {trap_is_interrupt, 26'b0, trap_cause};
                     stval_q  <= trap_tval;
                     st_spie_q <= st_sie_q;
@@ -372,6 +405,23 @@ module priv_csr_file
                 end
             end else if (write_valid) begin
                 apply_csr_write(write_addr, write_data);
+            end
+
+            /* Floating-point state tracking. Per the privileged spec, mstatus.FS
+             * becomes Dirty (11) whenever the FP unit modifies FP state: an FP
+             * instruction that accrues exception flags, or a write to one of the
+             * FP CSRs (fflags/frm/fcsr). The arch-test boot relies on this (its
+             * `csrw fcsr, zero` is what enables FP / sets SD), so without it the
+             * DUT reads mstatus with FS=0 where the reference reads FS=Dirty.
+             * An explicit mstatus/sstatus write in the same cycle takes priority
+             * (it is the architectural source of truth for the FS field). */
+            if ((fp_fflags_valid ||
+                 (write_valid && (write_addr == CSR_FCSR ||
+                                  write_addr == CSR_FFLAGS ||
+                                  write_addr == CSR_FRM))) &&
+                !(write_valid && (write_addr == CSR_MSTATUS ||
+                                  write_addr == CSR_SSTATUS))) begin
+                st_fs_q <= 2'b11;
             end
         end
     end
@@ -400,15 +450,16 @@ module priv_csr_file
             end
             CSR_SIE:    mie_q <= (mie_q & ~mideleg_q) | (wdata & mideleg_q & S_INT_MASK);
             CSR_STVEC:  stvec_q <= {wdata[31:2], 1'b0, wdata[0]};
-            CSR_SCOUNTEREN: scounteren_q <= wdata;
+            CSR_SCOUNTEREN: scounteren_q <= wdata & COUNTEREN_MASK;
             CSR_SSCRATCH: sscratch_q <= wdata;
-            CSR_SEPC:   sepc_q <= {wdata[31:1], 1'b0};
+            CSR_SEPC:   sepc_q <= {wdata[31:2], 2'b0};
             CSR_SCAUSE: scause_q <= wdata;
             CSR_STVAL:  stval_q <= wdata;
             CSR_SIP: begin
                 if (mideleg_q[SSI_BIT]) ssip_q <= wdata[SSI_BIT];
             end
             CSR_SATP:   satp_q <= wdata;
+            CSR_SENVCFG: senvcfg_fiom_q <= wdata[0];
 
             CSR_MSTATUS: begin
                 st_sie_q  <= wdata[MSTATUS_SIE_BIT];
@@ -429,15 +480,19 @@ module priv_csr_file
             CSR_MIDELEG: mideleg_q <= wdata & S_INT_MASK;
             CSR_MIE:     mie_q <= wdata & M_INT_MASK;
             CSR_MTVEC:   mtvec_q <= {wdata[31:2], 1'b0, wdata[0]};
-            CSR_MCOUNTEREN: mcounteren_q <= wdata;
+            CSR_MCOUNTEREN: mcounteren_q <= wdata & COUNTEREN_MASK;
             CSR_MENVCFG: menvcfg_q <= wdata;
             CSR_MSCRATCH: mscratch_q <= wdata;
-            CSR_MEPC:    mepc_q <= {wdata[31:1], 1'b0};
+            CSR_MEPC:    mepc_q <= {wdata[31:2], 2'b0};
             CSR_MCAUSE:  mcause_q <= wdata;
             CSR_MTVAL:   mtval_q <= wdata;
             CSR_MIP: begin
-                ssip_q <= wdata[SSI_BIT];
-                stip_q <= wdata[STI_BIT];
+                // M-mode may write the software-settable S-mode pending bits.
+                // mip.SEIP is a software-writable alias that ORs with the real
+                // supervisor external interrupt input on read.
+                ssip_q    <= wdata[SSI_BIT];
+                stip_q    <= wdata[STI_BIT];
+                seip_sw_q <= wdata[SEI_BIT];
             end
             CSR_PMPCFG0: pmpcfg_q[0] <= wdata;
             CSR_PMPCFG1: pmpcfg_q[1] <= wdata;
@@ -458,5 +513,18 @@ module priv_csr_file
             default:             legal_mpp = 2'b00;
         endcase
     endfunction
+
+`ifdef AGENT_DEBUG
+    always_ff @(posedge clk) begin
+        if (rst_l && write_valid &&
+                (write_addr == CSR_MSTATUS || write_addr == CSR_SSTATUS))
+            $display("[CSR] write %h <= %h (FS<=%b) priv=%0d",
+                write_addr, write_data, write_data[MSTATUS_FS_LO+:2], priv_q);
+        if (rst_l && (read_addr == CSR_MSTATUS) && !read_illegal)
+            $display("[CSR] read mstatus => %h (FS=%b SD=%b) priv=%0d",
+                read_data, read_data[MSTATUS_FS_LO+:2], read_data[MSTATUS_SD_BIT],
+                priv_q);
+    end
+`endif
 
 endmodule: priv_csr_file

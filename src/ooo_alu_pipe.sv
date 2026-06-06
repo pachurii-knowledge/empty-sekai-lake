@@ -55,6 +55,23 @@ module ooo_alu_pipe
             wb_next.exc_cause = 5'd2;   // EXC_ILLEGAL_INSTR
             wb_next.halted = issue_entry.ctrl.syscall &&
                 ((rs1_data == 32'ha) || (rs1_data == 32'hb));
+
+            // Instruction-address-misaligned (IALIGN=32, no C extension): a
+            // taken branch or jump whose target is not 4-byte aligned faults on
+            // the control-transfer instruction itself (epc = its PC, tval =
+            // target). JALR already forces target bit[0] to 0; JAL/branch
+            // immediates are even, so the only way to misalign is target bit[1].
+            // Reported here as an exception that the ROB takes precisely at
+            // commit; fetch is kept on an aligned path meanwhile since the
+            // misaligned target is never actually executed.
+            if (control_taken(issue_entry, rs1_data, rs2_data) &&
+                    actual_target_for(issue_entry, rs1_data, rs2_data)[1]) begin
+                wb_next.exception = 1'b1;
+                wb_next.exc_cause = 5'd0;   // EXC_INSTR_MISALIGNED
+                wb_next.data =
+                    actual_target_for(issue_entry, rs1_data, rs2_data);
+                wb_next.redirect_pc = issue_entry.pc + 32'd4;
+            end
         end
     end
 
@@ -306,6 +323,14 @@ module ooo_alu_pipe
             branch_mispredict_for = actual_target_for(entry, src1, src2) !=
                 (entry.pc + 32'd4);
         end
+    endfunction
+
+    function automatic logic control_taken(issue_entry_t entry,
+            logic [31:0] src1, logic [31:0] src2);
+        control_taken = (entry.ctrl.pc_source == PC_uncond) ||
+            (entry.ctrl.pc_source == PC_indirect) ||
+            ((entry.ctrl.pc_source == PC_cond) &&
+             branch_cmp(src1, src2, entry.ctrl.alu_op));
     endfunction
 
     function automatic logic [31:0] actual_target_for(issue_entry_t entry,

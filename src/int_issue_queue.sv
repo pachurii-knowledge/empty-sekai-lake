@@ -14,6 +14,9 @@ module int_issue_queue
     input  logic [FU_ISSUE_PORTS-1:0] issue_ready,
     input  branch_mask_t         reset_mask,
     input  branch_mask_t         abort_mask,
+    // Full pipeline flush on a precise trap / interrupt / trap-return: discard
+    // every queued instruction (all are younger than the trapping instruction).
+    input  logic                 flush,
     output logic                 full,
     output logic [FU_ISSUE_PORTS-1:0] issue_valid,
     output issue_entry_t         issue_entry [FU_ISSUE_PORTS]
@@ -103,6 +106,17 @@ module int_issue_queue
                         end
                     end
                 end
+            end
+        end
+
+        if (flush) begin
+            for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+                entries_next[i] = '0;
+            end
+            count_next = '0;
+            issue_valid = '0;
+            for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
+                issue_entry[i] = '0;
             end
         end
     end

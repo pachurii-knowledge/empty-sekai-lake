@@ -16,6 +16,9 @@ module load_store_queue
     input  logic [OOO_WIDTH-1:0][31:0] wakeup_data,
     input  branch_mask_t         reset_mask,
     input  branch_mask_t         abort_mask,
+    // Full pipeline flush on a precise trap / interrupt / trap-return: discard
+    // every queued memory op (all are younger than the trapping instruction).
+    input  logic                 flush,
     input  logic                 data_load_valid,
     input  logic [31:0]          data_load,
     input  logic [29:0]          data_load_addr,
@@ -326,6 +329,27 @@ module load_store_queue
                     count_next += 1'b1;
                 end
             end
+        end
+
+        // Precise-trap flush: every queued op is younger than the trapping
+        // instruction, so discard them all. Suppress any memory/writeback
+        // effects driven above this cycle. The LR reservation is committed
+        // architectural state and is intentionally preserved.
+        if (flush) begin
+            for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
+                entries_next[i] = '0;
+            end
+            head_next = '0;
+            tail_next = '0;
+            count_next = '0;
+            data_load_en = 1'b0;
+            data_addr = '0;
+            data_store = '0;
+            data_store_mask = '0;
+            load_writeback = '0;
+            double_store_pending_next = 1'b0;
+            double_store_addr_next = '0;
+            double_store_data_next = '0;
         end
     end
 

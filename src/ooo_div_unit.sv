@@ -13,6 +13,9 @@ module ooo_div_unit
     input  logic [31:0]       rs1_data,
     input  logic [31:0]       rs2_data,
     input  branch_mask_t      abort_mask,
+    // Precise-trap full flush: abandon any in-flight division so no stale
+    // writeback lands on a reused active-list id after the pipeline is reset.
+    input  logic              flush,
     input  logic              writeback_ready,
     output writeback_packet_t writeback
 );
@@ -43,7 +46,8 @@ module ooo_div_unit
 
     always_comb begin
         writeback = packet_q;
-        writeback.valid = (state_q == DIV_DONE) && packet_q.valid && !aborted;
+        writeback.valid = (state_q == DIV_DONE) && packet_q.valid && !aborted &&
+            !flush;
     end
 
     always_comb begin
@@ -61,7 +65,7 @@ module ooo_div_unit
         qdigit = 4'b0;
         trial_remainder = 36'b0;
 
-        if (aborted) begin
+        if (flush || aborted) begin
             state_next = DIV_IDLE;
             packet_next = '0;
         end else begin

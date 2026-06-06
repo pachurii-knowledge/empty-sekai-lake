@@ -67,6 +67,7 @@ package RISCV_Priv;
     localparam logic [11:0] CSR_MCOUNTEREN = 12'h306;
     localparam logic [11:0] CSR_MSTATUSH   = 12'h310;
     localparam logic [11:0] CSR_MENVCFG    = 12'h30A;
+    localparam logic [11:0] CSR_MENVCFGH   = 12'h31A;
 
     // Machine trap handling
     localparam logic [11:0] CSR_MSCRATCH   = 12'h340;
@@ -87,6 +88,22 @@ package RISCV_Priv;
     localparam logic [11:0] CSR_MINSTRET   = 12'hB02;
     localparam logic [11:0] CSR_MCYCLEH    = 12'hB80;
     localparam logic [11:0] CSR_MINSTRETH  = 12'hB82;
+
+    // Hardware performance-monitor CSRs (modelled as WARL read-zero). Bounds of
+    // the programmable counter / event-selector ranges used for decode.
+    localparam logic [11:0] CSR_MCOUNTINHIBIT  = 12'h320;
+    localparam logic [11:0] CSR_MHPMEVENT3     = 12'h323;  // .. 0x33F
+    localparam logic [11:0] CSR_MHPMEVENT31    = 12'h33F;
+    localparam logic [11:0] CSR_MHPMEVENT3H    = 12'h723;  // .. 0x73F
+    localparam logic [11:0] CSR_MHPMEVENT31H   = 12'h73F;
+    localparam logic [11:0] CSR_MHPMCOUNTER3   = 12'hB03;  // .. 0xB1F
+    localparam logic [11:0] CSR_MHPMCOUNTER31  = 12'hB1F;
+    localparam logic [11:0] CSR_MHPMCOUNTER3H  = 12'hB83;  // .. 0xB9F
+    localparam logic [11:0] CSR_MHPMCOUNTER31H = 12'hB9F;
+    localparam logic [11:0] CSR_HPMCOUNTER3    = 12'hC03;  // .. 0xC1F
+    localparam logic [11:0] CSR_HPMCOUNTER31   = 12'hC1F;
+    localparam logic [11:0] CSR_HPMCOUNTER3H   = 12'hC83;  // .. 0xC9F
+    localparam logic [11:0] CSR_HPMCOUNTER31H  = 12'hC9F;
 
     /*------------------------------------------------------------------------
      * Trap causes (mcause / scause). Interrupt bit is the MSB of the XLEN word.

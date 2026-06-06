@@ -13,6 +13,10 @@ module niigo_fp_unit
     input  logic [31:0]       rs1_data,
     input  logic [2:0]        frm,
     input  branch_mask_t      abort_mask,
+    // Precise-trap full flush: drop the pending request, the cvfpu internal
+    // pipeline, and the output buffer so no stale writeback lands on a reused
+    // active-list id after the pipeline is reset.
+    input  logic              flush,
     input  logic              writeback_ready,
     output writeback_packet_t writeback
 );
@@ -89,7 +93,7 @@ module niigo_fp_unit
         .simd_mask_i   ( '1                 ),
         .in_valid_i    ( fpnew_in_valid     ),
         .in_ready_o    ( fpnew_in_ready     ),
-        .flush_i       ( 1'b0               ),
+        .flush_i       ( flush              ),
         .result_o      ( fpnew_result       ),
         .status_o      ( fpnew_status       ),
         .tag_o         ( fpnew_tag          ),
@@ -104,7 +108,9 @@ module niigo_fp_unit
         fpnew_writeback = packet_for_fpnew(fpnew_buffer_tag_q,
             fpnew_buffer_result_q, fpnew_buffer_status_q);
         writeback = '0;
-        if (simple_writeback_valid) begin
+        if (flush) begin
+            writeback = '0;
+        end else if (simple_writeback_valid) begin
             writeback = simple_writeback;
         end else if (fpnew_buffer_valid_q && !fpnew_buffer_aborted) begin
             writeback = fpnew_writeback;
@@ -120,6 +126,9 @@ module niigo_fp_unit
             fpnew_buffer_result_q <= '0;
             fpnew_buffer_status_q <= '0;
             fpnew_buffer_tag_q <= '0;
+        end else if (flush) begin
+            req_valid_q <= 1'b0;
+            fpnew_buffer_valid_q <= 1'b0;
         end else begin
             if (fpnew_buffer_valid_q &&
                     (fpnew_buffer_aborted ||

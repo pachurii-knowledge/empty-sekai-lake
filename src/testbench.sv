@@ -212,6 +212,49 @@ module top;
         end
     end
 
+    /* Architectural-signature dumper for RISCOF/arch-test style verification.
+     * Enable by passing +sig_begin=<hex byte addr> +sig_end=<hex byte addr>
+     * +sig_out=<path>. At the end of simulation the words in [begin, end) are
+     * written one 32-bit word per line (lowercase hex) so the result can be
+     * diffed directly against the golden reference .sig. Reads the flat backing
+     * store in the (DO-NOT-MODIFY) memory model hierarchically; uninitialized
+     * words read back as zero, matching the model's own read semantics. */
+    logic [31:0] sig_begin_addr, sig_end_addr;
+    string       sig_out_path;
+    logic        sig_enabled;
+    initial begin
+        if ($value$plusargs("sig_begin=%h", sig_begin_addr) &&
+            $value$plusargs("sig_end=%h", sig_end_addr) &&
+            $value$plusargs("sig_out=%s", sig_out_path)) begin
+            sig_enabled = 1'b1;
+        end else begin
+            sig_enabled = 1'b0;
+        end
+    end
+    final begin
+        if (sig_enabled) begin
+            int unsigned waddr;
+            int          fd;
+            logic [29:0] idx;
+            fd = $fopen(sig_out_path, "w");
+            if (fd == 0) begin
+                $display("SIG: unable to open %s for writing", sig_out_path);
+            end else begin
+                for (waddr = sig_begin_addr; waddr < sig_end_addr;
+                        waddr += 4) begin
+                    idx = waddr[31:2];
+                    if (Memory.memory.exists(idx))
+                        $fdisplay(fd, "%08x", Memory.memory[idx]);
+                    else
+                        $fdisplay(fd, "%08x", 32'h0);
+                end
+                $fclose(fd);
+                $display("SIG: wrote signature [%08h,%08h) to %s",
+                    sig_begin_addr, sig_end_addr, sig_out_path);
+            end
+        end
+    end
+
 endmodule : top
 
 /*----------------------------------------------------------------------------
