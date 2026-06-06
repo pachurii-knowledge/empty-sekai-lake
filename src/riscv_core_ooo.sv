@@ -256,6 +256,8 @@ module riscv_core_ooo (
     logic [31:0] mem_data_store;
     logic [3:0] mem_data_store_mask;
     logic [29:0] lsq_data_load_addr;
+    logic lsq_store_second_beat;
+    logic lsq_store_port_busy;
     logic commit_store;
     active_id_t commit_store_id;
 
@@ -861,6 +863,7 @@ module riscv_core_ooo (
         .xlate_stall(lsq_xlate_stall),
         .xlate_fault(lsq_xlate_fault),
         .xlate_cause(lsq_xlate_cause),
+        .xlate_pa(data_pa),
         .mem_req_valid(mem_req_valid),
         .mem_req_vaddr(mem_req_vaddr),
         .mem_req_store(mem_req_store),
@@ -869,6 +872,8 @@ module riscv_core_ooo (
         .data_addr(mem_data_addr),
         .data_store(mem_data_store),
         .data_store_mask(mem_data_store_mask),
+        .store_second_beat(lsq_store_second_beat),
+        .store_port_busy(lsq_store_port_busy),
         .load_writeback
     );
 
@@ -920,7 +925,7 @@ module riscv_core_ooo (
     ooo_commit_unit CommitUnit (
         .commit_valid(active_commit_valid),
         .commit_packet(active_commit_packet),
-        .store_port_busy(1'b0),
+        .store_port_busy(lsq_store_port_busy),
         .retire_valid,
         .free_valid(commit_free_valid),
         .free_prd(commit_free_prd),
@@ -1422,7 +1427,11 @@ module riscv_core_ooo (
         data_load_en = mem_data_load_en;
         // Apply Sv32 translation at the memory port: the LSQ works in virtual
         // addresses; the physical word address is computed by the MMU above.
-        data_addr = paging_data ? data_pa[31:2] : mem_data_addr;
+        // The second beat of a split store is the exception: the LSQ already
+        // drives the captured physical word address, so bypass the (stale,
+        // head-VA based) translation mux.
+        data_addr = (paging_data && !lsq_store_second_beat) ? data_pa[31:2]
+                                                            : mem_data_addr;
         data_store = mem_data_store;
         data_store_mask = mem_data_store_mask;
 
