@@ -56,6 +56,8 @@ module plic #(
     localparam int NCTX = 2;
     localparam logic [29:0] PRIO_BASE  = 30'((BASE + 32'h0000_0000) >> 2);
     localparam logic [29:0] PENDING_W  = 30'((BASE + 32'h0000_1000) >> 2);
+    // Non-standard test/IPI helper: write-1-to-clear the software-pending word.
+    localparam logic [29:0] PENDING_CLR_W = 30'((BASE + 32'h0000_1004) >> 2);
     localparam logic [29:0] ENABLE0_W  = 30'((BASE + 32'h0000_2000) >> 2);
     localparam logic [29:0] ENABLE1_W  = 30'((BASE + 32'h0000_2080) >> 2);
     localparam logic [29:0] THRESH0_W  = 30'((BASE + 32'h0020_0000) >> 2);
@@ -173,6 +175,10 @@ module plic #(
                         PENDING_W: begin
                             for (int s = 1; s <= NSOURCES; s += 1)
                                 if (store_wdata[s]) sw_pend_q[s] <= 1'b1;
+                        end
+                        PENDING_CLR_W: begin
+                            for (int s = 1; s <= NSOURCES; s += 1)
+                                if (store_wdata[s]) sw_pend_q[s] <= 1'b0;
                         end
                         ENABLE0_W: enable_q[0] <= store_wdata;
                         ENABLE1_W: enable_q[1] <= store_wdata;
