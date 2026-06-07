@@ -61,10 +61,10 @@ OoO core (`src/riscv_core_ooo.sv` is the top of the datapath):
 - **Issue/execute:** `int_issue_queue.sv` → `ooo_alu_pipe.sv` (×2, ALU/branch/CSR), `ooo_mul_unit.sv`, `ooo_div_unit.sv`, `niigo_fp_unit.sv` (CVFPU wrapper), `load_store_queue.sv`. Results arbitrate on `ooo_writeback_bus.sv`.
 - **Commit:** `ooo_commit_unit.sv` retires in order, frees physregs, commits stores, and takes precise traps/interrupts/`mret`/`sret`/`sfence.vma` with a full-pipeline flush + frontend redirect.
 
-Privileged/MMU (shared with the scalar prototype core): `priv_csr_file.sv` (M/S/U CSRs), `trap_controller.sv` (combinational trap decision + delegation), `ptw.sv` (Sv32 walker, A/D updates), `mmu_tlb.sv` (16-entry ITLB/DTLB), `clint.sv` (mtime/mtimecmp/msip), `pmp_checker.sv` (wired into the scalar core only — not yet in the OoO data/fetch paths). Loads/stores translate at the LSQ memory port; fetch translates through the ITLB.
+Privileged/MMU (shared with the scalar prototype core): `priv_csr_file.sv` (M/S/U CSRs), `trap_controller.sv` (combinational trap decision + delegation), `ptw.sv` (Sv32 walker, A/D updates), `mmu_tlb.sv` (16-entry ITLB/DTLB), `clint.sv` (mtime/mtimecmp/msip), `plic.sv` (M/S-external interrupt controller, base `0x0C00_0000`, drives `mip.MEIP`/`SEIP`), `pmp_checker.sv` (instantiated on both the scalar core and the OoO fetch+data paths — `DataPMP`/`FetchPMP` in `riscv_core_ooo.sv`). Loads/stores translate at the LSQ memory port; fetch translates through the ITLB.
 
 Floating point: `niigo_fp_unit.sv` wraps the vendored CVFPU/FPnew under `src/cvfpu/` (RV32D config) with small request/result buffers; `src/common_cells/` holds the minimal vendor support cells. CVFPU sources are listed explicitly in `src/verilator.mk` (not glob-collected).
 
 ## Layout
 
-`src/` RTL + testbench support + vendored CVFPU · `scripts/` ACT build/run + memory-image tooling · `tests/` local `.S` tests · `references/` reference RTL/PDFs + generated ACT artifacts (gitignored) · `output/` build & sim artifacts (gitignored) · `447ref/`, `plans/`, `.cursor/` gitignored.
+`src/` RTL + testbench support + vendored CVFPU · `scripts/` ACT build/run + memory-image tooling · `tests/` local `.S` tests · `act-config/` version-controlled niigo ACT DUT config (synced into the checkout via `scripts/sync_act_config.sh`) · `references/` reference RTL/PDFs + generated ACT artifacts (gitignored; its `riscv-tests` is a nested git repo) · `output/` build & sim artifacts (gitignored) · `447ref/`, `plans/`, `.cursor/` gitignored.
