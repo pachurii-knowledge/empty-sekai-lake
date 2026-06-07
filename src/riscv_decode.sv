@@ -120,9 +120,11 @@ module riscv_decode
                 is_sret: 1'b0,
                 is_wfi: 1'b0,
                 is_sfence_vma: 1'b0,
-                illegal_instr: 1'b0
+                illegal_instr: 1'b0,
+                fetch_fault: 1'b0,
+                fetch_fault_cause: 5'd0
             };
-            
+
             if(~rst_l) begin
                 ctrl_signals = '{
                     useImm: 1'b0,
@@ -160,7 +162,9 @@ module riscv_decode
                     is_sret: 1'b0,
                     is_wfi: 1'b0,
                     is_sfence_vma: 1'b0,
-                    illegal_instr: 1'b0
+                    illegal_instr: 1'b0,
+                    fetch_fault: 1'b0,
+                    fetch_fault_cause: 5'd0
                 };
             end
         

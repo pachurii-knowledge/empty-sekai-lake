@@ -30,6 +30,8 @@ module ptw
     input  priv_mode_t  req_priv,       // effective privilege of the access
     input  logic        mstatus_sum,
     input  logic        mstatus_mxr,
+    input  logic        adue,           // menvcfg.ADUE: 1=HW A/D update (Svadu),
+                                        // 0=fault when an A/D update is needed (Svade)
 
     // Memory port (byte addressed)
     output logic        mem_req,
@@ -157,7 +159,11 @@ module ptw
             S_L1_WAIT: begin
                 // pte_q now holds the level-1 PTE
                 if (!v_bit || (!r_bit && w_bit)) state_n = S_DONE;       // invalid
-                else if (leaf)                   state_n = need_ad ? S_AD_REQ : S_DONE;
+                // Take the A/D-update path only for a permitted leaf when ADUE
+                // enables hardware update; otherwise complete (and fault below
+                // either on the permission violation or the Svade A/D fault).
+                else if (leaf)                   state_n =
+                    (need_ad && adue && !perm_fault(1'b1)) ? S_AD_REQ : S_DONE;
                 else                             state_n = S_L0_REQ;     // pointer
             end
             S_L0_REQ: begin
@@ -167,7 +173,8 @@ module ptw
             end
             S_L0_WAIT: begin
                 if (!v_bit || (!r_bit && w_bit) || !leaf) state_n = S_DONE;
-                else                                      state_n = need_ad ? S_AD_REQ : S_DONE;
+                else                                      state_n =
+                    (need_ad && adue && !perm_fault(1'b0)) ? S_AD_REQ : S_DONE;
             end
             S_AD_REQ: begin
                 mem_req   = 1'b1;
@@ -199,18 +206,31 @@ module ptw
         end
     end
 
+    // Svade A/D fault: a permitted leaf that needs an A/D update but ADUE is
+    // off raises a page fault instead of a hardware update.
+    logic ad_fault;
+    assign ad_fault = need_ad && !adue;
+
     // Fault computation at the completing level
     logic l1_fault, l0_fault;
     assign l1_fault = (!v_bit || (!r_bit && w_bit)) ||
-                      (leaf && perm_fault(1'b1));
+                      (leaf && perm_fault(1'b1)) ||
+                      (leaf && ad_fault);
     assign l0_fault = (!v_bit || (!r_bit && w_bit) || !leaf) ||
-                      perm_fault(1'b0);
+                      perm_fault(1'b0) ||
+                      ad_fault;
 
     assign busy      = (state_q != S_IDLE);
     assign done      = (state_q == S_DONE);
     assign superpage = super_q;
     assign ppn       = pte_ppn;
-    assign perm      = pte_q[7:0];
+    // Reflect the A/D bits the hardware update set (Svadu) in the reported perm,
+    // so the TLB is filled with the post-update PTE. Otherwise a store would see
+    // a stale D=0 in the DTLB after its A/D walk, fail dtlb_usable on the commit
+    // cycle, and miss its one-shot store-commit window (orphaning the access).
+    assign perm      = pte_q[7:0] |
+        ((need_ad && adue) ? ((8'b1 << RISCV_Priv::PTE_A) |
+            ((acc_q == ACC_STORE) ? (8'b1 << RISCV_Priv::PTE_D) : 8'b0)) : 8'b0);
 
     // fault asserted with done: recompute based on which level produced it.
     // (When done is reached from S_L1_WAIT path super_q is set.)

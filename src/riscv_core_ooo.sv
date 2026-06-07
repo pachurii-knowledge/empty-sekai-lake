@@ -37,6 +37,12 @@ module riscv_core_ooo (
     logic [31:0] fetch_pa;   // translated fetch address (driven in MMU section)
     logic [1:0][31:0] fetch_pc_pipe_q, fetch_pc_pipe_next;
     logic [1:0] fetch_valid_pipe_q, fetch_valid_pipe_next;
+    // Fetch fault piped alongside fetch_pc/fetch_valid so it reaches decode
+    // aligned with the PC it belongs to (computed in the MMU section).
+    logic        fetch_fault;            // combinational fault for pc_q this cycle
+    logic [4:0]  fetch_fault_cause;
+    logic [1:0]  fetch_fault_pipe_q, fetch_fault_pipe_next;
+    logic [1:0][4:0] fetch_fault_cause_pipe_q, fetch_fault_cause_pipe_next;
     logic halted_q, halted_next;
     logic terminal_pending_q, terminal_pending_next;
     logic control_pending_q, control_pending_next;
@@ -189,6 +195,7 @@ module riscv_core_ooo (
     logic [31:0] csr_mtvec, csr_stvec, csr_mepc, csr_sepc, csr_satp;
     logic [31:0] csr_pmpcfg_arr [4];
     logic [31:0] csr_pmpaddr_arr [16];
+    logic        csr_menvcfg_adue;
     logic [63:0] clint_mtime;
     logic        irq_mtimer, irq_msoft;
     logic        clint_load_hit;
@@ -219,6 +226,10 @@ module riscv_core_ooo (
     logic        irq_drain_q, irq_drain_next;
     logic        commit_take_int;
     logic [31:0] commit_int_epc;
+    // WFI: while wfi_wait_q the core idles (dispatch suppressed) until an
+    // enabled interrupt is pending (wfi_wake), ignoring the global enable.
+    logic        wfi_wait_q, wfi_wait_next, wfi_wait_set, wfi_wake;
+    assign wfi_wake = (csr_mip & csr_mie) != 32'b0;
 
     fp_reg_data_t fp_regs_q [FP_REGS];
     fp_reg_data_t fp_regs_next [FP_REGS];
@@ -313,6 +324,8 @@ module riscv_core_ooo (
         .rst_l,
         .fetch_valid(fetch_valid_pipe_q[1] && !halted_q),
         .instr_mem_excpt,
+        .fetch_fault(fetch_fault_pipe_q[1] && fetch_valid_pipe_q[1]),
+        .fetch_fault_cause(fetch_fault_cause_pipe_q[1]),
         .fetch_pc(fetch_pc_pipe_q[1]),
         .instr,
         .decode_lanes
@@ -408,7 +421,8 @@ module riscv_core_ooo (
         .sepc(csr_sepc),
         .satp(csr_satp),
         .pmpcfg_o(csr_pmpcfg_arr),
-        .pmpaddr_o(csr_pmpaddr_arr)
+        .pmpaddr_o(csr_pmpaddr_arr),
+        .menvcfg_adue(csr_menvcfg_adue)
     );
 
     // Trap aggregation/delegation for the instruction being committed.
@@ -438,7 +452,9 @@ module riscv_core_ooo (
         .store_waddr(data_addr),
         .store_wdata(data_store),
         .store_mask(data_store_mask),
-        .load_addr(mem_data_addr),
+        // Look up against the returned-load address so a CLINT hit lines up with
+        // the load result the LSQ consumes (loads complete with latency).
+        .load_addr(data_load_addr),
         .load_hit(clint_load_hit),
         .load_data(clint_load_data),
         .irq_m_timer(irq_mtimer),
@@ -548,6 +564,7 @@ module riscv_core_ooo (
         .req_priv(ptw_priv),
         .mstatus_sum(mstatus_sum),
         .mstatus_mxr(mstatus_mxr),
+        .adue(csr_menvcfg_adue),
         .mem_req(),
         .mem_we(ptw_we),
         .mem_addr(ptw_mem_addr),
@@ -608,11 +625,32 @@ module riscv_core_ooo (
         (dtlb_usable && perm_bad(dtlb_perm, data_acc, priv_data,
             mstatus_sum, mstatus_mxr)) ||
         (data_need_walk && ptw_done && ptw_fault);
-    assign lsq_xlate_fault = paging_data && mem_req_valid && data_perm_fault;
+    // PMP on the resolved data physical address (checked in any mode, on the
+    // post-translation PA). Only meaningful once the PA is resolved -- during a
+    // walk data_pa is the (stale) VA fallback, so gate the PMP fault on a
+    // resolved PA. A translation page fault takes priority over a PMP fault.
+    logic        data_pa_resolved, pmp_data_fault;
+    assign data_pa_resolved = !paging_data || dtlb_usable || data_from_ptw;
+    pmp_checker DataPMP (
+        .paddr(data_pa),
+        .access(data_acc),
+        .priv(priv_data),
+        .pmpcfg(csr_pmpcfg_arr),
+        .pmpaddr(csr_pmpaddr_arr),
+        .fault(pmp_data_fault)
+    );
+    assign lsq_xlate_fault = mem_req_valid &&
+        ((paging_data && data_perm_fault) ||
+         (data_pa_resolved && pmp_data_fault));
     assign lsq_xlate_stall = paging_data && mem_req_valid &&
         !dtlb_usable && !data_from_ptw && !data_perm_fault;
-    assign lsq_xlate_cause = mem_req_store ? RISCV_Priv::EXC_STORE_PAGE_FAULT
-                                           : RISCV_Priv::EXC_LOAD_PAGE_FAULT;
+    // Page fault (translation) reported ahead of a PMP access fault.
+    assign lsq_xlate_cause =
+        (paging_data && data_perm_fault) ?
+            (mem_req_store ? RISCV_Priv::EXC_STORE_PAGE_FAULT
+                           : RISCV_Priv::EXC_LOAD_PAGE_FAULT) :
+            (mem_req_store ? RISCV_Priv::EXC_STORE_ACCESS
+                           : RISCV_Priv::EXC_LOAD_ACCESS);
     assign lsq_data_load_addr = paging_data ? mem_req_vaddr[31:2] : data_load_addr;
 
     // --- Resolve the fetch physical address + stall during a fetch walk ---
@@ -628,6 +666,33 @@ module riscv_core_ooo (
     end
     // Freeze the frontend while the walker resolves the fetch translation.
     assign fetch_xlate_stall = fetch_need_walk && !ptw_fetch_done;
+
+    // Instruction-fetch page fault: an ITLB hit lacking execute permission for
+    // the current privilege, or a fetch page-table walk that faulted. Reported
+    // precisely at commit on the faulting PC (see ooo_fetch_decode / alu_pipe);
+    // mtval = faulting VA.
+    logic fetch_perm_fault;
+    assign fetch_perm_fault =
+        (itlb_hit && perm_bad(itlb_perm, 2'd0, cur_priv,
+            mstatus_sum, mstatus_mxr)) ||
+        (fetch_need_walk && !ptw_for_data && ptw_done && ptw_fault);
+
+    // PMP on the resolved fetch PA (any mode). Gated on a resolved PA so the
+    // (stale VA) fallback during a walk is not checked; page fault wins over PMP.
+    logic fetch_pa_resolved, pmp_fetch_fault;
+    assign fetch_pa_resolved = !paging_fetch || itlb_hit || fetch_from_ptw;
+    pmp_checker FetchPMP (
+        .paddr(fetch_pa),
+        .access(2'd0),
+        .priv(cur_priv),
+        .pmpcfg(csr_pmpcfg_arr),
+        .pmpaddr(csr_pmpaddr_arr),
+        .fault(pmp_fetch_fault)
+    );
+    assign fetch_fault = (paging_fetch && fetch_perm_fault) ||
+                         (fetch_pa_resolved && pmp_fetch_fault);
+    assign fetch_fault_cause = (paging_fetch && fetch_perm_fault) ?
+        RISCV_Priv::EXC_INSTR_PAGE_FAULT : RISCV_Priv::EXC_INSTR_ACCESS;
 
     branch_stack BranchStack (
         .clk,
@@ -702,7 +767,7 @@ module riscv_core_ooo (
         .free_list_available(free_count_snapshot),
         .suppress_dispatch(redirect_valid || terminal_pending_q ||
             control_pending_q || serial_pending_q || halted_q || irq_drain_q ||
-            commit_take_trap),
+            wfi_wait_q || commit_take_trap),
         .dispatch_valid,
         .dispatch_stall
     );
@@ -853,7 +918,9 @@ module riscv_core_ooo (
         .abort_mask,
         .flush(trap_take),
         .data_load_valid,
-        .data_load(data_load[0]),
+        // A load that hits the memory-mapped CLINT returns the CLINT register
+        // value instead of the (out-of-window) DRAM result.
+        .data_load(clint_load_hit ? clint_load_data : data_load[0]),
         // Under paging the queue matches loads on the (virtual) head address; the
         // physical address is applied only at the memory port below.
         .data_load_addr(lsq_data_load_addr),
@@ -1016,6 +1083,7 @@ module riscv_core_ooo (
         commit_int_epc = 32'd0;
         tlb_flush = 1'b0;
         irq_drain_next = irq_drain_q;
+        wfi_wait_set = 1'b0;
         ras_count_next = branch_restore_valid ?
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
         ras_checkpoint_count_next = ras_checkpoint_count_q;
@@ -1311,6 +1379,23 @@ module riscv_core_ooo (
                         // report zero or a faulting data address).
                         commit_exc_tval  = active_commit_packet[i].pc;
                     end
+                    32'h1050_0073: begin                       // WFI
+                        // mstatus.TW=1 makes WFI illegal in any less-privileged
+                        // mode (S or U); with TW=0 it is legal and simply waits.
+                        // M-mode may always WFI.
+                        if ((cur_priv != RISCV_Priv::PRIV_M) &&
+                            csr_mstatus[RISCV_Priv::MSTATUS_TW_BIT]) begin
+                            commit_exc_valid = 1'b1;
+                            commit_exc_cause = RISCV_Priv::EXC_ILLEGAL_INSTR;
+                            commit_exc_tval  = active_commit_packet[i].instr;
+                            commit_trap_epc  = active_commit_packet[i].pc;
+                        end else if (!wfi_wake) begin
+                            // Legal WFI, no enabled interrupt pending yet: idle
+                            // the frontend until one arrives. (mret/sret/ecall
+                            // semantics are unaffected; WFI itself retires here.)
+                            wfi_wait_set = 1'b1;
+                        end
+                    end
                     default: begin
                         // SFENCE.VMA is illegal from U-mode, and illegal from
                         // S-mode when mstatus.TVM=1 (Trap Virtual Memory). It is
@@ -1424,6 +1509,14 @@ module riscv_core_ooo (
             irq_drain_next = 1'b0;
         end
 
+        // WFI idle FSM: set when a legal WFI retires with no enabled interrupt
+        // pending; cleared once an enabled interrupt arrives (wfi_wake) or on any
+        // pipeline flush (trap/interrupt/branch redirect). While set, dispatch is
+        // suppressed so the core idles until woken.
+        wfi_wait_next = wfi_wait_q;
+        if (wfi_wait_set) wfi_wait_next = 1'b1;
+        if (wfi_wake || trap_take || halted_q) wfi_wait_next = 1'b0;
+
         data_load_en = mem_data_load_en;
         // Apply Sv32 translation at the memory port: the LSQ works in virtual
         // addresses; the physical word address is computed by the MMU above.
@@ -1438,6 +1531,11 @@ module riscv_core_ooo (
         pc_next = pc_q;
         fetch_pc_pipe_next = fetch_pc_pipe_q;
         fetch_valid_pipe_next = fetch_valid_pipe_q;
+        // The fault pipe shifts only in the sequential-fetch case below; in the
+        // flush cases it holds, but is always masked by fetch_valid_pipe at the
+        // FetchDecode input, so a held-stale fault never pairs with a valid PC.
+        fetch_fault_pipe_next = fetch_fault_pipe_q;
+        fetch_fault_cause_pipe_next = fetch_fault_cause_pipe_q;
         // Synchronous exceptions now redirect to a trap handler instead of
         // halting the core (see commit-time trap detection above). precise_halt
         // (ecall a0=10/11) remains the simulation's clean stop condition.
@@ -1501,6 +1599,12 @@ module riscv_core_ooo (
                 fetch_pc_pipe_next[1] = fetch_pc_pipe_q[0];
                 fetch_valid_pipe_next[0] = rst_l;
                 fetch_valid_pipe_next[1] = fetch_valid_pipe_q[0];
+                // Capture the fetch fault for pc_q alongside it, shifting in
+                // lockstep with the PC/valid pipe so it stays aligned to decode.
+                fetch_fault_pipe_next[0] = fetch_fault;
+                fetch_fault_pipe_next[1] = fetch_fault_pipe_q[0];
+                fetch_fault_cause_pipe_next[0] = fetch_fault_cause;
+                fetch_fault_cause_pipe_next[1] = fetch_fault_cause_pipe_q[0];
             end
         end
 
@@ -1557,6 +1661,18 @@ module riscv_core_ooo (
                     fetch_pc_pipe_next = '0;
                     fetch_valid_pipe_next = '0;
                 end
+                // A satp write switches address space; flush both TLBs and
+                // refetch pc+4 so younger fetches re-translate, without needing a
+                // separate SFENCE.VMA. The CSR write is serializing (nothing
+                // younger is in flight), so a fetch-pipe flush is sufficient.
+                if (active_commit_packet[i].csr_write &&
+                        (active_commit_packet[i].csr_addr == RISCV_Priv::CSR_SATP) &&
+                        !active_commit_packet[i].exception && !commit_take_trap) begin
+                    tlb_flush = 1'b1;
+                    pc_next = active_commit_packet[i].pc + 32'd4;
+                    fetch_pc_pipe_next = '0;
+                    fetch_valid_pipe_next = '0;
+                end
             end
         end
 
@@ -1577,12 +1693,15 @@ module riscv_core_ooo (
             pc_q <= USER_TEXT_START;
             fetch_pc_pipe_q <= '0;
             fetch_valid_pipe_q <= '0;
+            fetch_fault_pipe_q <= '0;
+            fetch_fault_cause_pipe_q <= '0;
             halted_q <= 1'b0;
             terminal_pending_q <= 1'b0;
             control_pending_q <= 1'b0;
             control_pending_id_q <= '0;
             serial_pending_q <= 1'b0;
             irq_drain_q <= 1'b0;
+            wfi_wait_q <= 1'b0;
             abort_mask_q <= '0;
             ras_count_q <= '0;
             for (int i = 0; i < FP_REGS; i += 1) begin
@@ -1608,12 +1727,15 @@ module riscv_core_ooo (
             pc_q <= pc_next;
             fetch_pc_pipe_q <= fetch_pc_pipe_next;
             fetch_valid_pipe_q <= fetch_valid_pipe_next;
+            fetch_fault_pipe_q <= fetch_fault_pipe_next;
+            fetch_fault_cause_pipe_q <= fetch_fault_cause_pipe_next;
             halted_q <= halted_next;
             terminal_pending_q <= terminal_pending_next;
             control_pending_q <= control_pending_next;
             control_pending_id_q <= control_pending_id_next;
             serial_pending_q <= serial_pending_next;
             irq_drain_q <= irq_drain_next;
+            wfi_wait_q <= wfi_wait_next;
             abort_mask_q <= abort_mask;
             ras_count_q <= ras_count_next;
             for (int i = 0; i < RAS_DEPTH; i += 1) begin
@@ -1853,6 +1975,7 @@ module riscv_core_ooo (
             perf_mispredicted_branches);
     end
 `endif /* SIMULATION_18447 */
+
 
 `ifdef AGENT_DEBUG
     integer dbg_cyc = 0;

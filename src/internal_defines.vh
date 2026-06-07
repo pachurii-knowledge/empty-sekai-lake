@@ -198,6 +198,12 @@ typedef struct packed {
     logic is_sfence_vma;    // SFENCE.VMA (TLB shootdown)
     logic illegal_instr;    // Indicates if the current instruction is illegal
     logic isBranch;         // Indicates if the current instruction is a branch
+    // Instruction-fetch fault injected by the core (not derived from the
+    // instruction bits): when set, the lane is a forced NOP that the ALU pipe
+    // converts into a precise instruction page/access fault at commit. The
+    // faulting virtual address (= PC) is reported in m/stval.
+    logic       fetch_fault;
+    logic [4:0] fetch_fault_cause; // EXC_INSTR_PAGE_FAULT or EXC_INSTR_ACCESS
 } ctrl_signals_t;
 
 `endif /* INTERNAL_DEFINES_VH_ */

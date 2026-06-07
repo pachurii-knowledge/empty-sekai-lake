@@ -9,6 +9,8 @@ module ooo_fetch_decode
     input  logic             rst_l,
     input  logic             fetch_valid,
     input  logic             instr_mem_excpt,
+    input  logic             fetch_fault,        // fetch page/access fault
+    input  logic [4:0]       fetch_fault_cause,  // EXC_INSTR_PAGE_FAULT/ACCESS
     input  logic [31:0]      fetch_pc,
     input  logic [3:0][31:0] instr,
     output decode_lane_t     decode_lanes [OOO_WIDTH]
@@ -29,7 +31,10 @@ module ooo_fetch_decode
                 (fetch_valid && !instr_mem_excpt &&
                  (int'(fetch_lane_offset) + lane < OOO_WIDTH)) ?
                 instr[int'(fetch_lane_offset) + lane] : 32'h0000_0013;
-            assign decode_instr[lane] = prefix_unpredicted_control[lane] ?
+            // On a fetch fault every lane decodes as a NOP; the entry lane is
+            // then re-stamped below to carry the fault to the ALU/commit.
+            assign decode_instr[lane] =
+                (fetch_fault || prefix_unpredicted_control[lane]) ?
                 32'h0000_0013 : raw_decode_instr[lane];
 
             riscv_decode DecodeLane (
@@ -66,6 +71,22 @@ module ooo_fetch_decode
             decode_lanes[i].imm = immediate_for(lane_ctrl[i].imm_mode, decode_instr[i]);
             decode_lanes[i].uses_rs1 = uses_rs1(decode_instr[i]);
             decode_lanes[i].uses_rs2 = uses_rs2(decode_instr[i]);
+        end
+
+        // Fetch fault: collapse the block to a single trapping micro-op at the
+        // entry PC (lane 0). It is a NOP (no dest/mem/branch) carrying the fault
+        // so the ALU pipe raises a precise instruction page/access fault at
+        // commit; younger lanes in the faulting block are squashed. Valid even
+        // under instr_mem_excpt, since the discarded instruction bytes do not
+        // matter once the fetch has faulted.
+        if (fetch_fault) begin
+            for (int i = 0; i < OOO_WIDTH; i += 1) begin
+                decode_lanes[i].valid = (i == 0) && fetch_valid;
+                decode_lanes[i].kill  = 1'b0;
+                decode_lanes[i].pc    = fetch_pc;
+                decode_lanes[i].ctrl.fetch_fault       = (i == 0);
+                decode_lanes[i].ctrl.fetch_fault_cause = fetch_fault_cause;
+            end
         end
     end
 

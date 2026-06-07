@@ -375,6 +375,7 @@ module riscv_core_scalar (
     RISCV_Priv::priv_mode_t cur_priv;
     logic [31:0] csr_mstatus, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
     logic [31:0] csr_mtvec, csr_stvec, csr_mepc, csr_sepc, csr_satp;
+    logic        csr_menvcfg_adue;
     logic [31:0] csr_read_data_E;
     logic        csr_read_illegal_E;
     logic [2:0]  csr_frm_E;
@@ -565,7 +566,8 @@ module riscv_core_scalar (
         .sepc(csr_sepc),
         .satp(csr_satp),
         .pmpcfg_o(pmpcfg_arr),
-        .pmpaddr_o(pmpaddr_arr)
+        .pmpaddr_o(pmpaddr_arr),
+        .menvcfg_adue(csr_menvcfg_adue)
     );
 
     clint Clint (
@@ -699,6 +701,7 @@ module riscv_core_scalar (
         .req_priv(ptw_priv),
         .mstatus_sum(mstatus_sum),
         .mstatus_mxr(mstatus_mxr),
+        .adue(csr_menvcfg_adue),
         .mem_req(),
         .mem_we(ptw_we),
         .mem_addr(ptw_mem_addr),

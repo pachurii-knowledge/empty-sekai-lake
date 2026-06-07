@@ -116,6 +116,7 @@ module load_store_queue
     // AMOs read and write; treat as a store so the walker checks W permission.
     assign mem_req_store = entries_q[head_q].entry.ctrl.memWrite;
 
+
     always_comb begin
         entries_next = entries_q;
         count_next = count_q;
@@ -215,10 +216,17 @@ module load_store_queue
         // translation is established (DTLB hit, walk done, no fault) and the
         // registered head matches the entry currently processed (so the DTLB
         // lookup driven from entries_q[head_q] corresponds to this access).
+        // xlate_fault now covers both translation page faults (under paging) and
+        // PMP access faults (any mode, including bare), so the fault path is no
+        // longer gated on paging_data. mem_req_valid (the registered head
+        // address) is now required even in bare mode: it is what the core
+        // translates / PMP-checks, so a memory op must not complete off the
+        // combinational src-ready a cycle before the fault becomes visible. With
+        // paging off and no fault this matches the original (proceed to memory).
         head_match     = (head_next == head_q);
-        head_xlate_ok  = !paging_data ||
-            (head_match && mem_req_valid && !xlate_stall && !xlate_fault);
-        head_xlate_flt = paging_data && head_match && mem_req_valid && xlate_fault;
+        head_xlate_ok  = !xlate_fault && mem_req_valid &&
+            (!paging_data || (head_match && !xlate_stall));
+        head_xlate_flt = head_match && mem_req_valid && xlate_fault;
 
         // Faulting access: retire it with an exception instead of touching memory.
         if (head_xlate_flt && !double_store_pending_q &&

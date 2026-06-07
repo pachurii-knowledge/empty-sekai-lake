@@ -72,6 +72,17 @@ module ooo_alu_pipe
                     actual_target_for(issue_entry, rs1_data, rs2_data);
                 wb_next.redirect_pc = issue_entry.pc + 32'd4;
             end
+
+            // Instruction-fetch page/access fault: the frontend translated this
+            // PC and faulted, replacing the instruction with a forced NOP that
+            // carries the fault. Report it precisely at commit with m/stval set
+            // to the faulting virtual address (the PC). Takes priority over any
+            // value decoded from the (discarded) NOP encoding.
+            if (issue_entry.ctrl.fetch_fault) begin
+                wb_next.exception = 1'b1;
+                wb_next.exc_cause = issue_entry.ctrl.fetch_fault_cause;
+                wb_next.data = issue_entry.pc;
+            end
         end
     end
 

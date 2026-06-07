@@ -78,7 +78,11 @@ module priv_csr_file
 
     // PMP configuration exposed to the PMP checker
     output logic [31:0] pmpcfg_o  [4],
-    output logic [31:0] pmpaddr_o [16]
+    output logic [31:0] pmpaddr_o [16],
+
+    // menvcfg.ADUE: when set, the PTW performs hardware A/D updates (Svadu);
+    // when clear, a page needing an A/D update faults instead (Svade).
+    output logic        menvcfg_adue
 );
 
     /*------------------------------------------------------------------------
@@ -119,7 +123,10 @@ module priv_csr_file
     logic [31:0] mideleg_seip_q;        // unused placeholder (kept 0)
     logic [31:0] satp_q;
     logic [31:0] mcounteren_q, scounteren_q;
+    logic [31:0] mcountinhibit_q;       // CY (bit0) / IR (bit2) implemented
+    localparam logic [31:0] MCNTINHIBIT_MASK = 32'h0000_0005;
     logic [31:0] menvcfg_q;
+    logic        menvcfg_adue_q;        // menvcfg.ADUE (bit 61 -> menvcfgh[29])
     logic        senvcfg_fiom_q;        // senvcfg.FIOM (bit 0); other fields 0
     // Software-writable interrupt-pending bits (S-mode bits)
     logic        ssip_q, stip_q, seip_sw_q;
@@ -197,6 +204,7 @@ module priv_csr_file
     assign mepc    = mepc_q;
     assign sepc    = sepc_q;
     assign satp    = satp_q;
+    assign menvcfg_adue = menvcfg_adue_q;
 
     /*------------------------------------------------------------------------
      * CSR read (combinational) with privilege + existence checks
@@ -264,11 +272,10 @@ module priv_csr_file
             CSR_MTVEC:     data = mtvec_q;
             CSR_MCOUNTEREN:data = mcounteren_q;
             CSR_MENVCFG:   data = menvcfg_q;
-            // menvcfgh holds the upper 32 bits of menvcfg on RV32. niigo supports
-            // none of those features (STCE/PBMTE/ADUE/...), so it reads as zero and
-            // ignores writes (WARL). It must still decode (not trap) once U-mode
-            // exists, otherwise the arch-test boot code faults setting it up.
-            CSR_MENVCFGH:  data = 32'b0;
+            // menvcfgh holds the upper 32 bits of menvcfg on RV32. Only ADUE
+            // (bit 61 -> menvcfgh[29]) is implemented (Svadu HW A/D update);
+            // STCE/PBMTE and the rest read as zero and ignore writes (WARL).
+            CSR_MENVCFGH:  data = {2'b0, menvcfg_adue_q, 29'b0};
 
             // Machine trap handling
             CSR_MSCRATCH:  data = mscratch_q;
@@ -293,7 +300,7 @@ module priv_csr_file
                 // read-zero / ignore-write so the arch-test boot code that zeroes
                 // them does not take a spurious illegal-instruction trap.
                 end else if (addr == CSR_MCOUNTINHIBIT) begin
-                    data = 32'b0;
+                    data = mcountinhibit_q;
                 end else if ((addr >= CSR_MHPMEVENT3)   && (addr <= CSR_MHPMEVENT31))  begin
                     data = 32'b0;                       // mhpmevent3-31   (0x323-0x33F)
                 end else if ((addr >= CSR_MHPMEVENT3H)  && (addr <= CSR_MHPMEVENT31H)) begin
@@ -312,6 +319,16 @@ module priv_csr_file
                 end
             end
         endcase
+        // Counter access control: the unprivileged cycle/time/instret aliases
+        // (0xC00-0xC02 and the *h 0xC80-0xC82) require the matching mcounteren
+        // bit to be read from S/U, and additionally the scounteren bit from U.
+        // The M-mode mcycle/minstret (0xB0x) aliases are never gated.
+        if ((addr[11:8] == 4'hC) && (addr[6:2] == 5'b0) && (addr[1:0] != 2'b11)
+                && (priv_q != PRIV_M)) begin
+            if (!mcounteren_q[addr[1:0]]) illegal = 1'b1;
+            else if ((priv_q == PRIV_U) && !scounteren_q[addr[1:0]])
+                illegal = 1'b1;
+        end
         if (!priv_ok) illegal = 1'b1;
     endtask
 
@@ -350,7 +367,9 @@ module priv_csr_file
             satp_q      <= 32'b0;
             mcounteren_q<= 32'b0;
             scounteren_q<= 32'b0;
+            mcountinhibit_q <= 32'b0;
             menvcfg_q   <= 32'b0;
+            menvcfg_adue_q <= 1'b0;
             senvcfg_fiom_q <= 1'b0;
             ssip_q      <= 1'b0;
             stip_q      <= 1'b0;
@@ -362,9 +381,10 @@ module priv_csr_file
             for (int i = 0; i < 4; i += 1)  pmpcfg_q[i]  <= 32'b0;
             for (int i = 0; i < 16; i += 1) pmpaddr_q[i] <= 32'b0;
         end else begin
-            // Free-running counters
-            mcycle_q <= mcycle_q + 64'd1;
-            if (retire) minstret_q <= minstret_q + 64'd1;
+            // Free-running counters, gated by mcountinhibit (CY bit0 / IR bit2).
+            if (!mcountinhibit_q[0]) mcycle_q <= mcycle_q + 64'd1;
+            if (retire && !mcountinhibit_q[2])
+                minstret_q <= minstret_q + 64'd1;
 
             // Accumulate FP flags every cycle.
             if (fp_fflags_valid) fflags_q <= fflags_q | fp_fflags;
@@ -481,7 +501,9 @@ module priv_csr_file
             CSR_MIE:     mie_q <= wdata & M_INT_MASK;
             CSR_MTVEC:   mtvec_q <= {wdata[31:2], 1'b0, wdata[0]};
             CSR_MCOUNTEREN: mcounteren_q <= wdata & COUNTEREN_MASK;
+            CSR_MCOUNTINHIBIT: mcountinhibit_q <= wdata & MCNTINHIBIT_MASK;
             CSR_MENVCFG: menvcfg_q <= wdata;
+            CSR_MENVCFGH: menvcfg_adue_q <= wdata[29];   // WARL: only ADUE
             CSR_MSCRATCH: mscratch_q <= wdata;
             CSR_MEPC:    mepc_q <= {wdata[31:2], 2'b0};
             CSR_MCAUSE:  mcause_q <= wdata;
@@ -494,17 +516,56 @@ module priv_csr_file
                 stip_q    <= wdata[STI_BIT];
                 seip_sw_q <= wdata[SEI_BIT];
             end
-            CSR_PMPCFG0: pmpcfg_q[0] <= wdata;
-            CSR_PMPCFG1: pmpcfg_q[1] <= wdata;
-            CSR_PMPCFG2: pmpcfg_q[2] <= wdata;
-            CSR_PMPCFG3: pmpcfg_q[3] <= wdata;
+            // PMP config writes honour per-byte lock (L) and WARL masking.
+            CSR_PMPCFG0: pmpcfg_q[0] <= pmp_cfg_word_wr(pmpcfg_q[0], wdata);
+            CSR_PMPCFG1: pmpcfg_q[1] <= pmp_cfg_word_wr(pmpcfg_q[1], wdata);
+            CSR_PMPCFG2: pmpcfg_q[2] <= pmp_cfg_word_wr(pmpcfg_q[2], wdata);
+            CSR_PMPCFG3: pmpcfg_q[3] <= pmp_cfg_word_wr(pmpcfg_q[3], wdata);
             default: begin
                 if ((addr >= CSR_PMPADDR0) && (addr <= CSR_PMPADDR0 + 12'd15)) begin
-                    pmpaddr_q[addr - CSR_PMPADDR0] <= wdata;
+                    // A locked entry (or the base of a locked TOR entry above)
+                    // ignores pmpaddr writes.
+                    if (!pmp_addr_locked(addr - CSR_PMPADDR0))
+                        pmpaddr_q[addr - CSR_PMPADDR0] <= wdata;
                 end
             end
         endcase
     endtask
+
+    // One PMP cfg byte: locked bytes are immutable; otherwise mask the WARL
+    // reserved bits [6:5] and the reserved R=0,W=1 combination (force W=0).
+    function automatic logic [7:0] pmp_cfg_byte_wr(input logic [7:0] cur,
+            input logic [7:0] nw);
+        logic [7:0] r;
+        if (cur[7]) begin
+            r = cur;                 // locked
+        end else begin
+            r = nw;
+            r[6:5] = 2'b00;          // reserved
+            if (!r[0]) r[1] = 1'b0;  // R=0 => W=0
+        end
+        pmp_cfg_byte_wr = r;
+    endfunction
+
+    function automatic logic [31:0] pmp_cfg_word_wr(input logic [31:0] cur,
+            input logic [31:0] nw);
+        logic [31:0] r;
+        for (int b = 0; b < 4; b += 1)
+            r[b*8 +: 8] = pmp_cfg_byte_wr(cur[b*8 +: 8], nw[b*8 +: 8]);
+        pmp_cfg_word_wr = r;
+    endfunction
+
+    // pmpaddr[i] is locked if its own cfg byte is locked, or if the next entry
+    // is a locked TOR (which uses pmpaddr[i] as its lower bound).
+    function automatic logic pmp_addr_locked(input logic [3:0] i);
+        logic [7:0] c_i, c_n;
+        c_i = pmpcfg_q[i[3:2]][i[1:0]*8 +: 8];
+        pmp_addr_locked = c_i[7];
+        if (i != 4'd15) begin
+            c_n = pmpcfg_q[(i+4'd1) >> 2][((i+4'd1) & 4'd3)*8 +: 8];
+            if (c_n[7] && (c_n[4:3] == 2'd1)) pmp_addr_locked = 1'b1;
+        end
+    endfunction
 
     function automatic logic [1:0] legal_mpp(input logic [1:0] v);
         // Only U(00), S(01), M(11) are legal MPP encodings.
