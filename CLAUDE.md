@@ -50,6 +50,7 @@ After any RTL change, the baseline to keep green is **RV32G 247/247 plus the pri
 
 - **Never edit `DO NOT MODIFY THIS FILE!` files.** These are CMU 18-447 lab infrastructure: `main_memory.sv`, `sram_simulation.sv`, `cache.sv`, `cache_new.sv`, `testbench.sv`, `register_file.sv`, and the `.vh` headers `memory_segments.vh`, `riscv_isa.vh`, `riscv_abi.vh`, `riscv_uarch.vh`, `riscv_register_names.vh`. To change one, copy it into `src/` under a new module name and instantiate that instead.
 - **`main_memory` is word-addressed and writes one 32-bit word at a time.** This is why misaligned/cross-word accesses are split into word-granular beats inside the LSQ rather than at the memory model — see the misaligned load/store handling in `src/load_store_queue.sv`. Do not work around this by changing the memory model.
+- **Editing the niigo ACT DUT config:** always edit the live copy in the checkout — `references/riscv-tests/config/cores/niigo-lake/niigo-rv32g/` — since that is what `build_riscv_tests.py` reads (so no sync is needed to build/test). It lives in a gitignored, nested git repo and can't be committed from here. Before committing, run `scripts/sync_act_config.sh` to copy the edits back into the version-controlled `act-config/`, and commit that. (`scripts/sync_act_config.sh --to-checkout` restores the tracked config into a fresh checkout.) Do not hand-edit `act-config/` directly.
 
 ## Architecture map
 

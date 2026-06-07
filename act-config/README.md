@@ -8,14 +8,20 @@ macros, memory layout).
 `references/riscv-tests/` is an external checkout that is **gitignored** (and is
 its own git repo, so its files can't be tracked from this repo). The ACT build
 reads its config from
-`references/riscv-tests/config/cores/niigo-lake/niigo-rv32g/`, so this directory
-is the tracked copy and must be **synced into the checkout** before building:
+`references/riscv-tests/config/cores/niigo-lake/niigo-rv32g/`, so that checkout
+copy is the live one and this directory is the version-controlled mirror.
+
+**Workflow:** edit the config **in the checkout** (no sync needed to build/test),
+then before committing copy the edits back here:
 
 ```sh
-scripts/sync_act_config.sh        # copies act-config/ -> references/.../niigo-lake/
+scripts/sync_act_config.sh              # checkout -> act-config (run before committing)
+scripts/sync_act_config.sh --to-checkout  # act-config -> checkout (restore a fresh checkout)
 ```
 
-After editing config here (or in the checkout), re-sync so both stay consistent.
+Do not hand-edit `act-config/` directly — edits there are overwritten by the next
+`sync_act_config.sh`. Use `--to-checkout` to seed/restore the config after a fresh
+`references/` checkout.
 
 ## Files (`niigo-lake/niigo-rv32g/`)
 
