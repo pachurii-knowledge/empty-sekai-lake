@@ -537,6 +537,8 @@ module riscv_core_ooo (
     logic [21:0] ptw_ppn;
     logic [7:0]  ptw_perm;
     logic [19:0] ptw_vpn;
+    logic [19:0] ptw_walk_vpn;     // VPN the in-flight walk was launched for
+    logic        ptw_walk_is_data; // that walk is a data (vs fetch) access
     logic [1:0]  ptw_access;
     RISCV_Priv::priv_mode_t ptw_priv;
     logic [31:0] ptw_mem_addr;
@@ -576,7 +578,9 @@ module riscv_core_ooo (
         .fault(ptw_fault),
         .ppn(ptw_ppn),
         .perm(ptw_perm),
-        .superpage(ptw_super)
+        .superpage(ptw_super),
+        .walk_vpn(ptw_walk_vpn),
+        .walk_is_data(ptw_walk_is_data)
     );
     assign ptw_addr = ptw_mem_addr[31:2];
 
@@ -587,8 +591,10 @@ module riscv_core_ooo (
         .lookup_asid(satp_asid),
         .hit(itlb_hit), .hit_ppn(itlb_ppn), .hit_perm(itlb_perm),
         .hit_superpage(itlb_super),
-        .fill_en(ptw_done && !ptw_fault && !ptw_for_data),
-        .fill_vpn(pc_q[31:12]),
+        // Fill against the VPN the PTW actually walked, gated by the walk's
+        // latched class -- not the live fetch/data head, which may have moved.
+        .fill_en(ptw_done && !ptw_fault && !ptw_walk_is_data),
+        .fill_vpn(ptw_walk_vpn),
         .fill_asid(satp_asid),
         .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_superpage(ptw_super),
         .flush_en(tlb_flush)
@@ -601,8 +607,8 @@ module riscv_core_ooo (
         .lookup_asid(satp_asid),
         .hit(dtlb_hit), .hit_ppn(dtlb_ppn), .hit_perm(dtlb_perm),
         .hit_superpage(dtlb_super),
-        .fill_en(ptw_done && !ptw_fault && ptw_for_data),
-        .fill_vpn(mem_req_vaddr[31:12]),
+        .fill_en(ptw_done && !ptw_fault && ptw_walk_is_data),
+        .fill_vpn(ptw_walk_vpn),
         .fill_asid(satp_asid),
         .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_superpage(ptw_super),
         .flush_en(tlb_flush)

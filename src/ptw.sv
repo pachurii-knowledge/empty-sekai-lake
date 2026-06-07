@@ -47,7 +47,14 @@ module ptw
     output logic        fault,
     output logic [21:0] ppn,
     output logic [7:0]  perm,
-    output logic        superpage
+    output logic        superpage,
+    // The VPN and access class this walk was launched for, latched at request
+    // time. A TLB must be filled against these (not the integrating core's live
+    // head address), since in an out-of-order core the requesting access may
+    // have advanced by the time the walk completes -- using the live address
+    // would tag the fill with the wrong VPN.
+    output logic [19:0] walk_vpn,
+    output logic        walk_is_data
 );
 
     localparam logic [1:0] ACC_FETCH = 2'd0;
@@ -224,6 +231,8 @@ module ptw
     assign done      = (state_q == S_DONE);
     assign superpage = super_q;
     assign ppn       = pte_ppn;
+    assign walk_vpn     = vpn_q;
+    assign walk_is_data = (acc_q != ACC_FETCH);
     // Reflect the A/D bits the hardware update set (Svadu) in the reported perm,
     // so the TLB is filled with the post-update PTE. Otherwise a store would see
     // a stale D=0 in the DTLB after its A/D walk, fail dtlb_usable on the commit
