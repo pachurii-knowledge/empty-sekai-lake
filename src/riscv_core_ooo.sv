@@ -200,6 +200,9 @@ module riscv_core_ooo (
     logic        irq_mtimer, irq_msoft;
     logic        clint_load_hit;
     logic [31:0] clint_load_data;
+    logic        plic_load_hit;
+    logic [31:0] plic_load_data;
+    logic        plic_m_ext, plic_s_ext;
 
     // Commit-time trap evaluation (driven combinationally in the commit block).
     logic        commit_exc_valid;
@@ -399,8 +402,8 @@ module riscv_core_ooo (
         .frm_value(csr_frm),
         .irq_m_timer(irq_mtimer),
         .irq_m_software(irq_msoft),
-        .irq_m_external(1'b0),
-        .irq_s_external(1'b0),
+        .irq_m_external(plic_m_ext),
+        .irq_s_external(plic_s_ext),
         .trap_valid(commit_take_trap || commit_take_int),
         .trap_is_interrupt(tc_is_int),
         .trap_cause(tc_cause),
@@ -460,6 +463,25 @@ module riscv_core_ooo (
         .irq_m_timer(irq_mtimer),
         .irq_m_software(irq_msoft),
         .mtime_out(clint_mtime)
+    );
+
+    // PLIC: external-interrupt controller (ctx0 = M-external, ctx1 = S-external).
+    // No device sources are wired yet (src_irq = 0); software injects pending via
+    // a write to the pending word. Drives mip.MEIP / mip.SEIP.
+    plic Plic (
+        .clk,
+        .rst_l,
+        .src_irq('0),
+        .store_en(data_store_mask != 4'b0),
+        .store_waddr(data_addr),
+        .store_wdata(data_store),
+        .store_mask(data_store_mask),
+        .load_addr(data_load_addr),
+        .load_en(data_load_valid),
+        .load_hit(plic_load_hit),
+        .load_data(plic_load_data),
+        .irq_m_external(plic_m_ext),
+        .irq_s_external(plic_s_ext)
     );
 
     // ===================== Sv32 MMU (Phase 4) =====================
@@ -926,7 +948,8 @@ module riscv_core_ooo (
         .data_load_valid,
         // A load that hits the memory-mapped CLINT returns the CLINT register
         // value instead of the (out-of-window) DRAM result.
-        .data_load(clint_load_hit ? clint_load_data : data_load[0]),
+        .data_load(clint_load_hit ? clint_load_data :
+                   plic_load_hit  ? plic_load_data  : data_load[0]),
         // Under paging the queue matches loads on the (virtual) head address; the
         // physical address is applied only at the memory port below.
         .data_load_addr(lsq_data_load_addr),
