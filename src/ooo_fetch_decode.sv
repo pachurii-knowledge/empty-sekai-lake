@@ -9,7 +9,11 @@ module ooo_fetch_decode
     input  logic             rst_l,
     input  logic             fetch_valid,
     input  logic             instr_mem_excpt,
-    input  logic             fetch_fault,        // fetch page/access fault
+    // Per-lane fetch page/access fault for the fetch group. Bit i corresponds to
+    // decode lane i (PC = fetch_pc + 4*i). Translation/execute-permission faults
+    // are page-granular (so they set lane 0 only), but PMP can differ per 4-byte
+    // word within the 16-byte fetch block, so each lane is checked independently.
+    input  logic [OOO_WIDTH-1:0] fetch_fault_lane,
     input  logic [4:0]       fetch_fault_cause,  // EXC_INSTR_PAGE_FAULT/ACCESS
     input  logic [31:0]      fetch_pc,
     input  logic [3:0][31:0] instr,
@@ -19,10 +23,34 @@ module ooo_fetch_decode
     ctrl_signals_t lane_ctrl [OOO_WIDTH];
     logic [1:0] fetch_lane_offset;
     logic [OOO_WIDTH-1:0] prefix_unpredicted_control;
+    logic [OOO_WIDTH-1:0] base_valid;        // lane fetched + not control-squashed
+    logic [OOO_WIDTH-1:0] block_fault;       // lane validly faults
+    logic [OOO_WIDTH-1:0] prefix_fault;      // some older lane in the group faults
     logic [OOO_WIDTH-1:0][31:0] raw_decode_instr;
     logic [OOO_WIDTH-1:0][31:0] decode_instr;
 
     assign fetch_lane_offset = fetch_pc[3:2];
+
+    // base_valid / block_fault / prefix_fault depend only on raw_decode_instr and
+    // the fault mask, so they are resolved before decode_instr (no comb cycle).
+    always_comb begin
+        prefix_unpredicted_control = '0;
+        for (int i = 1; i < OOO_WIDTH; i += 1) begin
+            prefix_unpredicted_control[i] =
+                prefix_unpredicted_control[i - 1] ||
+                (raw_decode_instr[i - 1][6:0] == RISCV_ISA::OP_JAL) ||
+                (raw_decode_instr[i - 1][6:0] == RISCV_ISA::OP_JALR);
+        end
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            base_valid[i] = fetch_valid &&
+                (int'(fetch_lane_offset) + i < OOO_WIDTH) &&
+                !prefix_unpredicted_control[i];
+            block_fault[i] = base_valid[i] && fetch_fault_lane[i];
+        end
+        prefix_fault = '0;
+        for (int i = 1; i < OOO_WIDTH; i += 1)
+            prefix_fault[i] = prefix_fault[i - 1] || block_fault[i - 1];
+    end
 
     genvar lane;
     generate
@@ -31,10 +59,12 @@ module ooo_fetch_decode
                 (fetch_valid && !instr_mem_excpt &&
                  (int'(fetch_lane_offset) + lane < OOO_WIDTH)) ?
                 instr[int'(fetch_lane_offset) + lane] : 32'h0000_0013;
-            // On a fetch fault every lane decodes as a NOP; the entry lane is
-            // then re-stamped below to carry the fault to the ALU/commit.
+            // NOP a lane that is control-squashed, that is the fault carrier, or
+            // that follows an older faulting lane in the same group. The fault
+            // carrier is re-stamped below to carry the fault to the ALU/commit.
             assign decode_instr[lane] =
-                (fetch_fault || prefix_unpredicted_control[lane]) ?
+                (prefix_unpredicted_control[lane] || block_fault[lane] ||
+                 prefix_fault[lane]) ?
                 32'h0000_0013 : raw_decode_instr[lane];
 
             riscv_decode DecodeLane (
@@ -46,24 +76,20 @@ module ooo_fetch_decode
     endgenerate
 
     always_comb begin
-        prefix_unpredicted_control = '0;
-        for (int i = 1; i < OOO_WIDTH; i += 1) begin
-            prefix_unpredicted_control[i] =
-                prefix_unpredicted_control[i - 1] ||
-                (raw_decode_instr[i - 1][6:0] == RISCV_ISA::OP_JAL) ||
-                (raw_decode_instr[i - 1][6:0] == RISCV_ISA::OP_JALR);
-        end
-    end
-
-    always_comb begin
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            // A lane stays valid until (and including) the first faulting lane;
+            // older lanes execute normally, younger lanes are squashed. The fault
+            // carrier (block_fault & !prefix_fault) retires as a trapping NOP.
             decode_lanes[i].valid = fetch_valid && !instr_mem_excpt &&
                 (int'(fetch_lane_offset) + i < OOO_WIDTH) &&
-                !prefix_unpredicted_control[i];
+                !prefix_unpredicted_control[i] && !prefix_fault[i];
             decode_lanes[i].kill = 1'b0;
             decode_lanes[i].pc = fetch_pc + (i * 32'd4);
             decode_lanes[i].instr = decode_instr[i];
             decode_lanes[i].ctrl = lane_ctrl[i];
+            decode_lanes[i].ctrl.fetch_fault =
+                block_fault[i] && !prefix_fault[i];
+            decode_lanes[i].ctrl.fetch_fault_cause = fetch_fault_cause;
             decode_lanes[i].rs1 = lane_ctrl[i].syscall ? 5'd10 :
                 decode_instr[i][19:15];
             decode_lanes[i].rs2 = decode_instr[i][24:20];
@@ -73,21 +99,11 @@ module ooo_fetch_decode
             decode_lanes[i].uses_rs2 = uses_rs2(decode_instr[i]);
         end
 
-        // Fetch fault: collapse the block to a single trapping micro-op at the
-        // entry PC (lane 0). It is a NOP (no dest/mem/branch) carrying the fault
-        // so the ALU pipe raises a precise instruction page/access fault at
-        // commit; younger lanes in the faulting block are squashed. Valid even
-        // under instr_mem_excpt, since the discarded instruction bytes do not
-        // matter once the fetch has faulted.
-        if (fetch_fault) begin
-            for (int i = 0; i < OOO_WIDTH; i += 1) begin
-                decode_lanes[i].valid = (i == 0) && fetch_valid;
-                decode_lanes[i].kill  = 1'b0;
-                decode_lanes[i].pc    = fetch_pc;
-                decode_lanes[i].ctrl.fetch_fault       = (i == 0);
-                decode_lanes[i].ctrl.fetch_fault_cause = fetch_fault_cause;
-            end
-        end
+        // The fault carrier remains valid even under instr_mem_excpt: the
+        // discarded instruction bytes do not matter once the fetch has faulted.
+        for (int i = 0; i < OOO_WIDTH; i += 1)
+            if (block_fault[i] && !prefix_fault[i])
+                decode_lanes[i].valid = fetch_valid;
     end
 
     function automatic logic [31:0] immediate_for(imm_mode_t mode,

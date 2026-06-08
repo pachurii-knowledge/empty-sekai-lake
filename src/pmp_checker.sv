@@ -45,8 +45,12 @@ module pmp_checker
             input logic [29:0] addr);
         logic [30:0] xor1;
         logic [29:0] ignore;
+        // a (= byte addr >> 2) has k trailing ones encoding a 2^(k+3)-byte region,
+        // i.e. 2^(k+1) words; the low (k+1) bits of the word address are ignored.
+        // a ^ (a+1) is exactly those (k+1) low bits, so it IS the ignore mask
+        // (matching the Sail model's NAPOT begin/size computation).
         xor1   = {1'b0, a} ^ ({1'b0, a} + 31'd1);  // (k+1) trailing ones
-        ignore = xor1[30:1];                        // low k bits to ignore
+        ignore = xor1[29:0];                        // low (k+1) bits to ignore
         napot_match = ((addr ^ a) & ~ignore) == 30'b0;
     endfunction
 

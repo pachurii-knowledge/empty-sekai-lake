@@ -39,9 +39,10 @@ module riscv_core_ooo (
     logic [1:0] fetch_valid_pipe_q, fetch_valid_pipe_next;
     // Fetch fault piped alongside fetch_pc/fetch_valid so it reaches decode
     // aligned with the PC it belongs to (computed in the MMU section).
-    logic        fetch_fault;            // combinational fault for pc_q this cycle
+    logic        fetch_fault;            // combinational: any lane of pc_q faults
+    logic [OOO_WIDTH-1:0] fetch_fault_lane;  // per-lane fetch fault for pc_q's group
     logic [4:0]  fetch_fault_cause;
-    logic [1:0]  fetch_fault_pipe_q, fetch_fault_pipe_next;
+    logic [1:0][OOO_WIDTH-1:0] fetch_fault_lane_pipe_q, fetch_fault_lane_pipe_next;
     logic [1:0][4:0] fetch_fault_cause_pipe_q, fetch_fault_cause_pipe_next;
     logic halted_q, halted_next;
     logic terminal_pending_q, terminal_pending_next;
@@ -327,7 +328,8 @@ module riscv_core_ooo (
         .rst_l,
         .fetch_valid(fetch_valid_pipe_q[1] && !halted_q),
         .instr_mem_excpt,
-        .fetch_fault(fetch_fault_pipe_q[1] && fetch_valid_pipe_q[1]),
+        .fetch_fault_lane(fetch_fault_lane_pipe_q[1] &
+            {OOO_WIDTH{fetch_valid_pipe_q[1]}}),
         .fetch_fault_cause(fetch_fault_cause_pipe_q[1]),
         .fetch_pc(fetch_pc_pipe_q[1]),
         .instr,
@@ -556,6 +558,8 @@ module riscv_core_ooo (
 
     // --- Page-table walker (shared; data has priority over fetch) ---
     logic        ptw_req, ptw_done, ptw_fault, ptw_busy, ptw_super;
+    logic        ptw_fault_access;       // PTW fault is a PMP-on-PTE access fault
+    logic        ptw_pte_pmp_fault;      // PMP denies the in-flight PTE access
     logic [21:0] ptw_ppn;
     logic [7:0]  ptw_perm;
     logic [19:0] ptw_vpn;
@@ -595,9 +599,11 @@ module riscv_core_ooo (
         .mem_wdata(ptw_wdata),
         .mem_ack(1'b1),
         .mem_rdata(ptw_rdata),
+        .pte_pmp_fault(ptw_pte_pmp_fault),
         .busy(ptw_busy),
         .done(ptw_done),
         .fault(ptw_fault),
+        .fault_access(ptw_fault_access),
         .ppn(ptw_ppn),
         .perm(ptw_perm),
         .superpage(ptw_super),
@@ -605,6 +611,18 @@ module riscv_core_ooo (
         .walk_is_data(ptw_walk_is_data)
     );
     assign ptw_addr = ptw_mem_addr[31:2];
+
+    // PMP on the implicit PTE access. Per the priv spec these accesses are checked
+    // as Supervisor (reads need R, A/D writes need W); a violation aborts the walk
+    // and surfaces as an access fault of the original access type (handled below).
+    pmp_checker PtwPMP (
+        .paddr(ptw_mem_addr),
+        .access(ptw_we ? 2'd2 : 2'd1),
+        .priv(RISCV_Priv::PRIV_S),
+        .pmpcfg(csr_pmpcfg_arr),
+        .pmpaddr(csr_pmpaddr_arr),
+        .fault(ptw_pte_pmp_fault)
+    );
 
     mmu_tlb #(.ENTRIES(16)) ITLB (
         .clk, .rst_l,
@@ -672,9 +690,14 @@ module riscv_core_ooo (
          (data_pa_resolved && pmp_data_fault));
     assign lsq_xlate_stall = paging_data && mem_req_valid &&
         !dtlb_usable && !data_from_ptw && !data_perm_fault;
+    // A PMP fault on a PTE access during a data walk is an access fault, not a
+    // page fault (priv spec); it overrides the page-fault cause below.
+    logic data_ptw_access_fault;
+    assign data_ptw_access_fault =
+        data_need_walk && ptw_done && ptw_fault && ptw_fault_access;
     // Page fault (translation) reported ahead of a PMP access fault.
     assign lsq_xlate_cause =
-        (paging_data && data_perm_fault) ?
+        (paging_data && data_perm_fault && !data_ptw_access_fault) ?
             (mem_req_store ? RISCV_Priv::EXC_STORE_PAGE_FAULT
                            : RISCV_Priv::EXC_LOAD_PAGE_FAULT) :
             (mem_req_store ? RISCV_Priv::EXC_STORE_ACCESS
@@ -704,22 +727,55 @@ module riscv_core_ooo (
         (itlb_hit && perm_bad(itlb_perm, 2'd0, cur_priv,
             mstatus_sum, mstatus_mxr)) ||
         (fetch_need_walk && !ptw_for_data && ptw_done && ptw_fault);
+    // A PMP fault on a PTE access during a fetch walk is an instruction *access*
+    // fault, not a page fault (priv spec) -- selects the cause below.
+    logic fetch_ptw_access_fault;
+    assign fetch_ptw_access_fault =
+        fetch_need_walk && !ptw_for_data && ptw_done && ptw_fault && ptw_fault_access;
 
     // PMP on the resolved fetch PA (any mode). Gated on a resolved PA so the
     // (stale VA) fallback during a walk is not checked; page fault wins over PMP.
-    logic fetch_pa_resolved, pmp_fetch_fault;
+    // A 16-byte fetch block can span multiple PMP regions, so each of the up-to-4
+    // fetched words is PMP-checked independently (translation/exec-permission are
+    // page-granular and identical across the block). fetch_fault_lane[i] is the
+    // fault for decode lane i (VA pc_q + 4*i; same page, so PA = fetch_pa + 4*i).
+    logic fetch_pa_resolved;
+    logic [OOO_WIDTH-1:0] pmp_fetch_fault_lane;
+    logic [OOO_WIDTH-1:0] fetch_lane_in_block;
     assign fetch_pa_resolved = !paging_fetch || itlb_hit || fetch_from_ptw;
-    pmp_checker FetchPMP (
-        .paddr(fetch_pa),
-        .access(2'd0),
-        .priv(cur_priv),
-        .pmpcfg(csr_pmpcfg_arr),
-        .pmpaddr(csr_pmpaddr_arr),
-        .fault(pmp_fetch_fault)
-    );
-    assign fetch_fault = (paging_fetch && fetch_perm_fault) ||
-                         (fetch_pa_resolved && pmp_fetch_fault);
-    assign fetch_fault_cause = (paging_fetch && fetch_perm_fault) ?
+    genvar fpl;
+    generate
+        for (fpl = 0; fpl < OOO_WIDTH; fpl += 1) begin : fetch_pmp_gen
+            pmp_checker FetchPMP (
+                .paddr(fetch_pa + (fpl * 32'd4)),
+                .access(2'd0),
+                .priv(cur_priv),
+                .pmpcfg(csr_pmpcfg_arr),
+                .pmpaddr(csr_pmpaddr_arr),
+                .fault(pmp_fetch_fault_lane[fpl])
+            );
+            // Lane fpl is part of this block only if it lies within the 16-byte
+            // fetch window starting at pc_q's offset; otherwise it is a different
+            // block and must not contribute a fault.
+            assign fetch_lane_in_block[fpl] =
+                (int'(pc_q[3:2]) + fpl) < OOO_WIDTH;
+        end
+    endgenerate
+
+    // Page/exec-permission faults are page-granular -> collapse onto lane 0;
+    // PMP faults are per word. fetch_fault retains its group-level meaning (any
+    // lane faults) for the existing frontend-stall/redirect logic.
+    always_comb begin
+        if (paging_fetch && fetch_perm_fault)
+            fetch_fault_lane = {{(OOO_WIDTH-1){1'b0}}, 1'b1};
+        else if (fetch_pa_resolved)
+            fetch_fault_lane = pmp_fetch_fault_lane & fetch_lane_in_block;
+        else
+            fetch_fault_lane = '0;
+    end
+    assign fetch_fault = |fetch_fault_lane;
+    assign fetch_fault_cause =
+        (paging_fetch && fetch_perm_fault && !fetch_ptw_access_fault) ?
         RISCV_Priv::EXC_INSTR_PAGE_FAULT : RISCV_Priv::EXC_INSTR_ACCESS;
 
     branch_stack BranchStack (
@@ -1563,7 +1619,7 @@ module riscv_core_ooo (
         // The fault pipe shifts only in the sequential-fetch case below; in the
         // flush cases it holds, but is always masked by fetch_valid_pipe at the
         // FetchDecode input, so a held-stale fault never pairs with a valid PC.
-        fetch_fault_pipe_next = fetch_fault_pipe_q;
+        fetch_fault_lane_pipe_next = fetch_fault_lane_pipe_q;
         fetch_fault_cause_pipe_next = fetch_fault_cause_pipe_q;
         // Synchronous exceptions now redirect to a trap handler instead of
         // halting the core (see commit-time trap detection above). precise_halt
@@ -1630,8 +1686,8 @@ module riscv_core_ooo (
                 fetch_valid_pipe_next[1] = fetch_valid_pipe_q[0];
                 // Capture the fetch fault for pc_q alongside it, shifting in
                 // lockstep with the PC/valid pipe so it stays aligned to decode.
-                fetch_fault_pipe_next[0] = fetch_fault;
-                fetch_fault_pipe_next[1] = fetch_fault_pipe_q[0];
+                fetch_fault_lane_pipe_next[0] = fetch_fault_lane;
+                fetch_fault_lane_pipe_next[1] = fetch_fault_lane_pipe_q[0];
                 fetch_fault_cause_pipe_next[0] = fetch_fault_cause;
                 fetch_fault_cause_pipe_next[1] = fetch_fault_cause_pipe_q[0];
             end
@@ -1722,7 +1778,7 @@ module riscv_core_ooo (
             pc_q <= USER_TEXT_START;
             fetch_pc_pipe_q <= '0;
             fetch_valid_pipe_q <= '0;
-            fetch_fault_pipe_q <= '0;
+            fetch_fault_lane_pipe_q <= '0;
             fetch_fault_cause_pipe_q <= '0;
             halted_q <= 1'b0;
             terminal_pending_q <= 1'b0;
@@ -1756,7 +1812,7 @@ module riscv_core_ooo (
             pc_q <= pc_next;
             fetch_pc_pipe_q <= fetch_pc_pipe_next;
             fetch_valid_pipe_q <= fetch_valid_pipe_next;
-            fetch_fault_pipe_q <= fetch_fault_pipe_next;
+            fetch_fault_lane_pipe_q <= fetch_fault_lane_pipe_next;
             fetch_fault_cause_pipe_q <= fetch_fault_cause_pipe_next;
             halted_q <= halted_next;
             terminal_pending_q <= terminal_pending_next;

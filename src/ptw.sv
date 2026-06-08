@@ -40,11 +40,17 @@ module ptw
     output logic [31:0] mem_wdata,
     input  logic        mem_ack,
     input  logic [31:0] mem_rdata,
+    // PMP violation on the PTE access at mem_addr (driven combinationally by the
+    // integrating core against the address this walk is currently requesting).
+    // Per the priv spec a PMP fault on a PTE access aborts the walk and raises an
+    // access fault of the *original* access type, not a page fault.
+    input  logic        pte_pmp_fault,
 
     // Result (asserted for one cycle with done)
     output logic        busy,
     output logic        done,
     output logic        fault,
+    output logic        fault_access,   // fault is a PTE-access (PMP) fault, not a page fault
     output logic [21:0] ppn,
     output logic [7:0]  perm,
     output logic        superpage,
@@ -78,6 +84,12 @@ module ptw
     logic [31:0] pte_addr_q;     // address of current PTE (for A/D writeback)
     logic        super_q;
     logic        fault_q;
+    logic        pte_af_q;        // sticky: a PTE access (PMP) fault aborted the walk
+
+    // A PTE memory access (L1/L0 read or A/D write) is in flight this cycle.
+    logic        pte_access_now;
+    assign pte_access_now = (state_q == S_L1_REQ) || (state_q == S_L0_REQ) ||
+                            (state_q == S_AD_REQ);
 
     // Latched request context
     always_ff @(posedge clk or negedge rst_l) begin
@@ -86,7 +98,7 @@ module ptw
             vpn_q <= 20'b0; acc_q <= 2'b0; priv_q <= PRIV_M;
             sum_q <= 1'b0; mxr_q <= 1'b0;
             pte_q <= 32'b0; pte_addr_q <= 32'b0; super_q <= 1'b0;
-            fault_q <= 1'b0;
+            fault_q <= 1'b0; pte_af_q <= 1'b0;
         end else begin
             state_q <= state_n;
             if (state_q == S_IDLE && req_valid) begin
@@ -100,6 +112,11 @@ module ptw
             if ((state_q == S_L1_REQ || state_q == S_L0_REQ) && mem_ack) begin
                 pte_q <= mem_rdata;
             end
+            // Latch a PTE-access PMP fault; clear it as a fresh walk is launched.
+            if (state_q == S_IDLE && req_valid)
+                pte_af_q <= 1'b0;
+            else if (pte_access_now && pte_pmp_fault)
+                pte_af_q <= 1'b1;
         end
     end
 
@@ -161,7 +178,8 @@ module ptw
             S_L1_REQ: begin
                 mem_req  = 1'b1;
                 mem_addr = {satp_ppn[19:0], 12'b0} + {20'b0, vpn_q[19:10], 2'b00};
-                if (mem_ack) state_n = S_L1_WAIT;
+                if (pte_pmp_fault) state_n = S_DONE;   // PMP-denied PTE: abort walk
+                else if (mem_ack)  state_n = S_L1_WAIT;
             end
             S_L1_WAIT: begin
                 // pte_q now holds the level-1 PTE
@@ -176,7 +194,8 @@ module ptw
             S_L0_REQ: begin
                 mem_req  = 1'b1;
                 mem_addr = {pte_ppn[19:0], 12'b0} + {20'b0, vpn_q[9:0], 2'b00};
-                if (mem_ack) state_n = S_L0_WAIT;
+                if (pte_pmp_fault) state_n = S_DONE;   // PMP-denied PTE: abort walk
+                else if (mem_ack)  state_n = S_L0_WAIT;
             end
             S_L0_WAIT: begin
                 if (!v_bit || (!r_bit && w_bit) || !leaf) state_n = S_DONE;
@@ -189,7 +208,8 @@ module ptw
                 mem_addr  = pte_addr_q;
                 mem_wdata = pte_q | (32'b1 << RISCV_Priv::PTE_A) |
                     ((acc_q == ACC_STORE) ? (32'b1 << RISCV_Priv::PTE_D) : 32'b0);
-                if (mem_ack) state_n = S_AD_WAIT;
+                if (pte_pmp_fault) state_n = S_DONE;   // PMP-denied A/D write: abort
+                else if (mem_ack)  state_n = S_AD_WAIT;
             end
             S_AD_WAIT: state_n = S_DONE;
             S_DONE:    state_n = S_IDLE;
@@ -241,8 +261,10 @@ module ptw
         ((need_ad && adue) ? ((8'b1 << RISCV_Priv::PTE_A) |
             ((acc_q == ACC_STORE) ? (8'b1 << RISCV_Priv::PTE_D) : 8'b0)) : 8'b0);
 
-    // fault asserted with done: recompute based on which level produced it.
-    // (When done is reached from S_L1_WAIT path super_q is set.)
-    assign fault     = done && (super_q ? l1_fault : l0_fault);
+    // fault asserted with done: a PTE-access PMP fault (pte_af_q) aborts the walk
+    // and is reported as an access fault; otherwise recompute the page fault based
+    // on which level produced it. (When done is reached from S_L1_WAIT super_q is set.)
+    assign fault        = done && (pte_af_q || (super_q ? l1_fault : l0_fault));
+    assign fault_access = done && pte_af_q;
 
 endmodule: ptw

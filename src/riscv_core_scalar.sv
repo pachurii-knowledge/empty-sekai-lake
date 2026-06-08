@@ -708,9 +708,11 @@ module riscv_core_scalar (
         .mem_wdata(ptw_wdata),
         .mem_ack(1'b1),
         .mem_rdata({ptw_rdata}),
+        .pte_pmp_fault(1'b0),   // scalar prototype: PMP-on-PTE not modelled
         .busy(ptw_busy),
         .done(ptw_done),
         .fault(ptw_fault),
+        .fault_access(),
         .ppn(ptw_ppn),
         .perm(ptw_perm),
         .superpage(ptw_super)
