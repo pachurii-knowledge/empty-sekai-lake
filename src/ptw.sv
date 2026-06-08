@@ -36,6 +36,11 @@ module ptw
     // Memory port (byte addressed)
     output logic        mem_req,
     output logic        mem_we,
+    // The in-flight PTE access is a write (A/D update) -- unconditional intent,
+    // unlike mem_we which is gated off when the PMP check denies the write. The
+    // core uses this (not mem_we) to pick the PMP access type, so gating mem_we
+    // cannot feed back and flip the access type / oscillate the PMP result.
+    output logic        mem_is_write,
     output logic [31:0] mem_addr,
     output logic [31:0] mem_wdata,
     input  logic        mem_ack,
@@ -203,8 +208,12 @@ module ptw
                     (need_ad && adue && !perm_fault(1'b0)) ? S_AD_REQ : S_DONE;
             end
             S_AD_REQ: begin
-                mem_req   = 1'b1;
-                mem_we    = 1'b1;
+                // Suppress the write itself when PMP denies it -- the A/D bits
+                // must NOT be updated on a faulting A/D write (the access faults
+                // instead). Asserting mem_we here regardless would wrongly commit
+                // the update before the abort.
+                mem_req   = !pte_pmp_fault;
+                mem_we    = !pte_pmp_fault;
                 mem_addr  = pte_addr_q;
                 mem_wdata = pte_q | (32'b1 << RISCV_Priv::PTE_A) |
                     ((acc_q == ACC_STORE) ? (32'b1 << RISCV_Priv::PTE_D) : 32'b0);
@@ -247,8 +256,9 @@ module ptw
                       perm_fault(1'b0) ||
                       ad_fault;
 
-    assign busy      = (state_q != S_IDLE);
-    assign done      = (state_q == S_DONE);
+    assign busy         = (state_q != S_IDLE);
+    assign mem_is_write = (state_q == S_AD_REQ);
+    assign done         = (state_q == S_DONE);
     assign superpage = super_q;
     assign ppn       = pte_ppn;
     assign walk_vpn     = vpn_q;

@@ -704,6 +704,7 @@ module riscv_core_scalar (
         .adue(csr_menvcfg_adue),
         .mem_req(),
         .mem_we(ptw_we),
+        .mem_is_write(),
         .mem_addr(ptw_mem_addr),
         .mem_wdata(ptw_wdata),
         .mem_ack(1'b1),

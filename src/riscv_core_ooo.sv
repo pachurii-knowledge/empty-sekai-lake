@@ -586,6 +586,7 @@ module riscv_core_ooo (
     logic        ptw_req, ptw_done, ptw_fault, ptw_busy, ptw_super;
     logic        ptw_fault_access;       // PTW fault is a PMP-on-PTE access fault
     logic        ptw_pte_pmp_fault;      // PMP denies the in-flight PTE access
+    logic        ptw_mem_is_write;       // in-flight PTE access is an A/D write
     logic [21:0] ptw_ppn;
     logic [7:0]  ptw_perm;
     logic [19:0] ptw_vpn;
@@ -621,6 +622,7 @@ module riscv_core_ooo (
         .adue(csr_menvcfg_adue),
         .mem_req(),
         .mem_we(ptw_we),
+        .mem_is_write(ptw_mem_is_write),
         .mem_addr(ptw_mem_addr),
         .mem_wdata(ptw_wdata),
         .mem_ack(1'b1),
@@ -643,7 +645,7 @@ module riscv_core_ooo (
     // and surfaces as an access fault of the original access type (handled below).
     pmp_checker PtwPMP (
         .paddr(ptw_mem_addr),
-        .access(ptw_we ? 2'd2 : 2'd1),
+        .access(ptw_mem_is_write ? 2'd2 : 2'd1),
         .priv(RISCV_Priv::PRIV_S),
         .pmpcfg(csr_pmpcfg_arr),
         .pmpaddr(csr_pmpaddr_arr),
