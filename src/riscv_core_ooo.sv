@@ -204,6 +204,9 @@ module riscv_core_ooo (
     logic        plic_load_hit;
     logic [31:0] plic_load_data;
     logic        plic_m_ext, plic_s_ext;
+    logic        uart_load_hit;
+    logic [31:0] uart_load_data;
+    logic        uart_irq;
 
     // Commit-time trap evaluation (driven combinationally in the commit block).
     logic        commit_exc_valid;
@@ -470,10 +473,17 @@ module riscv_core_ooo (
     // PLIC: external-interrupt controller (ctx0 = M-external, ctx1 = S-external).
     // No device sources are wired yet (src_irq = 0); software injects pending via
     // a write to the pending word. Drives mip.MEIP / mip.SEIP.
+    // UART interrupt drives PLIC source 10 (the conventional NS16550 line); all
+    // other device sources are still software-injected via the pending word.
+    logic [31:0] plic_src;
+    always_comb begin
+        plic_src = 32'b0;
+        plic_src[10] = uart_irq;
+    end
     plic Plic (
         .clk,
         .rst_l,
-        .src_irq('0),
+        .src_irq(plic_src),
         .store_en(data_store_mask != 4'b0),
         .store_waddr(data_addr),
         .store_wdata(data_store),
@@ -484,6 +494,22 @@ module riscv_core_ooo (
         .load_data(plic_load_data),
         .irq_m_external(plic_m_ext),
         .irq_s_external(plic_s_ext)
+    );
+
+    // NS16550-subset UART -> simulation console (base 0x0D00_0000, in the device
+    // hole; 0x1000_0000 is arch-test RAM). Snoops the data store port like the
+    // CLINT/PLIC; its loads mux into the LSQ writeback.
+    uart Uart (
+        .clk,
+        .rst_l,
+        .store_en(data_store_mask != 4'b0),
+        .store_waddr(data_addr),
+        .store_wdata(data_store),
+        .store_mask(data_store_mask),
+        .load_addr(data_load_addr),
+        .load_hit(uart_load_hit),
+        .load_data(uart_load_data),
+        .irq(uart_irq)
     );
 
     // ===================== Sv32 MMU (Phase 4) =====================
@@ -1005,7 +1031,8 @@ module riscv_core_ooo (
         // A load that hits the memory-mapped CLINT returns the CLINT register
         // value instead of the (out-of-window) DRAM result.
         .data_load(clint_load_hit ? clint_load_data :
-                   plic_load_hit  ? plic_load_data  : data_load[0]),
+                   plic_load_hit  ? plic_load_data  :
+                   uart_load_hit  ? uart_load_data  : data_load[0]),
         // Under paging the queue matches loads on the (virtual) head address; the
         // physical address is applied only at the memory port below.
         .data_load_addr(lsq_data_load_addr),
