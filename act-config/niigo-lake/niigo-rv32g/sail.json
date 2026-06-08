@@ -77,14 +77,18 @@
   },
   "memory": {
     "pmp": {
+      // grain 0 = 4-byte (G=0): matches the OoO core (NA4 selectable,
+      // pmpaddr fully writable). Mirrors NUM_PMP_ENTRIES:16 / PMP_GRANULARITY:2
+      // (G+2) in niigo-rv32g.yaml; the two must agree or the golden signatures
+      // are generated with PMP unenforced while the DUT enforces it.
       "grain": 0,
       // This specifies the number of PMP entries present.
       // The value must be one of 0, 16, or 64.
-      "count": 0,
+      "count": 16,
       // This specifies the number of usable PMP entries.
       // Entries higher than this are read-only-zero.
       // The value must be less than or equal to `count`.
-      "usable_count": 0,
+      "usable_count": 16,
       "tor_supported": true,
       "na4_supported": true,
       "napot_supported": true
