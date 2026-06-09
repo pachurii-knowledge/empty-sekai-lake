@@ -10,6 +10,7 @@ Usage:  python3 scripts/make_dtb.py [out.dtb]   (default: output/niigo_platform.
 """
 from __future__ import annotations
 
+import argparse
 import struct
 import sys
 from pathlib import Path
@@ -76,7 +77,17 @@ class FdtWriter:
         return header + rsvmap + bytes(self.struct) + bytes(self.strings)
 
 
-def build_dtb() -> bytes:
+def build_dtb(
+    *,
+    xlen: int = 32,
+    ram_base: int = 0x8000_0000,
+    ram_size: int = 0x0800_0000,
+    initrd: tuple[int, int] | None = None,
+    bootargs: str = "console=ttyS0 earlycon",
+) -> bytes:
+    isa = "rv64imafd" if xlen == 64 else "rv32imafd"
+    mmu = "riscv,sv39" if xlen == 64 else "riscv,sv32"
+
     w = FdtWriter()
     w.begin_node("")                       # root
     w.prop_u32("#address-cells", 1)
@@ -85,8 +96,12 @@ def build_dtb() -> bytes:
     w.prop_str("model", "niigo-lake")
 
     w.begin_node("chosen")
-    w.prop_str("bootargs", "console=ttyS0 earlycon")
+    w.prop_str("bootargs", bootargs)
     w.prop_str("stdout-path", "/soc/serial@d000000")
+    if initrd is not None:
+        # Linux mounts this in-RAM cpio as the root filesystem (no block device).
+        w.prop_u32("linux,initrd-start", initrd[0])
+        w.prop_u32("linux,initrd-end", initrd[1])
     w.end_node()
 
     w.begin_node("cpus")
@@ -98,8 +113,8 @@ def build_dtb() -> bytes:
     w.prop_u32("reg", 0)
     w.prop_str("status", "okay")
     w.prop_str("compatible", "riscv")
-    w.prop_str("riscv,isa", "rv32imafd")
-    w.prop_str("mmu-type", "riscv,sv32")
+    w.prop_str("riscv,isa", isa)
+    w.prop_str("mmu-type", mmu)
     w.begin_node("interrupt-controller")
     w.prop_u32("#interrupt-cells", 1)
     w.prop("interrupt-controller", b"")
@@ -109,9 +124,9 @@ def build_dtb() -> bytes:
     w.end_node()
     w.end_node()
 
-    w.begin_node("memory@80000000")
+    w.begin_node(f"memory@{ram_base:x}")
     w.prop_str("device_type", "memory")
-    w.prop_u32("reg", 0x8000_0000, 0x0800_0000)   # 128 MiB RAM
+    w.prop_u32("reg", ram_base, ram_size)
     w.end_node()
 
     w.begin_node("soc")
@@ -166,12 +181,38 @@ def emit_asm(blob: bytes, label: str = "dtb_blob") -> str:
     return "\n".join(lines) + "\n"
 
 
+def _int0(s: str) -> int:
+    return int(s, 0)
+
+
 def main(argv: list[str]) -> int:
-    out = Path(argv[1]) if len(argv) > 1 else Path("output/niigo_platform.dtb")
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("out", nargs="?", type=Path,
+                   default=Path("output/niigo_platform.dtb"),
+                   help="output .dtb path (also writes a sibling .inc)")
+    p.add_argument("--xlen", type=int, choices=(32, 64), default=32,
+                   help="32 -> rv32imafd/sv32 (default), 64 -> rv64imafd/sv39")
+    p.add_argument("--ram-base", type=_int0, default=0x8000_0000)
+    p.add_argument("--ram-size", type=_int0, default=0x0800_0000)
+    p.add_argument("--initrd-start", type=_int0,
+                   help="add chosen/linux,initrd-start (in-RAM cpio rootfs)")
+    p.add_argument("--initrd-end", type=_int0,
+                   help="add chosen/linux,initrd-end")
+    p.add_argument("--bootargs", default="console=ttyS0 earlycon")
+    args = p.parse_args(argv)
+
+    initrd = None
+    if args.initrd_start is not None and args.initrd_end is not None:
+        initrd = (args.initrd_start, args.initrd_end)
+
+    out = args.out
     out.parent.mkdir(parents=True, exist_ok=True)
-    blob = build_dtb()
+    blob = build_dtb(xlen=args.xlen, ram_base=args.ram_base,
+                     ram_size=args.ram_size, initrd=initrd,
+                     bootargs=args.bootargs)
     out.write_bytes(blob)
-    print(f"wrote {len(blob)} bytes -> {out}")
+    print(f"wrote {len(blob)} bytes -> {out} (rv{args.xlen})")
     # Also emit an assembly .byte include so a directed test can embed the blob
     # without depending on .incbin path resolution.
     inc = out.with_suffix(".inc")
@@ -181,4 +222,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    raise SystemExit(main(sys.argv[1:]))
