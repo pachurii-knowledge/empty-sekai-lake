@@ -876,21 +876,21 @@ module riscv_core_scalar
     //===============================MEM1 start=========================//
 
     logic [XLEN-1:0] mem_read_data_M1, final_data_M1, cache_read_data_selected_M1;
-    logic [3:0][31:0] cache_write_data_M1;
-    logic [31:0] cache_read_data_M1;
+    logic [3:0][XLEN-1:0] cache_write_data_M1;
+    logic [XLEN-1:0] cache_read_data_M1;
     logic RegWrite_M1, Mem2Reg_M1, syscall_M1, illegal_instr_M1;
     logic [2:0] rd_src_M1;
-    logic [1:0] data_byte_M1;
-    logic [1:0] data_offset;
+    logic [ADDR_SHIFT-1:0] data_byte_M1;   // byte offset within the XLEN-byte word
+    logic [1:0] data_offset;               // word offset within the 4-word line
     logic cache_en;
     logic read_hit_M1, read_miss_M1, is_eviction_M1, mem_cache_sel_M1;
-    logic [29:0] cache_addr, data_addr_aligned;
+    logic [MEMORY_ADDR_WIDTH-1:0] cache_addr, data_addr_aligned;
     ldst_mode_t ldst_mode_M1;
     assign npc_offset_M1 = branch_target_M1;
     assign PCSrc_M1 = ctrl_signals_M1.pc_source == PC_cond && bcond_M1;
-    assign data_offset = pa_M1[3:2];
-    assign data_addr_aligned = {pa_M1[31:4], 2'b0};
-    assign data_addr = MemRead_M1 ? data_addr_aligned : pa_M1[31:2];
+    assign data_offset = pa_M1[ADDR_SHIFT+1 : ADDR_SHIFT];
+    assign data_addr_aligned = {pa_M1[XLEN-1 : ADDR_SHIFT+2], 2'b0};
+    assign data_addr = MemRead_M1 ? data_addr_aligned : pa_M1[XLEN-1 : ADDR_SHIFT];
     assign data_load_en = MemRead_M1 && read_miss_M1;
     assign cache_en = data_load_valid || ctrl_signals_M1.memWrite;
     assign RegWrite_M1 = ctrl_signals_M1.rfWrite;
@@ -898,7 +898,7 @@ module riscv_core_scalar
     assign syscall_M1 = ctrl_signals_M1.syscall;
     assign ldst_mode_M1 = ctrl_signals_M1.ldst_mode;
     assign illegal_instr_M1 = ctrl_signals_M1.illegal_instr;
-    assign data_byte_M1 = pa_M1[1:0];
+    assign data_byte_M1 = pa_M1[ADDR_SHIFT-1 : 0];
     assign rd_src_M1 = ctrl_signals_M1.rd_source;
     riscv_store_unit Store_Unit(.memWrite(ctrl_signals_M1.memWrite), .ldst_mode(ctrl_signals_M1.ldst_mode), .data_byte(data_byte_M1), .rs2_data(rs2_data_M1), .data_store_mask(data_store_mask), .data_store(data_store));
     
@@ -915,31 +915,57 @@ module riscv_core_scalar
         end
     end
 
-    assign cache_addr = MemRead_M1 ? pa_M1[31:2] : data_addr_aligned;
+    assign cache_addr = MemRead_M1 ? pa_M1[XLEN-1 : ADDR_SHIFT] : data_addr_aligned;
 
     logic cache_flush_M1;
 
-    // cache read write flush logic
+    // cache read write flush logic: a store that does not write a whole cache
+    // word flushes the line (the cache merges only at word granularity).
     always_comb begin
         cache_flush_M1 = 1'b0;
         if (ctrl_signals_M1.memWrite) begin
+`ifdef RV64
+            // RV64 sub-word stores are byte-merged into the cached word (below),
+            // so the cache stays coherent without a flush -- which is what keeps
+            // a following load's same-cycle cache forwarding working (the data
+            // memory has an 8-cycle read latency, so a flush+memory-miss would
+            // read stale data).
+            cache_flush_M1 = 1'b0;
+`else
             case(ctrl_signals_M1.ldst_mode)
                 LDST_W: cache_flush_M1 = 1'b0;
                 LDST_H: cache_flush_M1 = 1'b1;
                 LDST_B: cache_flush_M1 = 1'b1;
                 default: cache_flush_M1 = 1'b0;
-            endcase     
+            endcase
+`endif
         end
     end
 
+    // RV64: byte-merge a sub-word store into the current cached word so the
+    // whole-word cache write preserves the untouched bytes. (RV32 stores a whole
+    // 32-bit word, so data_store is used directly.)
+    logic [XLEN-1:0] cache_store_word;
+`ifdef RV64
+    logic [XLEN-1:0] store_mask_bits;
+    always_comb begin
+        for (int bi = 0; bi < XLEN_BYTES; bi++)
+            store_mask_bits[bi*8 +: 8] = {8{data_store_mask[bi]}};
+    end
+    assign cache_store_word = (cache_read_data_M1 & ~store_mask_bits)
+                            | (data_store & store_mask_bits);
+`else
+    assign cache_store_word = data_store;
+`endif
+
     // cache write data select logic
-    mux #(2, 32) MEM_CACHE_DATA_SEL_0(.in({data_load[0], data_store}), .sel(data_load_valid), .out(cache_write_data_M1[0]));
-    mux #(2, 32) MEM_CACHE_DATA_SEL_1(.in({data_load[1], data_store}), .sel(data_load_valid), .out(cache_write_data_M1[1]));
-    mux #(2, 32) MEM_CACHE_DATA_SEL_2(.in({data_load[2], data_store}), .sel(data_load_valid), .out(cache_write_data_M1[2]));
-    mux #(2, 32) MEM_CACHE_DATA_SEL_3(.in({data_load[3], data_store}), .sel(data_load_valid), .out(cache_write_data_M1[3]));
+    mux #(2, XLEN) MEM_CACHE_DATA_SEL_0(.in({data_load[0], cache_store_word}), .sel(data_load_valid), .out(cache_write_data_M1[0]));
+    mux #(2, XLEN) MEM_CACHE_DATA_SEL_1(.in({data_load[1], cache_store_word}), .sel(data_load_valid), .out(cache_write_data_M1[1]));
+    mux #(2, XLEN) MEM_CACHE_DATA_SEL_2(.in({data_load[2], cache_store_word}), .sel(data_load_valid), .out(cache_write_data_M1[2]));
+    mux #(2, XLEN) MEM_CACHE_DATA_SEL_3(.in({data_load[3], cache_store_word}), .sel(data_load_valid), .out(cache_write_data_M1[3]));
 
 
-    cache447 #(.WAYS(2), .POLICY(1), .INDEX_BITS(5)) DataCache (
+    cache447 #(.WAYS(2), .POLICY(1), .INDEX_BITS(5), .WORD_SIZE(XLEN), .ADDRESS_SIZE(MEMORY_ADDR_WIDTH)) DataCache (
         .clk(clk), .rst_l(rst_l), .address(cache_addr), 
         .enable(MemRead_M1 | ctrl_signals_M1.memWrite | data_load_valid), .flush(cache_flush_M1), 
         .write_data(cache_write_data_M1), .read_data(cache_read_data_M1), .rd_wr(MemRead_M1), 
@@ -977,13 +1003,13 @@ module riscv_core_scalar
 
     logic [XLEN-1:0] rs1_data_W, rd_data_W, mem_read_data_W;
     logic [2:0] rd_src_W;
-    logic [1:0] data_byte_W;
+    logic [ADDR_SHIFT-1:0] data_byte_W;
     logic syscall_W, illegal_instr_W, Mem2Reg_W;
     ldst_mode_t ldst_mode_W;
     register #(XLEN, '0) RS1_DATA_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rs1_data_M1), .Q(rs1_data_W));
     register #(XLEN, '0) RD_DATA_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rd_in_M1), .Q(rd_data_W));
     register #(5, 5'b0) RD_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rd_M1), .Q(rd_W));
-    register #(2, 2'b0) DATA_BYTE_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(data_byte_M1), .Q(data_byte_W));
+    register #(ADDR_SHIFT, '0) DATA_BYTE_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(data_byte_M1), .Q(data_byte_W));
     register #(1, 1'b0) MEM2REG_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(Mem2Reg_M1), .Q(Mem2Reg_W));
     register #(1, 1'b0) REGWRITE_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(RegWrite_M1), .Q(RegWrite_W));
     register #(1, 1'b0) SYSCALL_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(syscall_M1), .Q(syscall_W));
@@ -1442,69 +1468,51 @@ module alu_src2_sel_unit
 endmodule: alu_src2_sel_unit
 
 // The store unit for the RISC-V processor
+// XLEN-generic store formatter: place the size's low bytes of rs2 at the byte
+// offset within the (XLEN-byte) memory word, and build the byte-enable mask.
 module riscv_store_unit
+    import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
     (input  logic        memWrite,
      input  ldst_mode_t  ldst_mode,
-     input  logic [1:0]  data_byte,
-     input  logic [31:0]  rs2_data,
-     output logic [3:0]  data_store_mask,
-     output logic [31:0] data_store);
-    // pick correct part of rs2 for store instruction
+     input  logic [$clog2(XLEN_BYTES)-1:0] data_byte,
+     input  logic [XLEN-1:0] rs2_data,
+     output logic [XLEN_BYTES-1:0] data_store_mask,
+     output logic [XLEN-1:0] data_store);
+    logic [XLEN-1:0]       base_data;   // size's bytes in the low position
+    logic [XLEN_BYTES-1:0] base_mask;   // size's byte mask in the low position
     always_comb begin
       case(ldst_mode)
-        LDST_W: data_store = rs2_data;
-        LDST_H: data_store = data_byte[1] ? {rs2_data[15:0], 16'b0}
-                                          : rs2_data[15:0];
-        LDST_B:  case(data_byte)
-                  2'h0: data_store = rs2_data[7:0];
-                  2'h1: data_store = {rs2_data[7:0], 8'b0};
-                  2'h2: data_store = {rs2_data[7:0], 16'b0};
-                  2'h3: data_store = {rs2_data[7:0], 24'b0};
-                  default: data_store = 'x;
-        endcase
-        default: data_store = 'x;
+        LDST_B: begin base_data = {{(XLEN-8){1'b0}},  rs2_data[7:0]};  base_mask = XLEN_BYTES'('h1); end
+        LDST_H: begin base_data = {{(XLEN-16){1'b0}}, rs2_data[15:0]}; base_mask = XLEN_BYTES'('h3); end
+        LDST_W: begin base_data = {{(XLEN-32){1'b0}}, rs2_data[31:0]}; base_mask = XLEN_BYTES'('hF); end
+        LDST_D: begin base_data = rs2_data;                           base_mask = '1;              end
+        default:begin base_data = 'x;                                 base_mask = '0;              end
       endcase
     end
-    // select proper mask, make sure only to set mask when we want to write
-    always_comb begin
-      case(ldst_mode)
-        LDST_W: data_store_mask = {4{memWrite}};
-        LDST_H: data_store_mask = data_byte[1] ? {{2{memWrite}},2'b0} : 
-                                                 {2{memWrite}};
-        LDST_B: data_store_mask = memWrite<<data_byte;
-        default: data_store_mask = 'b0;
-      endcase
-    end
+    assign data_store      = base_data << {data_byte, 3'b0};
+    assign data_store_mask = memWrite ? (base_mask << data_byte) : '0;
 endmodule: riscv_store_unit
 
 
-// The load unit for the RISC-V processor
+// XLEN-generic load formatter: shift the target field to bit 0, then sign- or
+// zero-extend to XLEN per the size.
 module riscv_load_unit
-    (input  logic [31:0]    data_load,
-     input  logic [1:0]     data_byte,
+    import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
+    (input  logic [XLEN-1:0] data_load,
+     input  logic [$clog2(XLEN_BYTES)-1:0] data_byte,
      input  ldst_mode_t     ldst_mode,
-     output logic [31:0]    ld_out);
-    // correctly format load output
+     output logic [XLEN-1:0] ld_out);
+    logic [XLEN-1:0] shifted;
+    assign shifted = data_load >> {data_byte, 3'b0};
     always_comb begin
       case(ldst_mode)
-        LDST_W:  ld_out = data_load;
-        LDST_H:  ld_out = data_byte[1] ? {{16{data_load[31]}}, data_load[31:16]}
-                                       : {{16{data_load[15]}}, data_load[15:0]};
-        LDST_HU:  ld_out = data_byte[1] ? data_load[31:16] : data_load[15:0];
-        LDST_B:  case(data_byte)
-                  2'h0: ld_out = {{24{data_load[7]}}, data_load[7:0]};
-                  2'h1: ld_out = {{24{data_load[15]}}, data_load[15:8]};
-                  2'h2: ld_out = {{24{data_load[23]}}, data_load[23:16]};
-                  2'h3: ld_out = {{24{data_load[31]}}, data_load[31:24]};
-                  default: ld_out = 'x;
-        endcase
-        LDST_BU:  case(data_byte)
-                  2'h0: ld_out = data_load[7:0];
-                  2'h1: ld_out = data_load[15:8];
-                  2'h2: ld_out = data_load[23:16];
-                  2'h3: ld_out = data_load[31:24];
-                  default: ld_out = 'x;
-        endcase
+        LDST_B:  ld_out = {{(XLEN-8){shifted[7]}},   shifted[7:0]};
+        LDST_BU: ld_out = {{(XLEN-8){1'b0}},         shifted[7:0]};
+        LDST_H:  ld_out = {{(XLEN-16){shifted[15]}}, shifted[15:0]};
+        LDST_HU: ld_out = {{(XLEN-16){1'b0}},        shifted[15:0]};
+        LDST_W:  ld_out = {{(XLEN-32){shifted[31]}}, shifted[31:0]};
+        LDST_WU: ld_out = {{(XLEN-32){1'b0}},        shifted[31:0]};
+        LDST_D:  ld_out = data_load;
         default: ld_out = 'x;
       endcase
     end

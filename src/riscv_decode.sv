@@ -376,9 +376,19 @@ module riscv_decode
                         end
 
                         default: begin
+`ifdef RV64
+                            // RV64 LD (funct3 011) / LWU (funct3 110)
+                            if (instr[14:12] == 3'b011)
+                                ctrl_signals.ldst_mode = LDST_D;
+                            else if (instr[14:12] == 3'b110)
+                                ctrl_signals.ldst_mode = LDST_WU;
+                            else
+                                ctrl_signals.illegal_instr = 1'b1;
+`else
                             `display(rst_l, "Encountered unknown/unimplemented 3-bit itype load code 0x%01x.",
                                     itype_load_funct3);
                             ctrl_signals.illegal_instr = 1'b1;
+`endif
                         end
                     endcase
                 end
@@ -409,9 +419,17 @@ module riscv_decode
                         end
 
                         default: begin
+`ifdef RV64
+                            // RV64 SD (funct3 011)
+                            if (instr[14:12] == 3'b011)
+                                ctrl_signals.ldst_mode = LDST_D;
+                            else
+                                ctrl_signals.illegal_instr = 1'b1;
+`else
                             `display(rst_l, "Encountered unknown/unimplemented 3-bit stype store code 0x%01x.",
                                     stype_funct3);
                             ctrl_signals.illegal_instr = 1'b1;
+`endif
                         end
                     endcase
                 end
