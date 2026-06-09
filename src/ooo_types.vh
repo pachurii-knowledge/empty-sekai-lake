@@ -180,12 +180,14 @@ package OOO_Types;
 
     function automatic logic is_mul_op(input alu_op_t op);
         is_mul_op = (op == ALU_MUL) || (op == ALU_MULH) ||
-            (op == ALU_MULHSU) || (op == ALU_MULHU);
+            (op == ALU_MULHSU) || (op == ALU_MULHU) || (op == ALU_MULW);
     endfunction
 
     function automatic logic is_div_op(input alu_op_t op);
         is_div_op = (op == ALU_DIV) || (op == ALU_DIVU) ||
-            (op == ALU_REM) || (op == ALU_REMU);
+            (op == ALU_REM) || (op == ALU_REMU) ||
+            (op == ALU_DIVW) || (op == ALU_DIVUW) ||
+            (op == ALU_REMW) || (op == ALU_REMUW);
     endfunction
 
     function automatic fu_class_t fu_class_for(input ctrl_signals_t ctrl);

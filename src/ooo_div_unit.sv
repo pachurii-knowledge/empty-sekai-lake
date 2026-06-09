@@ -10,8 +10,8 @@ module ooo_div_unit
     input  logic              issue_valid,
     output logic              issue_ready,
     input  issue_entry_t      issue_entry,
-    input  logic [31:0]       rs1_data,
-    input  logic [31:0]       rs2_data,
+    input  logic [XLEN-1:0]   rs1_data,
+    input  logic [XLEN-1:0]   rs2_data,
     input  branch_mask_t      abort_mask,
     // Precise-trap full flush: abandon any in-flight division so no stale
     // writeback lands on a reused active-list id after the pipeline is reset.
@@ -19,6 +19,11 @@ module ooo_div_unit
     input  logic              writeback_ready,
     output writeback_packet_t writeback
 );
+
+    // Radix-16 restoring division: 4 quotient bits per cycle.
+    localparam int DIV_ITERS = XLEN / 4;
+    localparam int ITER_W = $clog2(DIV_ITERS);
+    localparam int REM_W = XLEN + 4;
 
     typedef enum logic [1:0] {
         DIV_IDLE,
@@ -28,18 +33,20 @@ module ooo_div_unit
 
     div_state_t state_q, state_next;
     writeback_packet_t packet_q, packet_next;
-    logic [31:0] dividend_q, dividend_next;
-    logic [31:0] divisor_q, divisor_next;
-    logic [31:0] quotient_q, quotient_next;
-    logic [35:0] remainder_q, remainder_next;
-    logic [2:0] iter_q, iter_next;
+    alu_op_t op_q, op_next;
+    logic [XLEN-1:0] dividend_q, dividend_next;
+    logic [XLEN-1:0] divisor_q, divisor_next;
+    logic [XLEN-1:0] quotient_q, quotient_next;
+    logic [REM_W-1:0] remainder_q, remainder_next;
+    logic [ITER_W-1:0] iter_q, iter_next;
     logic quotient_negative_q, quotient_negative_next;
     logic remainder_negative_q, remainder_negative_next;
     logic special_q, special_next;
-    logic [31:0] special_result_q, special_result_next;
+    logic [XLEN-1:0] special_result_q, special_result_next;
     logic [3:0] qdigit;
-    logic [35:0] trial_remainder;
+    logic [REM_W-1:0] trial_remainder;
     logic aborted;
+    logic [XLEN-1:0] eff_lhs, eff_rhs;
 
     assign aborted = packet_q.valid && ((packet_q.branch_mask & abort_mask) != '0);
     assign issue_ready = state_q == DIV_IDLE;
@@ -50,9 +57,28 @@ module ooo_div_unit
             !flush;
     end
 
+    // W-form ops divide the low 32 bits of the operands; sign-/zero-extend them
+    // to XLEN here so the full-width divider computes the correct 32-bit result
+    // (the INT32_MIN/-1 overflow then resolves naturally: 2^31 is positive at
+    // 64 bits, and the final sext32 of the quotient restores INT32_MIN).
+    always_comb begin
+        eff_lhs = rs1_data;
+        eff_rhs = rs2_data;
+        if (is_word_div(issue_entry.ctrl.alu_op)) begin
+            if (unsigned_div(issue_entry.ctrl.alu_op)) begin
+                eff_lhs = XLEN'(rs1_data[31:0]);
+                eff_rhs = XLEN'(rs2_data[31:0]);
+            end else begin
+                eff_lhs = XLEN'($signed(rs1_data[31:0]));
+                eff_rhs = XLEN'($signed(rs2_data[31:0]));
+            end
+        end
+    end
+
     always_comb begin
         state_next = state_q;
         packet_next = packet_q;
+        op_next = op_q;
         dividend_next = dividend_q;
         divisor_next = divisor_q;
         quotient_next = quotient_q;
@@ -63,7 +89,7 @@ module ooo_div_unit
         special_next = special_q;
         special_result_next = special_result_q;
         qdigit = 4'b0;
-        trial_remainder = 36'b0;
+        trial_remainder = '0;
 
         if (flush || aborted) begin
             state_next = DIV_IDLE;
@@ -74,39 +100,44 @@ module ooo_div_unit
                     if (issue_valid &&
                             ((issue_entry.branch_mask & abort_mask) == '0)) begin
                         packet_next = base_packet_for(issue_entry);
-                        dividend_next = abs_operand(rs1_data, signed_lhs(issue_entry.ctrl.alu_op));
-                        divisor_next = abs_operand(rs2_data, signed_rhs(issue_entry.ctrl.alu_op));
-                        quotient_next = 32'b0;
-                        remainder_next = 36'b0;
-                        iter_next = 3'b0;
+                        op_next = issue_entry.ctrl.alu_op;
+                        dividend_next = abs_operand(eff_lhs,
+                            signed_div(issue_entry.ctrl.alu_op));
+                        divisor_next = abs_operand(eff_rhs,
+                            signed_div(issue_entry.ctrl.alu_op));
+                        quotient_next = '0;
+                        remainder_next = '0;
+                        iter_next = '0;
                         quotient_negative_next =
-                            signed_lhs(issue_entry.ctrl.alu_op) &&
-                            signed_rhs(issue_entry.ctrl.alu_op) &&
-                            (rs1_data[31] ^ rs2_data[31]);
+                            signed_div(issue_entry.ctrl.alu_op) &&
+                            (eff_lhs[XLEN-1] ^ eff_rhs[XLEN-1]);
                         remainder_negative_next =
-                            signed_lhs(issue_entry.ctrl.alu_op) && rs1_data[31];
+                            signed_div(issue_entry.ctrl.alu_op) && eff_lhs[XLEN-1];
                         special_next = special_case(issue_entry.ctrl.alu_op,
-                            rs1_data, rs2_data, special_result_next);
+                            eff_lhs, eff_rhs, special_result_next);
                         state_next = DIV_RUN;
                     end
                 end
                 DIV_RUN: begin
                     if (special_q) begin
-                        packet_next.data = special_result_q;
+                        packet_next.data = word_result(op_q, special_result_q);
                         state_next = DIV_DONE;
                     end else begin
-                        trial_remainder = {remainder_q[31:0], dividend_q[31:28]};
+                        trial_remainder = {remainder_q[XLEN-1:0],
+                            dividend_q[XLEN-1:XLEN-4]};
                         qdigit = select_qdigit(trial_remainder, divisor_q);
                         remainder_next = trial_remainder -
-                            (36'(divisor_q) * 36'(qdigit));
-                        quotient_next = {quotient_q[27:0], qdigit};
-                        dividend_next = {dividend_q[27:0], 4'b0};
-                        iter_next = iter_q + 3'd1;
-                        if (iter_q == 3'd7) begin
-                            packet_next.data = final_result(packet_q.instr,
-                                {quotient_q[27:0], qdigit},
-                                trial_remainder - (36'(divisor_q) * 36'(qdigit)),
-                                quotient_negative_q, remainder_negative_q);
+                            (REM_W'(divisor_q) * REM_W'(qdigit));
+                        quotient_next = {quotient_q[XLEN-5:0], qdigit};
+                        dividend_next = {dividend_q[XLEN-5:0], 4'b0};
+                        iter_next = iter_q + 1'b1;
+                        if (iter_q == ITER_W'(DIV_ITERS - 1)) begin
+                            packet_next.data = word_result(op_q,
+                                final_result(op_q,
+                                    {quotient_q[XLEN-5:0], qdigit},
+                                    trial_remainder -
+                                        (REM_W'(divisor_q) * REM_W'(qdigit)),
+                                    quotient_negative_q, remainder_negative_q));
                             state_next = DIV_DONE;
                         end
                     end
@@ -129,6 +160,7 @@ module ooo_div_unit
         if (!rst_l) begin
             state_q <= DIV_IDLE;
             packet_q <= '0;
+            op_q <= ALU_DIV;
             dividend_q <= '0;
             divisor_q <= '0;
             quotient_q <= '0;
@@ -141,6 +173,7 @@ module ooo_div_unit
         end else begin
             state_q <= state_next;
             packet_q <= packet_next;
+            op_q <= op_next;
             dividend_q <= dividend_next;
             divisor_q <= divisor_next;
             quotient_q <= quotient_next;
@@ -166,73 +199,78 @@ module ooo_div_unit
         return packet;
     endfunction
 
-    function automatic logic signed_lhs(input alu_op_t op);
-        signed_lhs = (op == ALU_DIV) || (op == ALU_REM);
+    function automatic logic is_word_div(input alu_op_t op);
+        is_word_div = (op == ALU_DIVW) || (op == ALU_DIVUW) ||
+            (op == ALU_REMW) || (op == ALU_REMUW);
     endfunction
 
-    function automatic logic signed_rhs(input alu_op_t op);
-        signed_rhs = (op == ALU_DIV) || (op == ALU_REM);
+    function automatic logic unsigned_div(input alu_op_t op);
+        unsigned_div = (op == ALU_DIVU) || (op == ALU_REMU) ||
+            (op == ALU_DIVUW) || (op == ALU_REMUW);
     endfunction
 
-    function automatic logic [31:0] abs_operand(input logic [31:0] value,
+    function automatic logic signed_div(input alu_op_t op);
+        signed_div = !unsigned_div(op);
+    endfunction
+
+    function automatic logic is_rem_op(input alu_op_t op);
+        is_rem_op = (op == ALU_REM) || (op == ALU_REMU) ||
+            (op == ALU_REMW) || (op == ALU_REMUW);
+    endfunction
+
+    // W-form results are the low 32 bits sign-extended to XLEN.
+    function automatic logic [XLEN-1:0] word_result(input alu_op_t op,
+            input logic [XLEN-1:0] value);
+        word_result = is_word_div(op) ? XLEN'($signed(value[31:0])) : value;
+    endfunction
+
+    function automatic logic [XLEN-1:0] abs_operand(input logic [XLEN-1:0] value,
             input logic is_signed);
-        abs_operand = (is_signed && value[31]) ? (~value + 32'd1) : value;
+        abs_operand = (is_signed && value[XLEN-1]) ? (~value + 1'b1) : value;
     endfunction
 
     function automatic logic special_case(input alu_op_t op,
-            input logic [31:0] lhs, input logic [31:0] rhs,
-            output logic [31:0] result);
+            input logic [XLEN-1:0] lhs, input logic [XLEN-1:0] rhs,
+            output logic [XLEN-1:0] result);
         special_case = 1'b0;
-        result = 32'b0;
-        if (rhs == 32'b0) begin
+        result = '0;
+        if (rhs == '0) begin
             special_case = 1'b1;
-            if ((op == ALU_REM) || (op == ALU_REMU)) begin
+            if (is_rem_op(op)) begin
                 result = lhs;
             end else begin
-                result = 32'hffff_ffff;
+                result = '1;
             end
-        end else if (((op == ALU_DIV) || (op == ALU_REM)) &&
-                (lhs == 32'h8000_0000) && (rhs == 32'hffff_ffff)) begin
+        end else if (signed_div(op) && !is_word_div(op) &&
+                (lhs == {1'b1, {(XLEN-1){1'b0}}}) && (rhs == '1)) begin
+            // INT_MIN / -1 overflow (full-width ops only; W-form operands are
+            // 32-bit values extended to XLEN and resolve through the divider).
             special_case = 1'b1;
-            result = (op == ALU_DIV) ? 32'h8000_0000 : 32'b0;
+            result = is_rem_op(op) ? '0 : {1'b1, {(XLEN-1){1'b0}}};
         end
     endfunction
 
-    function automatic logic [3:0] select_qdigit(input logic [35:0] remainder,
-            input logic [31:0] divisor);
-        logic [35:0] divisor_ext;
+    function automatic logic [3:0] select_qdigit(input logic [REM_W-1:0] remainder,
+            input logic [XLEN-1:0] divisor);
+        logic [REM_W-1:0] divisor_ext;
         select_qdigit = 4'd0;
-        divisor_ext = 36'(divisor);
+        divisor_ext = REM_W'(divisor);
         for (int i = 0; i < 16; i += 1) begin
-            if ((divisor_ext * 36'(i)) <= remainder) begin
+            if ((divisor_ext * REM_W'(i)) <= remainder) begin
                 select_qdigit = 4'(i);
             end
         end
     endfunction
 
-    function automatic logic [31:0] final_result(input logic [31:0] instr,
-            input logic [31:0] quotient, input logic [35:0] remainder,
+    function automatic logic [XLEN-1:0] final_result(input alu_op_t op,
+            input logic [XLEN-1:0] quotient, input logic [REM_W-1:0] remainder,
             input logic quotient_negative, input logic remainder_negative);
-        alu_op_t op;
-        logic [31:0] signed_quotient;
-        logic [31:0] signed_remainder;
-        op = alu_op_t'(instr_to_alu_op(instr));
-        signed_quotient = quotient_negative ? (~quotient + 32'd1) : quotient;
-        signed_remainder = remainder_negative ? (~remainder[31:0] + 32'd1) :
-            remainder[31:0];
-        unique case (op)
-            ALU_DIV, ALU_DIVU: final_result = signed_quotient;
-            default: final_result = signed_remainder;
-        endcase
-    endfunction
-
-    function automatic alu_op_t instr_to_alu_op(input logic [31:0] instr);
-        unique case (instr[14:12])
-            3'b100: instr_to_alu_op = ALU_DIV;
-            3'b101: instr_to_alu_op = ALU_DIVU;
-            3'b110: instr_to_alu_op = ALU_REM;
-            default: instr_to_alu_op = ALU_REMU;
-        endcase
+        logic [XLEN-1:0] signed_quotient;
+        logic [XLEN-1:0] signed_remainder;
+        signed_quotient = quotient_negative ? (~quotient + 1'b1) : quotient;
+        signed_remainder = remainder_negative ?
+            (~remainder[XLEN-1:0] + 1'b1) : remainder[XLEN-1:0];
+        final_result = is_rem_op(op) ? signed_remainder : signed_quotient;
     endfunction
 
 endmodule: ooo_div_unit

@@ -621,9 +621,13 @@ module riscv_decode
                         5'b11100: ctrl_signals.amo_op = AMO_MAXU;
                         default: ctrl_signals.illegal_instr = 1'b1;
                     endcase
-                    if (instr[14:12] != 3'b010) begin
-                        ctrl_signals.illegal_instr = 1'b1;
-                    end
+                    unique case (instr[14:12])
+                        3'b010: ctrl_signals.ldst_mode = LDST_W;
+`ifdef RV64
+                        3'b011: ctrl_signals.ldst_mode = LDST_D; // .D variants
+`endif
+                        default: ctrl_signals.illegal_instr = 1'b1;
+                    endcase
                     ctrl_signals.memRead = ctrl_signals.amo_op != AMO_SC;
                     ctrl_signals.memWrite = ctrl_signals.amo_op != AMO_LR;
                 end
@@ -821,14 +825,25 @@ module riscv_decode
                         ctrl_signals.rfWrite   = 1'b1;
                         ctrl_signals.pc_source = PC_plus4;
                         ctrl_signals.rd_source = RD_ALU;
-                        unique case (instr[14:12])
-                            3'b000: ctrl_signals.alu_op = instr[30] ? ALU_SUBW // SUBW
-                                                                    : ALU_ADDW;// ADDW
-                            3'b001: ctrl_signals.alu_op = ALU_SLLW;            // SLLW
-                            3'b101: ctrl_signals.alu_op = instr[30] ? ALU_SRAW // SRAW
-                                                                    : ALU_SRLW;// SRLW
-                            default: ctrl_signals.illegal_instr = 1'b1;
-                        endcase
+                        if (instr[31:25] == 7'b0000001) begin // RV64M W-forms
+                            unique case (instr[14:12])
+                                3'b000: ctrl_signals.alu_op = ALU_MULW;
+                                3'b100: ctrl_signals.alu_op = ALU_DIVW;
+                                3'b101: ctrl_signals.alu_op = ALU_DIVUW;
+                                3'b110: ctrl_signals.alu_op = ALU_REMW;
+                                3'b111: ctrl_signals.alu_op = ALU_REMUW;
+                                default: ctrl_signals.illegal_instr = 1'b1;
+                            endcase
+                        end else begin
+                            unique case (instr[14:12])
+                                3'b000: ctrl_signals.alu_op = instr[30] ? ALU_SUBW // SUBW
+                                                                        : ALU_ADDW;// ADDW
+                                3'b001: ctrl_signals.alu_op = ALU_SLLW;            // SLLW
+                                3'b101: ctrl_signals.alu_op = instr[30] ? ALU_SRAW // SRAW
+                                                                        : ALU_SRLW;// SRLW
+                                default: ctrl_signals.illegal_instr = 1'b1;
+                            endcase
+                        end
                     end else begin
                         `display(rst_l & (instr != 'h0), "Encountered unknown/unimplemented opcode 0x%02x.", opcode);
                         ctrl_signals.illegal_instr = 1'b1;

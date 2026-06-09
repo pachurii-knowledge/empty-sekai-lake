@@ -28,7 +28,7 @@ typedef enum logic [2:0] {
 } imm_mode_t;
 
 // Constants that specify which operation the ALU should perform
-typedef enum logic [4:0] {
+typedef enum logic [5:0] {
     ALU_ADD,                // Addition operation
     ALU_SUB,                // Subtraction/Compare operation
     ALU_XOR,                // XOR operation
@@ -59,7 +59,12 @@ typedef enum logic [4:0] {
     ALU_SLLW,
     ALU_SRLW,
     ALU_SRAW,
-    ALU_DC = 5'bxxxxx       // Don't care value
+    ALU_MULW,               // RV64M: low 32 bits of the product, sign-extended
+    ALU_DIVW,               // RV64M: 32-bit signed divide, sign-extended
+    ALU_DIVUW,              // RV64M: 32-bit unsigned divide, sign-extended
+    ALU_REMW,               // RV64M: 32-bit signed remainder, sign-extended
+    ALU_REMUW,              // RV64M: 32-bit unsigned remainder, sign-extended
+    ALU_DC = 6'bxxxxxx      // Don't care value
 } alu_op_t;
 
 // Load/store partial word mode

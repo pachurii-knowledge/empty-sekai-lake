@@ -95,6 +95,10 @@ module load_store_queue
     logic head_match, head_xlate_ok, head_xlate_flt;
     logic reservation_valid_q, reservation_valid_next;
     logic [XLEN-1:0] reservation_addr_q, reservation_addr_next;
+    // Unused high-word outputs of the AMO result repositioning (atomics are
+    // aligned, so they never split across memory words).
+    logic [XLEN-1:0] amo_split_hi_data;
+    logic [XLEN_BYTES-1:0] amo_split_hi_mask;
     logic double_store_pending_q, double_store_pending_next;
     logic [MEMORY_ADDR_WIDTH-1:0] double_store_addr_q, double_store_addr_next;
     logic [XLEN-1:0] double_store_data_q, double_store_data_next;
@@ -264,7 +268,9 @@ module load_store_queue
                 (entries_next[head_next].entry.ctrl.exec_class == EXEC_AMO) &&
                 entries_next[head_next].entry.src1_ready &&
                 !entries_next[head_next].issued_load &&
-                (entries_next[head_next].addr[1:0] != 2'b00)) begin
+                ((entries_next[head_next].addr[1:0] != 2'b00) ||
+                 ((entries_next[head_next].entry.ctrl.ldst_mode == LDST_D) &&
+                  entries_next[head_next].addr[2]))) begin
             load_writeback.valid = 1'b1;
             load_writeback.active_id = entries_next[head_next].entry.active_id;
             load_writeback.prd = entries_next[head_next].entry.prd;
@@ -365,7 +371,12 @@ module load_store_queue
             load_writeback.has_dest = entries_next[head_next].entry.has_dest;
             load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
             if (entries_next[head_next].entry.ctrl.exec_class == EXEC_AMO) begin
-                load_writeback.data = data_load;
+                // rd gets the old memory value at the access width (an AMO.W on
+                // RV64 sign-extends bit 31, and may sit at offset 4 of the
+                // 8-byte memory word).
+                load_writeback.data = format_load(data_load,
+                    entries_next[head_next].addr[ADDR_SHIFT-1:0],
+                    entries_next[head_next].entry.ctrl.ldst_mode);
                 if (entries_next[head_next].entry.ctrl.amo_op == AMO_LR) begin
                     reservation_valid_next = 1'b1;
                     reservation_addr_next = entries_next[head_next].addr;
@@ -373,10 +384,20 @@ module load_store_queue
                     head_next = head_next + 1'b1;
                     count_next -= 1'b1;
                 end else begin
-                    entries_next[head_next].store_data = amo_result(
-                        entries_next[head_next].entry.ctrl.amo_op,
-                        data_load, entries_next[head_next].store_data);
-                    entries_next[head_next].store_mask = 4'b1111;
+                    // Compute on the raw (unshifted) operands at the access
+                    // width, then position the result back into its memory
+                    // word with the matching byte-enable mask.
+                    format_store_split(
+                        entries_next[head_next].entry.ctrl.ldst_mode,
+                        entries_next[head_next].addr[ADDR_SHIFT-1:0],
+                        amo_result(entries_next[head_next].entry.ctrl.amo_op,
+                            load_writeback.data,
+                            entries_next[head_next].store_raw,
+                            entries_next[head_next].entry.ctrl.ldst_mode != LDST_D),
+                        entries_next[head_next].store_data,
+                        entries_next[head_next].store_mask,
+                        amo_split_hi_data,
+                        amo_split_hi_mask);
                     entries_next[head_next].load_complete = 1'b1;
                 end
             end else begin
@@ -644,21 +665,35 @@ module load_store_queue
         endcase
     endfunction
 
+    // word_op: a 32-bit AMO (AMO*.W) — compute on the low 32 bits of the
+    // operands. Sign- or zero-extending both to XLEN first makes the XLEN-wide
+    // compare/arithmetic produce the correct 32-bit result in the low bits
+    // (only the low 32 are stored back). Identity at XLEN=32.
     function automatic logic [XLEN-1:0] amo_result(input amo_op_t op,
-            input logic [XLEN-1:0] old_value, input logic [XLEN-1:0] operand);
+            input logic [XLEN-1:0] old_value, input logic [XLEN-1:0] operand,
+            input logic word_op);
+        logic [XLEN-1:0] a, b;
+        if (word_op && ((op == AMO_MINU) || (op == AMO_MAXU))) begin
+            a = XLEN'(old_value[31:0]);
+            b = XLEN'(operand[31:0]);
+        end else if (word_op) begin
+            a = XLEN'($signed(old_value[31:0]));
+            b = XLEN'($signed(operand[31:0]));
+        end else begin
+            a = old_value;
+            b = operand;
+        end
         unique case (op)
-            AMO_SWAP: amo_result = operand;
-            AMO_ADD:  amo_result = old_value + operand;
-            AMO_XOR:  amo_result = old_value ^ operand;
-            AMO_AND:  amo_result = old_value & operand;
-            AMO_OR:   amo_result = old_value | operand;
-            AMO_MIN:  amo_result = (signed'(old_value) < signed'(operand)) ?
-                old_value : operand;
-            AMO_MAX:  amo_result = (signed'(old_value) > signed'(operand)) ?
-                old_value : operand;
-            AMO_MINU: amo_result = (old_value < operand) ? old_value : operand;
-            AMO_MAXU: amo_result = (old_value > operand) ? old_value : operand;
-            default:  amo_result = old_value;
+            AMO_SWAP: amo_result = b;
+            AMO_ADD:  amo_result = a + b;
+            AMO_XOR:  amo_result = a ^ b;
+            AMO_AND:  amo_result = a & b;
+            AMO_OR:   amo_result = a | b;
+            AMO_MIN:  amo_result = (signed'(a) < signed'(b)) ? a : b;
+            AMO_MAX:  amo_result = (signed'(a) > signed'(b)) ? a : b;
+            AMO_MINU: amo_result = (a < b) ? a : b;
+            AMO_MAXU: amo_result = (a > b) ? a : b;
+            default:  amo_result = a;
         endcase
     endfunction
 
