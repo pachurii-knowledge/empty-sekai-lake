@@ -6,7 +6,8 @@
     #    -> machine-external interrupt. The handler claims (must read 10), clears
     #    the source by disabling IER, completes, and the interrupt does not refire.
     #
-    # UART base 0x0D000000:  THR @ +0, IER @ +1, LCR @ +3, LSR @ +5
+    # UART base 0x0D000000 (reg-shift=2, one register per word):
+    #   THR @ +0x0, IER @ +0x4, IIR @ +0x8, LCR @ +0xC, LSR @ +0x14
     # PLIC base 0x0C000000:  priority[10] @ +0x28, pending @ +0x1000,
     #   enable[ctx0] @ +0x2000, threshold[ctx0] @ +0x200000, claim @ +0x200004
     #
@@ -49,7 +50,7 @@ main:
     PUTC '\n'
 
     # ---- 2. LSR readiness ----
-    lbu     t1, 5(s0)               # LSR
+    lbu     t1, 0x14(s0)            # LSR (reg-shift=2)
     li      t2, 0x60
     bne     t1, t2, fail_lsr
 
@@ -67,7 +68,7 @@ main:
     csrsi   mstatus, 0x8            # MIE
 
     li      t1, 0x02
-    sb      t1, 1(s0)               # IER bit1 = THR-empty int -> uart_irq high
+    sb      t1, 4(s0)               # IER bit1 = THR-empty int -> uart_irq high
 
     li      t3, 1000
 3:  addi    t3, t3, -1              # spin; the interrupt should preempt us
@@ -100,7 +101,7 @@ handler:
     li      t4, 10
     bne     t3, t4, claim_bad
 
-    sb      x0, 1(s0)               # IER = 0 -> clear uart_irq (source deasserts)
+    sb      x0, 4(s0)               # IER = 0 -> clear uart_irq (source deasserts)
     sw      t3, 0(t2)               # complete source 10
     addi    s1, s1, 1
     li      t5, 2

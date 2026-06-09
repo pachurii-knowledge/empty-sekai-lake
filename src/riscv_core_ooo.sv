@@ -507,6 +507,7 @@ module riscv_core_ooo (
         .store_wdata(data_store),
         .store_mask(data_store_mask),
         .load_addr(data_load_addr),
+        .load_en(data_load_valid),
         .load_hit(uart_load_hit),
         .load_data(uart_load_data),
         .irq(uart_irq)

@@ -138,6 +138,10 @@ def build_dtb() -> bytes:
     w.begin_node("serial@d000000")
     w.prop_str("compatible", "ns16550a")
     w.prop_u32("reg", 0x0D00_0000, 0x0000_0100)
+    # One register per 32-bit word (reg-shift=2) accessed as 32-bit words
+    # (reg-io-width=4) -- matches src/uart.sv and the word-addressed device bus.
+    w.prop_u32("reg-shift", 2)
+    w.prop_u32("reg-io-width", 4)
     w.prop_u32("clock-frequency", 10_000_000)
     w.prop_u32("interrupt-parent", 2)
     w.prop_u32("interrupts", 10)
