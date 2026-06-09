@@ -322,21 +322,14 @@ module riscv_decode
                         end
 
                         FUNCT3_SRLI_SRAI: begin
-                            unique case (funct7)
-                                FUNCT7_INT: begin
-                                    ctrl_signals.rd_source = RD_ALU;
-                                    ctrl_signals.alu_op = ALU_SRL;
-                                end
-                                FUNCT7_ALT_INT: begin
-                                    ctrl_signals.rd_source = RD_ALU;
-                                    ctrl_signals.alu_op = ALU_SRA;
-                                end
-                                default: begin
-                                    `display(rst_l, "Encountered unknown/unimplemented 7-bit function code 0x%02x.",
-                                            funct7);
-                                    ctrl_signals.illegal_instr = 1'b1;
-                                end
-                            endcase
+                            // Discriminate SRLI vs SRAI by instr[30] (the
+                            // "arithmetic" bit), NOT the full funct7: in RV64 the
+                            // shamt is 6 bits (instr[25:20]), so instr[25] is a
+                            // shamt bit and would corrupt a funct7 match for any
+                            // shamt >= 32. instr[30] is the discriminator in the
+                            // funct7 (RV32) and funct6 (RV64) encodings alike.
+                            ctrl_signals.rd_source = RD_ALU;
+                            ctrl_signals.alu_op = instr[30] ? ALU_SRA : ALU_SRL;
                         end
 
                         default: begin

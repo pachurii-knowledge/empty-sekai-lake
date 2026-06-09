@@ -88,22 +88,29 @@
  *  - data_stall        stall data load from memory if multicycle.
  *  - data_store        The data to store to the data_addr address in memory.
  **/
-module riscv_core_scalar (
+module riscv_core_scalar
+    import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
+    import RISCV_UArch::MEMORY_ADDR_WIDTH, RISCV_UArch::MEMORY_READ_WIDTH;
+(
     input  logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
-    input  logic [3:0][31:0] instr, data_load,
-    input  logic [29:0]      data_load_addr,
+    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr, data_load,
+    input  logic [MEMORY_ADDR_WIDTH-1:0]           data_load_addr,
     input  logic             data_load_valid,
     output logic             data_load_en, halted,
-    output logic [ 3:0]      data_store_mask,
-    output logic [29:0]      instr_addr, data_addr,
+    output logic [XLEN_BYTES-1:0]        data_store_mask,
+    output logic [MEMORY_ADDR_WIDTH-1:0] instr_addr, data_addr,
     output logic             instr_stall, data_stall,
-    output logic [31:0]      data_store,
+    output logic [XLEN-1:0]  data_store,
     // MMU page-table-walk port
-    output logic [29:0]      ptw_addr,
+    output logic [MEMORY_ADDR_WIDTH-1:0] ptw_addr,
     output logic             ptw_we,
-    output logic [31:0]      ptw_wdata,
-    input  logic [31:0]      ptw_rdata
+    output logic [XLEN-1:0]  ptw_wdata,
+    input  logic [XLEN-1:0]  ptw_rdata
 );
+
+    // Byte-address -> word-address shift for the word-granular memory bus
+    // (2 for RV32's 4-byte words, 3 for RV64's 8-byte words).
+    localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
 
     assign data_stall = 1'b0;
 
@@ -121,19 +128,19 @@ module riscv_core_scalar (
     // flush signal from EX stage
     logic flush_E;
     // Manage the value of the PC, don't increment if the processor is halted
-    logic [31:0]    pc_F1, npc_plus4_F1, npc_offset_M1, next_pc_F1, branch_target_D, branch_target_E;
+    logic [XLEN-1:0] pc_F1, npc_plus4_F1, npc_offset_M1, next_pc_F1, branch_target_D, branch_target_E;
     logic 	        branch_taken_D;
     logic PCSrc_M1;
     assign instr_stall = (~rst_l) || mem_stall;
 
 
-    adder #(32) Next_PC_Adder(.A(pc_F1), .B('d4), .cin(1'b0),
+    adder #(XLEN) Next_PC_Adder(.A(pc_F1), .B('d4), .cin(1'b0),
             .sum(npc_plus4_F1), .cout());
 
-    register #(32, USER_TEXT_START) PC_Register(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(next_pc_F1),
+    register #(XLEN, USER_TEXT_START) PC_Register(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(next_pc_F1),
             .Q(pc_F1));
     // Fetch address is translated by the MMU (identity when paging is off).
-    assign instr_addr       = phys_pc[31:2];
+    assign instr_addr       = phys_pc[XLEN-1:ADDR_SHIFT];
 
     //===============================BP IF Logic =========================//
 
@@ -144,7 +151,7 @@ module riscv_core_scalar (
     logic [61:0] BTB_write_data, BTB_read_data;
     logic [6:0] BTB_read_addr, BTB_write_addr;
     logic [1:0] BTB_history_E;
-    logic [31:0] npc_plus4_E; 
+    logic [XLEN-1:0] npc_plus4_E;
     logic incorrect_addr_F1;
 
 
@@ -175,14 +182,14 @@ module riscv_core_scalar (
 
     // Privileged trap/return redirect (computed in the EX-stage trap block).
     logic        trap_redirect_E;
-    logic [31:0] trap_target_pc;
+    logic [XLEN-1:0] trap_target_pc;
 
     always_comb begin
       next_pc_F1 = npc_plus4_F1;
       if (trap_redirect_E) begin
         next_pc_F1 = trap_target_pc;
       end else if (flush_E) begin
-        next_pc_F1 = {branch_target_E[31:1], 1'b0};
+        next_pc_F1 = {branch_target_E[XLEN-1:1], 1'b0};
       end
     end
 
@@ -199,39 +206,48 @@ module riscv_core_scalar (
 
 
     //===============================IF1/IF2 Pipeline Registers=========================//
-    logic [31:0] pc_F2, npc_plus4_F2, next_pc_F2;
+    logic [XLEN-1:0] pc_F2, npc_plus4_F2, next_pc_F2;
     logic [1:0] BTB_history_F2;
 
-    register #(32, USER_TEXT_START) NPC_PLUS4_IF1_IF2_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~mem_stall), .clear(1'b0), .D(npc_plus4_F1), .Q(npc_plus4_F2));
-    register #(32, USER_TEXT_START) BTB_HIS_IF1_IF2_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~mem_stall), .clear(1'b0), .D(BTB_history_F1), .Q(BTB_history_F2));
+    register #(XLEN, USER_TEXT_START) NPC_PLUS4_IF1_IF2_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~mem_stall), .clear(1'b0), .D(npc_plus4_F1), .Q(npc_plus4_F2));
+    register #(2, 2'b0) BTB_HIS_IF1_IF2_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~mem_stall), .clear(1'b0), .D(BTB_history_F1), .Q(BTB_history_F2));
 
-    register #(32, USER_TEXT_START) PC_IF1_IF2_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(pc_F1),
+    register #(XLEN, USER_TEXT_START) PC_IF1_IF2_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(pc_F1),
             .Q(pc_F2));
 
-    register #(32, USER_TEXT_START) NXT_PC_IF1_IF2_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(next_pc_F1),
+    register #(XLEN, USER_TEXT_START) NXT_PC_IF1_IF2_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(next_pc_F1),
             .Q(next_pc_F2));
 
     
     //===============================IF2/ID Pipeline Registers=========================//
 
-    logic [31:0] instr_D, pc_D, next_pc_D;
+    logic [31:0] instr_D;
+    logic [XLEN-1:0] pc_D, next_pc_D;
     logic [1:0]  BTB_history_D;
-    logic [31:0] npc_plus4_D;
-    register #(32, USER_TEXT_START) PC_IF2_ID_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(pc_F2), .Q(pc_D));
-    register #(32, USER_TEXT_START) BTB_HIS_IF2_ID_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~mem_stall), .clear(1'b0), .D(BTB_history_F2), .Q(BTB_history_D));
-    register #(32, USER_TEXT_START) NXT_PC_IF2_D_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(next_pc_F2), .Q(next_pc_D));
-    register #(32, USER_TEXT_START) NPC_PLUS4_IF2_D_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~mem_stall), .clear(1'b0), .D(npc_plus4_F2), .Q(npc_plus4_D));
+    logic [XLEN-1:0] npc_plus4_D;
+    register #(XLEN, USER_TEXT_START) PC_IF2_ID_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(pc_F2), .Q(pc_D));
+    register #(2, 2'b0) BTB_HIS_IF2_ID_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~mem_stall), .clear(1'b0), .D(BTB_history_F2), .Q(BTB_history_D));
+    register #(XLEN, USER_TEXT_START) NXT_PC_IF2_D_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(next_pc_F2), .Q(next_pc_D));
+    register #(XLEN, USER_TEXT_START) NPC_PLUS4_IF2_D_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~mem_stall), .clear(1'b0), .D(npc_plus4_F2), .Q(npc_plus4_D));
 
     //===============================ID start=========================//
-    // Decode the instruction and generate the control signals
-    assign instr_D = instr[0];
+    // Decode the instruction and generate the control signals.
+    // RV64 packs two 32-bit instructions per 64-bit memory word; select the
+    // half the (word-aligned) fetch PC points at. RV32: the word is the instr.
+    logic [XLEN-1:0] fetch_word_D;
+    assign fetch_word_D = instr[0];
+`ifdef RV64
+    assign instr_D = pc_D[2] ? fetch_word_D[63:32] : fetch_word_D[31:0];
+`else
+    assign instr_D = fetch_word_D[31:0];
+`endif
     ctrl_signals_t ctrl_signals_D;
     logic en;
     riscv_decode Decoder(.rst_l(rst_l), .instr(instr_D), .ctrl_signals(ctrl_signals_D));
     logic x10_halt;
 
     logic [4:0]     rs1_D, rs2_D, rd_D, rd_W;
-    logic [31:0]    rs1_data_D, rs2_data_D, boffset_D, rd_in_W, se_immediate_D;
+    logic [XLEN-1:0] rs1_data_D, rs2_data_D, boffset_D, rd_in_W, se_immediate_D;
     logic [6:0]     opcode_D;
     logic RegWrite_W, rs1_use_D, rs2_use_D;
     assign  rs1_D = ctrl_signals_D.syscall ? X10 :instr_D[19:15];
@@ -244,11 +260,11 @@ module riscv_core_scalar (
     assign  rs2_use_D = opcode_D == OP_OP || opcode_D == OP_STORE || opcode_D == OP_BRANCH;
     always_comb begin
       case(ctrl_signals_D.imm_mode)
-        IMM_I: se_immediate_D = {{21{instr_D[31]}}, instr_D[30:20]};
-        IMM_S: se_immediate_D = {{20{instr_D[31]}}, instr_D[31:25], instr_D[11:7]};
-        IMM_U: se_immediate_D = {instr_D[31:12], 12'b0};
-        IMM_UJ: se_immediate_D = {{13{instr_D[31]}},instr_D[19:12],instr_D[20],instr_D[30:21],1'b0};
-        IMM_SB: se_immediate_D = {{20{instr_D[31]}},instr_D[7],instr_D[30:25],instr_D[11:8],1'b0};
+        IMM_I: se_immediate_D = {{(XLEN-11){instr_D[31]}}, instr_D[30:20]};
+        IMM_S: se_immediate_D = {{(XLEN-12){instr_D[31]}}, instr_D[31:25], instr_D[11:7]};
+        IMM_U: se_immediate_D = {{(XLEN-32){instr_D[31]}}, instr_D[31:12], 12'b0};
+        IMM_UJ: se_immediate_D = {{(XLEN-20){instr_D[31]}},instr_D[19:12],instr_D[20],instr_D[30:21],1'b0};
+        IMM_SB: se_immediate_D = {{(XLEN-12){instr_D[31]}},instr_D[7],instr_D[30:25],instr_D[11:8],1'b0};
         default: se_immediate_D = 'x;
       endcase
     end
@@ -256,20 +272,20 @@ module riscv_core_scalar (
             .rs1(rs1_D), .rs2(rs2_D), .rd(rd_W), .rd_data(rd_in_W), .rs1_data(rs1_data_D), .rs2_data(rs2_data_D));
 
     //===============================ID/EX Pipeline Registers=========================//
-    logic [31:0] pc_E, next_pc_E;
+    logic [XLEN-1:0] pc_E, next_pc_E;
     logic RegWrite_E;
     assign RegWrite_E = ctrl_signals_E.rfWrite;
-    logic [31:0] rs1_data_E, rs2_data_E, se_immediate_E, boffset_E;
+    logic [XLEN-1:0] rs1_data_E, rs2_data_E, se_immediate_E, boffset_E;
     logic [6:0] opcode_E;
     logic [4:0] rd_E, rs1_E, rs2_E;
     logic rs1_use_E, rs2_use_E, flush_M1, flush_W;
     ctrl_signals_t ctrl_signals_E;
     
-    register #(32, USER_TEXT_START) PC_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(pc_D), .Q(pc_E));
-    register #(32, 32'b0) RS1_DATA_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(rs1_data_D), .Q(rs1_data_E));
-    register #(32, 32'b0) RS2_DATA_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(rs2_data_D), .Q(rs2_data_E));
-    register #(32, 32'b0) SE_IMM_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(se_immediate_D), .Q(se_immediate_E));
-    register #(32, 32'b0) BOFFSET_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(boffset_D), .Q(boffset_E));
+    register #(XLEN, USER_TEXT_START) PC_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(pc_D), .Q(pc_E));
+    register #(XLEN, '0) RS1_DATA_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(rs1_data_D), .Q(rs1_data_E));
+    register #(XLEN, '0) RS2_DATA_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(rs2_data_D), .Q(rs2_data_E));
+    register #(XLEN, '0) SE_IMM_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(se_immediate_D), .Q(se_immediate_E));
+    register #(XLEN, '0) BOFFSET_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(boffset_D), .Q(boffset_E));
     register #(5, 5'b0) RD_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(rd_D), .Q(rd_E));
     register #($bits(ctrl_signals_D), '0) CTRL_ID_E_REG(.clk, .rst_l, .en(~halted & ~ctrl_signals_D.illegal_instr & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(ctrl_signals_D), .Q(ctrl_signals_E));
     register #($bits(opcode_D), '0) OPCODE_ID_E_REG(.clk, .rst_l, .en(~halted & ~ctrl_signals_D.illegal_instr & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(opcode_D), .Q(opcode_E));
@@ -277,9 +293,9 @@ module riscv_core_scalar (
     register #(5, 5'b0) RS2_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(rs2_D), .Q(rs2_E));
     register #(1, 1'b0) RS1_USE_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(rs1_use_D), .Q(rs1_use_E));
     register #(1, 1'b0) RS2_USE_ID_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(rs2_use_D), .Q(rs2_use_E));
-    register #(32, USER_TEXT_START) BTB_HIS_ID_E_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(BTB_history_D), .Q(BTB_history_E));
-    register #(32, USER_TEXT_START) NXT_PC_D_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(next_pc_D), .Q(next_pc_E));
-    register #(32, USER_TEXT_START) NPC_PLUS4_D_E_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(npc_plus4_D), .Q(npc_plus4_E));
+    register #(2, 2'b0) BTB_HIS_ID_E_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(BTB_history_D), .Q(BTB_history_E));
+    register #(XLEN, USER_TEXT_START) NXT_PC_D_E_REG(.clk, .rst_l, .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(next_pc_D), .Q(next_pc_E));
+    register #(XLEN, USER_TEXT_START) NPC_PLUS4_D_E_REG(.clk(clk), .rst_l(rst_l), .en(~halted & ~flush_M1 & ~flush_W & ~mem_stall), .clear(flush_E || flush_M1 || flush_W), .D(npc_plus4_D), .Q(npc_plus4_E));
 
     // Privileged ISA: pipeline the raw instruction and a validity bit into EX so
     // the trap/CSR datapath can act at the (in-order) execute stage.
@@ -290,26 +306,26 @@ module riscv_core_scalar (
 
     //===============================EX start=========================//
 
-    logic [31:0] base_branch_addr_E, alu_out_E, alu_src1_E, alu_src2_E, rs1_data_muxed_E, rs2_data_muxed_E, alu_out_M1;
-    logic [31:0] rd_data_M1;
+    logic [XLEN-1:0] base_branch_addr_E, alu_out_E, alu_src1_E, alu_src2_E, rs1_data_muxed_E, rs2_data_muxed_E, alu_out_M1;
+    logic [XLEN-1:0] rd_data_M1;
     logic MemRead_E, MemRead_M1;
     assign MemRead_E = ctrl_signals_E.memRead;
     logic [1:0] rs1_fwd_sel_E, rs2_fwd_sel_E, alu_src2_sel_E;
     logic branch_src_sel;
-    logic [31:0] rd_in_M1;
+    logic [XLEN-1:0] rd_in_M1;
 
-    assign alu_src1_E = ctrl_signals_E.usePC ? pc_E : (rs1_use_E ? rs1_data_muxed_E : 32'b0);
+    assign alu_src1_E = ctrl_signals_E.usePC ? pc_E : (rs1_use_E ? rs1_data_muxed_E : '0);
     assign x10_halt = ctrl_signals_E.syscall && rs1_data_E == ECALL_ARG_HALT;
 
     logic cmp_out_E, alu_cout_E;
     alu_src2_sel_unit ALU_SRC2_SEL_UNIT(.*);
-    mux #(3, 32) Rs1_data_Mux (.in({rd_in_W, rd_data_M1, rs1_data_E}), .sel(rs1_fwd_sel_E), .out(rs1_data_muxed_E));
-    mux #(3, 32) Rs2_data_Mux (.in({rd_in_W, rd_data_M1, rs2_data_E}), .sel(rs2_fwd_sel_E), .out(rs2_data_muxed_E));
-    mux #(4, 32) Alu_Src2_Mux (.in({rd_in_W, rd_data_M1, rs2_data_E, se_immediate_E}), .sel(alu_src2_sel_E), .out(alu_src2_E));
+    mux #(3, XLEN) Rs1_data_Mux (.in({rd_in_W, rd_data_M1, rs1_data_E}), .sel(rs1_fwd_sel_E), .out(rs1_data_muxed_E));
+    mux #(3, XLEN) Rs2_data_Mux (.in({rd_in_W, rd_data_M1, rs2_data_E}), .sel(rs2_fwd_sel_E), .out(rs2_data_muxed_E));
+    mux #(4, XLEN) Alu_Src2_Mux (.in({rd_in_W, rd_data_M1, rs2_data_E, se_immediate_E}), .sel(alu_src2_sel_E), .out(alu_src2_E));
     riscv_alu ALU(.alu_src1(alu_src1_E), .alu_src2(alu_src2_E), .alu_op(ctrl_signals_E.alu_op), .alu_out(alu_out_E));
     assign cmp_out_E = alu_out_E[0];
-    mux #(2, 32) Branch_Src_Mux (.in({rs1_data_muxed_E, pc_E}), .sel(branch_src_sel), .out(base_branch_addr_E));
-    adder #(32) Branch_Target_Adder(.A(base_branch_addr_E), .B(se_immediate_E), .cin(1'b0), .sum(branch_target_E), .cout());
+    mux #(2, XLEN) Branch_Src_Mux (.in({rs1_data_muxed_E, pc_E}), .sel(branch_src_sel), .out(base_branch_addr_E));
+    adder #(XLEN) Branch_Target_Adder(.A(base_branch_addr_E), .B(se_immediate_E), .cin(1'b0), .sum(branch_target_E), .cout());
 
     //===============================BP EX Logic=========================//
     // write back to BTB and counter 
@@ -611,9 +627,10 @@ module riscv_core_scalar (
     assign paging_fetch = satp_mode && (cur_priv  != RISCV_Priv::PRIV_M);
     assign paging_data  = satp_mode && (priv_data != RISCV_Priv::PRIV_M);
 
-    // Compute a 32-bit (capped) physical byte address from a leaf translation.
-    function automatic logic [31:0] make_pa(input logic [21:0] ppn,
-            input logic superpage, input logic [31:0] va);
+    // Compute a physical byte address from a leaf translation. (Sv32 layout;
+    // the Sv39 widening is a later phase -- bare mode bypasses this.)
+    function automatic logic [XLEN-1:0] make_pa(input logic [21:0] ppn,
+            input logic superpage, input logic [XLEN-1:0] va);
         if (superpage) make_pa = {ppn[19:10], va[21:0]};
         else           make_pa = {ppn[19:0],  va[11:0]};
     endfunction
@@ -676,7 +693,7 @@ module riscv_core_scalar (
     logic [7:0]  itlb_perm;
     logic        itlb_super;
     logic        fetch_need_walk;
-    logic [31:0] phys_pc;
+    logic [XLEN-1:0] phys_pc;
 
     assign fetch_need_walk = paging_fetch && !itlb_hit;
 
@@ -827,23 +844,23 @@ module riscv_core_scalar (
     assign ifault_acc_E = 1'b0;   // (PMP-on-fetch access faults not yet split out)
 
     // Pipeline the data physical address to M1 for the memory access.
-    logic [31:0] pa_M1;
-    register #(32, 32'b0) PA_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(pa_E), .Q(pa_M1));
+    logic [XLEN-1:0] pa_M1;
+    register #(XLEN, '0) PA_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(pa_E), .Q(pa_M1));
 
     //===============================EX/MEM1 Pipeline Registers=========================//
 
-    logic [31:0] rs1_data_M1, rs2_data_M1, branch_target_M1, pc_M1;
+    logic [XLEN-1:0] rs1_data_M1, rs2_data_M1, branch_target_M1, pc_M1;
     logic cmp_out_M1;
     ctrl_signals_t ctrl_signals_M1;
     logic [4:0] rd_M1;
     logic bcond_M1;;
 
 
-    register #(32, 32'b0) RS1_DATA_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rs1_data_muxed_E), .Q(rs1_data_M1));
-    register #(32, 32'b0) ALU_OUT_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(alu_out_E), .Q(alu_out_M1));
-    register #(32, 32'b0) RS2_DATA_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rs2_data_muxed_E), .Q(rs2_data_M1));
-    register #(32, 32'b0) BRANCH_TARGET_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(branch_target_E), .Q(branch_target_M1));
-    register #(32, 32'b0) PC_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(pc_E), .Q(pc_M1));
+    register #(XLEN, '0) RS1_DATA_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rs1_data_muxed_E), .Q(rs1_data_M1));
+    register #(XLEN, '0) ALU_OUT_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(alu_out_E), .Q(alu_out_M1));
+    register #(XLEN, '0) RS2_DATA_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rs2_data_muxed_E), .Q(rs2_data_M1));
+    register #(XLEN, '0) BRANCH_TARGET_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(branch_target_E), .Q(branch_target_M1));
+    register #(XLEN, '0) PC_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(pc_E), .Q(pc_M1));
     // A trapping/returning instruction is converted to a bubble as it advances
     // to M1 so it commits no architectural side effects (rf/mem/CSR write).
     register #($bits(ctrl_signals_E), 'b0) CTRL_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(trap_redirect_E), .D(ctrl_signals_E), .Q(ctrl_signals_M1));
@@ -857,7 +874,7 @@ module riscv_core_scalar (
 
     //===============================MEM1 start=========================//
 
-    logic [31:0] mem_read_data_M1, final_data_M1, cache_read_data_selected_M1;
+    logic [XLEN-1:0] mem_read_data_M1, final_data_M1, cache_read_data_selected_M1;
     logic [3:0][31:0] cache_write_data_M1;
     logic [31:0] cache_read_data_M1;
     logic RegWrite_M1, Mem2Reg_M1, syscall_M1, illegal_instr_M1;
@@ -940,15 +957,15 @@ module riscv_core_scalar (
     
     // CSR reads write the old CSR value into rd; other non-memory ops use the
     // ALU result (or PC+4 for link).
-    assign rd_in_M1 = (rd_src_M1 == RD_PC4) ? (pc_M1 + 32'h4) :
+    assign rd_in_M1 = (rd_src_M1 == RD_PC4) ? (pc_M1 + XLEN'(4)) :
                       (ctrl_signals_M1.exec_class == EXEC_CSR) ? csr_read_data_M1 :
                       (alu_out_M1);
 
 
     riscv_load_unit Load_Unit_MEM(.data_load(data_load[data_offset]), .ldst_mode(ldst_mode_M1), .data_byte(data_byte_M1), .ld_out(mem_read_data_M1));
     riscv_load_unit Load_Unit_CACHE(.data_load(cache_read_data_M1), .ldst_mode(ldst_mode_M1), .data_byte(data_byte_M1), .ld_out(cache_read_data_selected_M1));
-    logic [31:0] mem_final_data_M1;
-    mux #(2, 32) MEM_CACHE_SEL_DATA(.in({cache_read_data_selected_M1, mem_read_data_M1}), .sel(mem_cache_sel_M1), .out(mem_final_data_M1));
+    logic [XLEN-1:0] mem_final_data_M1;
+    mux #(2, XLEN) MEM_CACHE_SEL_DATA(.in({cache_read_data_selected_M1, mem_read_data_M1}), .sel(mem_cache_sel_M1), .out(mem_final_data_M1));
     // A load that hits the memory-mapped CLINT returns its register value.
     assign final_data_M1 = (MemRead_M1 && clint_load_hit) ? clint_load_data :
                            mem_final_data_M1;
@@ -957,13 +974,13 @@ module riscv_core_scalar (
 
     //===============================MEM1/WB Pipeline Registers=========================//
 
-    logic [31:0] rs1_data_W, rd_data_W, mem_read_data_W;
+    logic [XLEN-1:0] rs1_data_W, rd_data_W, mem_read_data_W;
     logic [2:0] rd_src_W;
     logic [1:0] data_byte_W;
     logic syscall_W, illegal_instr_W, Mem2Reg_W;
     ldst_mode_t ldst_mode_W;
-    register #(32, 32'b0) RS1_DATA_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rs1_data_M1), .Q(rs1_data_W));
-    register #(32, 32'b0) RD_DATA_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rd_in_M1), .Q(rd_data_W));
+    register #(XLEN, '0) RS1_DATA_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rs1_data_M1), .Q(rs1_data_W));
+    register #(XLEN, '0) RD_DATA_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rd_in_M1), .Q(rd_data_W));
     register #(5, 5'b0) RD_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rd_M1), .Q(rd_W));
     register #(2, 2'b0) DATA_BYTE_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(data_byte_M1), .Q(data_byte_W));
     register #(1, 1'b0) MEM2REG_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(Mem2Reg_M1), .Q(Mem2Reg_W));
@@ -971,7 +988,7 @@ module riscv_core_scalar (
     register #(1, 1'b0) SYSCALL_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(syscall_M1), .Q(syscall_W));
     register #(1, 1'b0) ILLEGAL_INSTR_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(illegal_instr_M1), .Q(illegal_instr_W));
     register #($bits(ldst_mode_M1), LDST_DC) LDST_MODE_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(ldst_mode_M1), .Q(ldst_mode_W));
-    register #(32, 32'b0) RD_IN_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rd_data_M1), .Q(rd_in_W));
+    register #(XLEN, '0) RD_IN_M1_WB_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(rd_data_M1), .Q(rd_in_W));
     register #(1, 1'b0) FLUSH_M1_W_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(flush_M1), .Q(flush_W));
 
 
@@ -987,7 +1004,7 @@ module riscv_core_scalar (
      * precise instruction/load/store faults in Phase 2). */
     assign exception_halt   = instr_mem_excpt | data_mem_excpt;
     assign halted = rst_l & (syscall_halt | exception_halt);
-    
+
     data_stall_unit DSU(.clk, .rst_l, .read_miss_M1, .data_load_valid, .mem_stall(dsu_mem_stall));
     assign mem_stall = dsu_mem_stall | ptw_stall;
     
@@ -1263,20 +1280,22 @@ endmodule: riscv_core_scalar
  * Outputs:
  *  - alu_out       The result of the ALU operation on the two sources.
  **/
-module riscv_alu (
-    input  logic [31:0] alu_src1,
-    input  logic [31:0] alu_src2,
+module riscv_alu
+    import RISCV_ISA::XLEN;
+(
+    input  logic [XLEN-1:0] alu_src1,
+    input  logic [XLEN-1:0] alu_src2,
     input  alu_op_t     alu_op,
-    output logic [31:0] alu_out
+    output logic [XLEN-1:0] alu_out
 );
 
-  logic [31:0] sum, or_res, xor_res, and_res;
-  logic [31:0] sll_res, srl_res, sra_res;
+  logic [XLEN-1:0] sum, or_res, xor_res, and_res;
+  logic [XLEN-1:0] sll_res, srl_res, sra_res;
 
   logic eq, ne, sltu, slt, geu, ge;
 
-  adder #($bits(alu_src1)) ALU_Adder(.A(alu_src1), 
-                                    .B((alu_op==ALU_SUB)?(~alu_src2):alu_src2), 
+  adder #($bits(alu_src1)) ALU_Adder(.A(alu_src1),
+                                    .B((alu_op==ALU_SUB)?(~alu_src2):alu_src2),
                                     .cin(alu_op==ALU_SUB),
                                     .sum, .cout());
 
@@ -1284,19 +1303,20 @@ module riscv_alu (
   assign xor_res = alu_src1 ^ alu_src2;
   assign and_res = alu_src1 & alu_src2;
 
-  assign sll_res = alu_src1 << alu_src2[4:0];
-  assign srl_res = alu_src1 >> alu_src2[4:0];
-  assign sra_res = $signed(alu_src1) >>> alu_src2[4:0];
+  // Shift amount: 5 bits for RV32, 6 for RV64 ($clog2(XLEN)).
+  assign sll_res = alu_src1 << alu_src2[$clog2(XLEN)-1:0];
+  assign srl_res = alu_src1 >> alu_src2[$clog2(XLEN)-1:0];
+  assign sra_res = $signed(alu_src1) >>> alu_src2[$clog2(XLEN)-1:0];
 
-  assign eq = ~|xor_res;         
-  assign ne = |xor_res;         
-  assign sltu = alu_src1 < alu_src2;          
-  // assign slt = $signed(alu_src1) < $signed(alu_src2); 
-  assign slt = (alu_src1[31] == alu_src2[31]) ? (alu_src1 < alu_src2) : (alu_src1[31] > alu_src2[31]);
-  assign geu = ~sltu;                             
-  assign ge = ~slt;                            
+  assign eq = ~|xor_res;
+  assign ne = |xor_res;
+  assign sltu = alu_src1 < alu_src2;
+  // assign slt = $signed(alu_src1) < $signed(alu_src2);
+  assign slt = (alu_src1[XLEN-1] == alu_src2[XLEN-1]) ? (alu_src1 < alu_src2) : (alu_src1[XLEN-1] > alu_src2[XLEN-1]);
+  assign geu = ~sltu;
+  assign ge = ~slt;
 
-  logic [31:0] arith_res, logic_res, shift_res, cmp_res;
+  logic [XLEN-1:0] arith_res, logic_res, shift_res, cmp_res;
 
   assign arith_res = sum;
 
@@ -1311,15 +1331,15 @@ module riscv_alu (
      : sra_res;
 
   assign cmp_res =
-       (alu_op == ALU_BEQ ) ? {31'd0, eq}
-     : (alu_op == ALU_BNE ) ? {31'd0, ne}
-     : (alu_op == ALU_BLT ) ? {31'd0, slt}
-     : (alu_op == ALU_BGE ) ? {31'd0, ge}
-     : (alu_op == ALU_BLTU) ? {31'd0, sltu}
-     : (alu_op == ALU_BGEU) ? {31'd0, geu}
-     : (alu_op == ALU_SLT ) ? {31'd0, slt}
-     : (alu_op == ALU_SLTU) ? {31'd0, sltu}
-     : 32'bx;
+       (alu_op == ALU_BEQ ) ? {{(XLEN-1){1'b0}}, eq}
+     : (alu_op == ALU_BNE ) ? {{(XLEN-1){1'b0}}, ne}
+     : (alu_op == ALU_BLT ) ? {{(XLEN-1){1'b0}}, slt}
+     : (alu_op == ALU_BGE ) ? {{(XLEN-1){1'b0}}, ge}
+     : (alu_op == ALU_BLTU) ? {{(XLEN-1){1'b0}}, sltu}
+     : (alu_op == ALU_BGEU) ? {{(XLEN-1){1'b0}}, geu}
+     : (alu_op == ALU_SLT ) ? {{(XLEN-1){1'b0}}, slt}
+     : (alu_op == ALU_SLTU) ? {{(XLEN-1){1'b0}}, sltu}
+     : 'x;
 
   logic [1:0] group_sel;
   assign group_sel =
