@@ -53,6 +53,12 @@ typedef enum logic [4:0] {
     ALU_DIVU,
     ALU_REM,
     ALU_REMU,
+    // RV64 W-form ops: operate on the low 32 bits, sign-extend bit 31 to XLEN
+    ALU_ADDW,
+    ALU_SUBW,
+    ALU_SLLW,
+    ALU_SRLW,
+    ALU_SRAW,
     ALU_DC = 5'bxxxxx       // Don't care value
 } alu_op_t;
 
@@ -63,6 +69,8 @@ typedef enum logic [2:0] {
     LDST_HU,
     LDST_B,
     LDST_BU,
+    LDST_D,                  // RV64 doubleword (LD/SD)
+    LDST_WU,                 // RV64 word unsigned (LWU)
     LDST_DC = 3'bxxx         // Don't care value
 } ldst_mode_t;
 

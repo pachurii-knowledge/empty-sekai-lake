@@ -255,9 +255,10 @@ module riscv_core_scalar
     assign  rs2_D = instr_D[24:20];
     assign  rd_D = instr_D[11:7];
     //rs1 is used if opcode indicates R-type, I-type, S-type, or B-type
-    assign  rs1_use_D = opcode_D == OP_OP || opcode_D == OP_IMM || opcode_D == OP_STORE || opcode_D == OP_BRANCH || opcode_D == OP_SYSTEM || opcode_D == OP_JALR || opcode_D == OP_LOAD;
-    //rs2 is used if opcode indicates R-type, S-type, or B-type
-    assign  rs2_use_D = opcode_D == OP_OP || opcode_D == OP_STORE || opcode_D == OP_BRANCH;
+    //  (incl. RV64 OP-32 0x3B and OP-IMM-32 0x1B; harmless in RV32 -- unused)
+    assign  rs1_use_D = opcode_D == OP_OP || opcode_D == OP_IMM || opcode_D == OP_STORE || opcode_D == OP_BRANCH || opcode_D == OP_SYSTEM || opcode_D == OP_JALR || opcode_D == OP_LOAD || opcode_D == 7'h3B || opcode_D == 7'h1B;
+    //rs2 is used if opcode indicates R-type, S-type, or B-type (incl. OP-32)
+    assign  rs2_use_D = opcode_D == OP_OP || opcode_D == OP_STORE || opcode_D == OP_BRANCH || opcode_D == 7'h3B;
     always_comb begin
       case(ctrl_signals_D.imm_mode)
         IMM_I: se_immediate_D = {{(XLEN-11){instr_D[31]}}, instr_D[30:20]};
@@ -998,7 +999,13 @@ module riscv_core_scalar
 
     //Handle syscall halt here
     logic syscall_halt, exception_halt, read_miss;
-    assign syscall_halt = syscall_W && rs1_data_W == ECALL_ARG_HALT;
+    // A committed ecall with a0 in {10,11} halts the sim (pass/fail), matching the
+    // OoO core. +no_ecall_halt disables it for a real OS boot, where the kernel's
+    // SBI ecalls legitimately carry those values (see ooo_alu_pipe.sv / Phase H4).
+    logic ecall_halt_en;
+    initial ecall_halt_en = !$test$plusargs("no_ecall_halt");
+    assign syscall_halt = ecall_halt_en && syscall_W &&
+                          ((rs1_data_W == ECALL_ARG_HALT) || (rs1_data_W == 'd11));
     /* Illegal instructions now raise a precise trap at EX instead of halting.
      * Raw fetch/data memory exceptions remain a hard halt for now (the MMU adds
      * precise instruction/load/store faults in Phase 2). */
@@ -1348,8 +1355,28 @@ module riscv_alu
      : (alu_op == ALU_SLL || alu_op == ALU_SRL || alu_op == ALU_SRA) ? 2'b10
      : 2'b11;
 
+  // RV64 W-form ops: operate on the low 32 bits, sign-extend bit 31 to XLEN.
+  // (Never selected in RV32 -- the decoder only emits them under -DRV64.)
+  logic [31:0] w_res32;
+  logic        is_w_op;
+  assign is_w_op = (alu_op == ALU_ADDW) || (alu_op == ALU_SUBW)
+                || (alu_op == ALU_SLLW) || (alu_op == ALU_SRLW)
+                || (alu_op == ALU_SRAW);
   always_comb begin
-    case (group_sel)
+    unique case (alu_op)
+      ALU_ADDW: w_res32 = alu_src1[31:0] +  alu_src2[31:0];
+      ALU_SUBW: w_res32 = alu_src1[31:0] -  alu_src2[31:0];
+      ALU_SLLW: w_res32 = alu_src1[31:0] << alu_src2[4:0];
+      ALU_SRLW: w_res32 = alu_src1[31:0] >> alu_src2[4:0];
+      ALU_SRAW: w_res32 = $signed(alu_src1[31:0]) >>> alu_src2[4:0];
+      default:  w_res32 = 'x;
+    endcase
+  end
+
+  always_comb begin
+    if (is_w_op)
+      alu_out = {{(XLEN-32){w_res32[31]}}, w_res32};
+    else case (group_sel)
       2'b00: alu_out = arith_res;
       2'b01: alu_out = logic_res;
       2'b10: alu_out = shift_res;

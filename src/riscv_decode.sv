@@ -781,6 +781,41 @@ module riscv_decode
                 end
 
                 default: begin
+`ifdef RV64
+                    // RV64-only OP-32 (0x3B) and OP-IMM-32 (0x1B). Dispatched here
+                    // on the raw opcode bits (they are not members of opcode_t,
+                    // which lives in the DO-NOT-MODIFY riscv_isa.vh). W-form ops
+                    // operate on the low 32 bits, result sign-extended to XLEN.
+                    if (instr[6:0] == 7'h1B) begin            // OP-IMM-32
+                        ctrl_signals.useImm    = 1'b1;
+                        ctrl_signals.rfWrite   = 1'b1;
+                        ctrl_signals.imm_mode  = IMM_I;
+                        ctrl_signals.pc_source = PC_plus4;
+                        ctrl_signals.rd_source = RD_ALU;
+                        unique case (instr[14:12])
+                            3'b000: ctrl_signals.alu_op = ALU_ADDW;            // ADDIW
+                            3'b001: ctrl_signals.alu_op = ALU_SLLW;            // SLLIW
+                            3'b101: ctrl_signals.alu_op = instr[30] ? ALU_SRAW // SRAIW
+                                                                    : ALU_SRLW;// SRLIW
+                            default: ctrl_signals.illegal_instr = 1'b1;
+                        endcase
+                    end else if (instr[6:0] == 7'h3B) begin   // OP-32
+                        ctrl_signals.rfWrite   = 1'b1;
+                        ctrl_signals.pc_source = PC_plus4;
+                        ctrl_signals.rd_source = RD_ALU;
+                        unique case (instr[14:12])
+                            3'b000: ctrl_signals.alu_op = instr[30] ? ALU_SUBW // SUBW
+                                                                    : ALU_ADDW;// ADDW
+                            3'b001: ctrl_signals.alu_op = ALU_SLLW;            // SLLW
+                            3'b101: ctrl_signals.alu_op = instr[30] ? ALU_SRAW // SRAW
+                                                                    : ALU_SRLW;// SRLW
+                            default: ctrl_signals.illegal_instr = 1'b1;
+                        endcase
+                    end else begin
+                        `display(rst_l & (instr != 'h0), "Encountered unknown/unimplemented opcode 0x%02x.", opcode);
+                        ctrl_signals.illegal_instr = 1'b1;
+                    end
+`else
                     // Skip only the diagnostic $display for all-zero words: with
                     // the flat valid memory window, speculative fetches past the
                     // program image read back as zero and would otherwise spam the
@@ -790,6 +825,7 @@ module riscv_decode
                     // (OoO) so this never raises a spurious exception.
                     `display(rst_l & (instr != 'h0), "Encountered unknown/unimplemented opcode 0x%02x.", opcode);
                     ctrl_signals.illegal_instr = 1'b1;
+`endif
                 end
             endcase
 
