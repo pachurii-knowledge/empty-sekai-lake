@@ -305,8 +305,93 @@ module main_memory
         initialize_segment(2);
         initialize_segment(3);
         initialize_segment(4);
+        initialize_flat_images();
         return;
     endfunction: initialize_memory
+
+    /* Flat-image loader for Linux-class boot images (kernel Image, DTB,
+     * initramfs) that exceed the fixed 512 KiB segment windows. The five
+     * segments above feed the directed-test / ACT flow unchanged; this is an
+     * additive path that loads arbitrarily large blobs into the sparse `memory`
+     * associative array (which has no size limit) at explicit base addresses.
+     *
+     * It reads an OPTIONAL manifest file "mem.image.manifest" in the run
+     * directory, one region per line:  <hex_byte_base> <relative_file_path>
+     * e.g.   80200000 mem.kimage.bin
+     * Lines are ignored if the manifest is absent, so every existing test that
+     * does not ship a manifest is completely unaffected. Bases must be
+     * word-aligned (they are page-aligned in practice). */
+    function void initialize_flat_images();
+
+        int manifest_fd, n;
+        longint unsigned base_byte;
+        string image_path;
+
+        /* A failed open here leaves the host errno dirty, but every read loop
+         * in this file now gates its $ferror check on !$feof, so that is
+         * harmless. */
+        manifest_fd = $fopen("mem.image.manifest", "r");
+        if (manifest_fd == 0) begin
+            return;             // No manifest -> nothing to load (the common case).
+        end
+
+        /* One region per line: `<hex_byte_base> <file>`. $fscanf returns the
+         * count of matched items; <2 means a blank/trailing line or EOF. */
+        while (1) begin
+            n = $fscanf(manifest_fd, "%h %s", base_byte, image_path);
+            if (n != 2) break;
+            load_flat_image(image_path, base_byte);
+        end
+        $fclose(manifest_fd);
+        return;
+    endfunction: initialize_flat_images
+
+    /* Loads a flat binary blob into the sparse physical memory at the given
+     * byte base address, with no size cap. Mirrors load_mem_segment's
+     * byte-at-a-time little-endian fill, but the base comes from the manifest
+     * rather than a fixed segment, and the file may be any size. */
+    function void load_flat_image(string path, longint unsigned base_byte);
+
+        int image_fd, word_index, byte_index;
+        addr_t base_word;
+        string placeholder;
+
+        image_fd = $fopen(path, "rb");
+        if (image_fd == 0) begin
+            file_error(image_fd, path, "Unable to open flat image file");
+        end
+
+        base_word = addr_t'(base_byte >> ADDR_SHIFT);
+        word_index = 0;
+        byte_index = 0;
+
+        /* As in load_mem_segment: $fread reads big-endian, so place bytes one
+         * at a time to get little-endian word ordering. */
+        while (1) begin
+            logic [BYTE_WIDTH-1:0] data_byte;
+            int bytes_read;
+
+            bytes_read = $fread(data_byte, image_fd);
+            if (bytes_read == 0) begin
+                if (!$feof(image_fd) && $ferror(image_fd, placeholder) != 0)
+                    file_error(image_fd, path, "Unable to read file");
+                break;
+            end
+
+            if (!memory.exists(base_word + word_index)) begin
+                memory[base_word + word_index] = '{default: 'h00};
+            end
+            memory[base_word + word_index][byte_index] = data_byte;
+            byte_index += 1;
+            if (byte_index == WORD_BYTES) begin
+                byte_index = 0;
+                word_index += 1;
+            end
+        end
+
+        $fclose(image_fd);
+        return;
+    endfunction: load_flat_image
 
     /* Initializes a segment of memory, and loading it with the values from
      * the corresponding data file. */
@@ -384,9 +469,13 @@ module main_memory
 
             // Read the next byte from the file
             bytes_read = $fread(data_byte, segment_fd);
-            if (bytes_read == 0 && $ferror(segment_fd, placeholder) != 0) begin
-                file_error(segment_fd, segment_path, "Unable to read file");
-            end else if (bytes_read == 0) begin
+            if (bytes_read == 0) begin
+                /* Gate the error report on !$feof: a genuine end-of-file must
+                 * not consult $ferror, which returns the host's *global* errno
+                 * and can hold a stale value from an unrelated prior failed
+                 * syscall (e.g. probing for an absent mem.image.manifest). */
+                if (!$feof(segment_fd) && $ferror(segment_fd, placeholder) != 0)
+                    file_error(segment_fd, segment_path, "Unable to read file");
                 break;
             end
 
