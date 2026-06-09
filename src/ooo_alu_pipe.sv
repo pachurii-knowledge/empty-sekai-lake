@@ -19,6 +19,15 @@ module ooo_alu_pipe
 
     writeback_packet_t wb_next;
 
+    /* Simulation halt-on-ecall (a0 in {10,11}) is how the directed/ACT tests
+     * signal pass/fail. A real OS boot can't use it: the kernel's SBI ecalls
+     * legitimately carry a0==10 (console '\n') or 11, which would spuriously
+     * halt. The +no_ecall_halt plusarg disables it so those ecalls trap to the
+     * M-mode SBI firmware normally; the run instead terminates via the console
+     * watch / HTIF tohost. Default (no plusarg) preserves the test behaviour. */
+    logic ecall_halt_en;
+    initial ecall_halt_en = !$test$plusargs("no_ecall_halt");
+
     always_comb begin
         wb_next = '0;
         if (issue_valid && ((issue_entry.branch_mask & abort_mask) == '0)) begin
@@ -53,7 +62,7 @@ module ooo_alu_pipe
                  (csr_illegal || (issue_entry.ctrl.csr_write &&
                   (issue_entry.instr[31:30] == 2'b11))));
             wb_next.exc_cause = 5'd2;   // EXC_ILLEGAL_INSTR
-            wb_next.halted = issue_entry.ctrl.syscall &&
+            wb_next.halted = ecall_halt_en && issue_entry.ctrl.syscall &&
                 ((rs1_data == 32'ha) || (rs1_data == 32'hb));
 
             // Instruction-address-misaligned (IALIGN=32, no C extension): a
