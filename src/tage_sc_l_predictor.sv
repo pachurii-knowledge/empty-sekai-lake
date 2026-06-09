@@ -13,12 +13,12 @@ module tage_sc_l_predictor
     input  logic            clk,
     input  logic            rst_l,
     input  logic            lookup_valid,
-    input  logic [31:0]     lookup_pc,
+    input  logic [XLEN-1:0] lookup_pc,
     input  logic [HISTORY_BITS-1:0] history,
     output logic            prediction,
     output predictor_info_t prediction_info,
     input  logic            update_valid,
-    input  logic [31:0]     update_pc,
+    input  logic [XLEN-1:0] update_pc,
     input  logic            update_taken,
     input  predictor_info_t update_info
 );

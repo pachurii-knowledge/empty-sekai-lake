@@ -18,17 +18,17 @@ module phys_reg_file
     input  phys_reg_t            rs2 [READ_PORTS],
     input  logic [OOO_WIDTH-1:0] write_valid,
     input  phys_reg_t            write_prd [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0][31:0] write_data,
-    output logic [READ_PORTS-1:0][31:0] rs1_data,
-    output logic [READ_PORTS-1:0][31:0] rs2_data
+    input  logic [OOO_WIDTH-1:0][XLEN-1:0] write_data,
+    output logic [READ_PORTS-1:0][XLEN-1:0] rs1_data,
+    output logic [READ_PORTS-1:0][XLEN-1:0] rs2_data
 );
 
-    logic [PHYS_REGS-1:0][31:0] registers;
+    logic [PHYS_REGS-1:0][XLEN-1:0] registers;
 
     always_comb begin
         for (int i = 0; i < READ_PORTS; i += 1) begin
-            rs1_data[i] = (rs1[i] == '0) ? 32'b0 : registers[rs1[i]];
-            rs2_data[i] = (rs2[i] == '0) ? 32'b0 : registers[rs2[i]];
+            rs1_data[i] = (rs1[i] == '0) ? '0 : registers[rs1[i]];
+            rs2_data[i] = (rs2[i] == '0) ? '0 : registers[rs2[i]];
             for (int w = 0; w < OOO_WIDTH; w += 1) begin
                 if (write_valid[w] && (write_prd[w] != '0)) begin
                     if (write_prd[w] == rs1[i]) begin

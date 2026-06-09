@@ -9,14 +9,14 @@ module ooo_branch_recovery
     input  branch_mask_t      stack_reset_mask,
     input  branch_mask_t      stack_abort_mask,
     input  logic              stack_restore_valid,
-    input  logic [31:0]       fetch_pc_plus4,
+    input  logic [XLEN-1:0]   fetch_pc_plus4,
     output logic              resolve_valid,
     output branch_id_t        resolve_id,
     output logic              resolve_mispredict,
     output branch_mask_t      reset_mask,
     output branch_mask_t      abort_mask,
     output logic              redirect_valid,
-    output logic [31:0]       redirect_pc
+    output logic [XLEN-1:0]   redirect_pc
 );
 
     always_comb begin

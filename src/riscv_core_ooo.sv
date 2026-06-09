@@ -6,24 +6,30 @@
 
 `default_nettype none
 
-module riscv_core_ooo (
+module riscv_core_ooo
+    import OOO_Types::*;
+    import RISCV_ISA::XLEN_BYTES;
+    import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
+(
     input  logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
-    input  logic [3:0][31:0] instr, data_load,
-    input  logic [29:0]      data_load_addr,
+    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr, data_load,
+    input  logic [MEMORY_ADDR_WIDTH-1:0] data_load_addr,
     input  logic             data_load_valid,
     output logic             data_load_en, halted,
-    output logic [ 3:0]      data_store_mask,
-    output logic [29:0]      instr_addr, data_addr,
+    output logic [XLEN_BYTES-1:0]        data_store_mask,
+    output logic [MEMORY_ADDR_WIDTH-1:0] instr_addr, data_addr,
     output logic             instr_stall, data_stall,
-    output logic [31:0]      data_store,
+    output logic [XLEN-1:0]  data_store,
     // MMU page-table-walk port (Phase 4 will drive this; tied off for now)
-    output logic [29:0]      ptw_addr,
+    output logic [MEMORY_ADDR_WIDTH-1:0] ptw_addr,
     output logic             ptw_we,
-    output logic [31:0]      ptw_wdata,
-    input  logic [31:0]      ptw_rdata
+    output logic [XLEN-1:0]  ptw_wdata,
+    input  logic [XLEN-1:0]  ptw_rdata
 );
 
-    import OOO_Types::*;
+    // Byte-address -> word-address shift for the word-granular memory bus.
+    localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
+
     import RISCV_ABI::ECALL_ARG_HALT;
     import MemorySegments::USER_TEXT_START;
 
@@ -33,8 +39,8 @@ module riscv_core_ooo (
     localparam int RAS_COUNT_BITS = $clog2(RAS_DEPTH + 1);
     localparam int DIRECT_HISTORY_BITS = 30;
 
-    logic [31:0] pc_q, pc_next;
-    logic [31:0] fetch_pa;   // translated fetch address (driven in MMU section)
+    logic [XLEN-1:0] pc_q, pc_next;
+    logic [XLEN-1:0] fetch_pa;   // translated fetch address (driven in MMU section)
     logic [1:0][31:0] fetch_pc_pipe_q, fetch_pc_pipe_next;
     logic [1:0] fetch_valid_pipe_q, fetch_valid_pipe_next;
     // Fetch fault piped alongside fetch_pc/fetch_valid so it reaches decode
@@ -50,8 +56,8 @@ module riscv_core_ooo (
     branch_id_t control_pending_id_q, control_pending_id_next;
     logic frontend_stall;
     logic redirect_valid;
-    logic [31:0] redirect_pc;
-    logic [31:0] sequential_next_pc;
+    logic [XLEN-1:0] redirect_pc;
+    logic [XLEN-1:0] sequential_next_pc;
 
     decode_lane_t decode_lanes [OOO_WIDTH];
     logic [OOO_WIDTH-1:0] lane_valid;
@@ -61,7 +67,7 @@ module riscv_core_ooo (
     logic [OOO_WIDTH-1:0] lane_is_call;
     logic [OOO_WIDTH-1:0] lane_is_return;
     logic [OOO_WIDTH-1:0] lane_control_predicted;
-    logic [OOO_WIDTH-1:0][31:0] lane_predicted_pc;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] lane_predicted_pc;
     logic [OOO_WIDTH-1:0] lane_is_memory;
     logic [OOO_WIDTH-1:0] lane_is_terminal;
     logic [OOO_WIDTH-1:0] lane_is_serializing;
@@ -77,12 +83,12 @@ module riscv_core_ooo (
     logic partial_resume_lane_is_branch;
     logic dispatched_unpredicted_control;
     logic ras_redirect_valid;
-    logic [31:0] ras_redirect_pc;
+    logic [XLEN-1:0] ras_redirect_pc;
     logic predictor_redirect_valid;
-    logic [31:0] predictor_redirect_pc;
+    logic [XLEN-1:0] predictor_redirect_pc;
 
-    logic [31:0] ras_stack_q [RAS_DEPTH];
-    logic [31:0] ras_stack_next [RAS_DEPTH];
+    logic [XLEN-1:0] ras_stack_q [RAS_DEPTH];
+    logic [XLEN-1:0] ras_stack_next [RAS_DEPTH];
     logic [RAS_COUNT_BITS-1:0] ras_count_q, ras_count_next;
     logic [RAS_COUNT_BITS-1:0] ras_checkpoint_count_q [BRANCH_STACK_SIZE];
     logic [RAS_COUNT_BITS-1:0] ras_checkpoint_count_next [BRANCH_STACK_SIZE];
@@ -94,13 +100,13 @@ module riscv_core_ooo (
     logic [DIRECT_HISTORY_BITS-1:0] ghr_branch_snapshot;
 
     logic direct_lookup_valid;
-    logic [31:0] direct_lookup_pc;
+    logic [XLEN-1:0] direct_lookup_pc;
     logic direct_prediction;
     predictor_info_t direct_prediction_info;
     logic indirect_lookup_valid;
-    logic [31:0] indirect_lookup_pc;
+    logic [XLEN-1:0] indirect_lookup_pc;
     logic indirect_prediction_valid;
-    logic [31:0] indirect_prediction_target;
+    logic [XLEN-1:0] indirect_prediction_target;
     predictor_info_t indirect_prediction_info;
     predictor_info_t lane_predictor_info [OOO_WIDTH];
 
@@ -144,13 +150,13 @@ module riscv_core_ooo (
 
     phys_reg_t phys_rs1 [PHYS_READ_PORTS];
     phys_reg_t phys_rs2 [PHYS_READ_PORTS];
-    logic [PHYS_READ_PORTS-1:0][31:0] phys_rs1_data;
-    logic [PHYS_READ_PORTS-1:0][31:0] phys_rs2_data;
-    logic [OOO_WIDTH-1:0][31:0] mem_insert_rs1_data;
-    logic [OOO_WIDTH-1:0][31:0] mem_insert_rs2_data;
+    logic [PHYS_READ_PORTS-1:0][XLEN-1:0] phys_rs1_data;
+    logic [PHYS_READ_PORTS-1:0][XLEN-1:0] phys_rs2_data;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] mem_insert_rs1_data;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] mem_insert_rs2_data;
     logic [OOO_WIDTH-1:0] phys_write_valid;
     phys_reg_t phys_write_prd [OOO_WIDTH];
-    logic [OOO_WIDTH-1:0][31:0] phys_write_data;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] phys_write_data;
 
     writeback_packet_t alu0_writeback;
     writeback_packet_t alu1_writeback;
@@ -165,14 +171,14 @@ module riscv_core_ooo (
     logic [OOO_WIDTH-1:0] writeback_valid;
     active_id_t writeback_active_id [OOO_WIDTH];
     phys_reg_t writeback_prd [OOO_WIDTH];
-    logic [OOO_WIDTH-1:0][31:0] writeback_data;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] writeback_data;
     logic [OOO_WIDTH-1:0] writeback_has_dest;
     logic [OOO_WIDTH-1:0] writeback_fp_write;
     arch_reg_t writeback_fp_rd [OOO_WIDTH];
     fp_reg_data_t writeback_fp_data [OOO_WIDTH];
     logic [OOO_WIDTH-1:0] writeback_csr_write;
     logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr;
-    logic [OOO_WIDTH-1:0][31:0] writeback_csr_wdata;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] writeback_csr_wdata;
     logic [OOO_WIDTH-1:0] writeback_fp_fflags_valid;
     logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags;
     logic [OOO_WIDTH-1:0] writeback_exception;
@@ -270,10 +276,10 @@ module riscv_core_ooo (
 
     logic mem_queue_full;
     logic mem_data_load_en;
-    logic [29:0] mem_data_addr;
-    logic [31:0] mem_data_store;
-    logic [3:0] mem_data_store_mask;
-    logic [29:0] lsq_data_load_addr;
+    logic [MEMORY_ADDR_WIDTH-1:0] mem_data_addr;
+    logic [XLEN-1:0] mem_data_store;
+    logic [XLEN_BYTES-1:0] mem_data_store_mask;
+    logic [MEMORY_ADDR_WIDTH-1:0] lsq_data_load_addr;
     logic lsq_store_second_beat;
     logic lsq_store_port_busy;
     logic commit_store;
@@ -310,22 +316,41 @@ module riscv_core_ooo (
     logic [$clog2(PHYS_REGS)-1:0] free_restore_head;
 
     logic [OOO_WIDTH-1:0] arch_rd_we;
-    logic [OOO_WIDTH-1:0][4:0] arch_rs1;
-    logic [OOO_WIDTH-1:0][4:0] arch_rs2;
-    logic [OOO_WIDTH-1:0][4:0] arch_rd;
-    logic [OOO_WIDTH-1:0][31:0] arch_rd_data;
-    logic [OOO_WIDTH-1:0][31:0] arch_rs1_data;
-    logic [OOO_WIDTH-1:0][31:0] arch_rs2_data;
+    // register_file declares its index ports as [$clog2(WIDTH)-1:0] (WIDTH=XLEN),
+    // so on RV64 each selector is 6 bits, not 5. The index arrays must match that
+    // per-way width or the packed-array connection misaligns lanes 1+ (writing
+    // scrambled architectural register numbers).
+    logic [OOO_WIDTH-1:0][$clog2(XLEN)-1:0] arch_rs1;
+    logic [OOO_WIDTH-1:0][$clog2(XLEN)-1:0] arch_rs2;
+    logic [OOO_WIDTH-1:0][$clog2(XLEN)-1:0] arch_rd;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] arch_rd_data;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] arch_rs1_data;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] arch_rs2_data;
 
     assign halted = halted_q;
     assign data_stall = 1'b0;
     assign instr_stall = !rst_l || halted_q || frontend_stall ||
         dispatched_unpredicted_control;
     // instr_addr is the translated fetch block address (fetch_pa, computed in the
-    // MMU section below; identity when paging is off).
-    assign instr_addr = {fetch_pa[31:4], 2'b00};
-    assign sequential_next_pc = {pc_q[31:4], 4'b0} + 32'd16;
+    // MMU section below; identity when paging is off). The 16-byte fetch block
+    // is {fetch_pa[..:4]} as a word address (2 zeros for RV32's 4-byte words, 1
+    // for RV64's 8-byte words).
+    assign instr_addr = {fetch_pa[XLEN-1:4], {(4-ADDR_SHIFT){1'b0}}};
+    assign sequential_next_pc = {pc_q[XLEN-1:4], 4'b0} + XLEN'(16);
     assign dispatch_branch_mask = current_branch_mask & ~reset_mask & ~abort_mask;
+
+    // Extract the 4 32-bit instructions of the 16-byte fetch block from the
+    // word-granular memory read. RV32: one instruction per memory word. RV64:
+    // two 32-bit instructions per 64-bit word, so the block is the low 2 words.
+    logic [3:0][31:0] decode_fetch_instr;
+    always_comb begin
+        for (int j = 0; j < 4; j++)
+`ifdef RV64
+            decode_fetch_instr[j] = instr[j/2][ (j[0] ? 32 : 0) +: 32 ];
+`else
+            decode_fetch_instr[j] = instr[j];
+`endif
+    end
 
     ooo_fetch_decode FetchDecode (
         .rst_l,
@@ -335,7 +360,7 @@ module riscv_core_ooo (
             {OOO_WIDTH{fetch_valid_pipe_q[1]}}),
         .fetch_fault_cause(fetch_fault_cause_pipe_q[1]),
         .fetch_pc(fetch_pc_pipe_q[1]),
-        .instr,
+        .instr(decode_fetch_instr),
         .decode_lanes
     );
 
@@ -537,8 +562,8 @@ module riscv_core_ooo (
     logic tlb_flush;
 
     // Compute a 32-bit (capped) physical byte address from a leaf translation.
-    function automatic logic [31:0] make_pa(input logic [21:0] ppn,
-            input logic superpage, input logic [31:0] va);
+    function automatic logic [XLEN-1:0] make_pa(input logic [21:0] ppn,
+            input logic superpage, input logic [XLEN-1:0] va);
         if (superpage) make_pa = {ppn[19:10], va[21:0]};
         else           make_pa = {ppn[19:0],  va[11:0]};
     endfunction
@@ -569,7 +594,7 @@ module riscv_core_ooo (
 
     // --- Data-side translation request exposed by the load/store queue ---
     logic        mem_req_valid;
-    logic [31:0] mem_req_vaddr;
+    logic [XLEN-1:0] mem_req_vaddr;
     logic        mem_req_store;
     logic [1:0]  data_acc;
     assign data_acc = mem_req_store ? 2'd2 : 2'd1;
@@ -685,7 +710,7 @@ module riscv_core_ooo (
 
     // --- Resolve the data physical address + fault/stall for the LSQ ---
     logic        data_from_ptw;
-    logic [31:0] data_pa;
+    logic [XLEN-1:0] data_pa;
     logic        data_perm_fault;
     logic        lsq_xlate_stall, lsq_xlate_fault;
     logic [4:0]  lsq_xlate_cause;
@@ -731,7 +756,7 @@ module riscv_core_ooo (
                            : RISCV_Priv::EXC_LOAD_PAGE_FAULT) :
             (mem_req_store ? RISCV_Priv::EXC_STORE_ACCESS
                            : RISCV_Priv::EXC_LOAD_ACCESS);
-    assign lsq_data_load_addr = paging_data ? mem_req_vaddr[31:2] : data_load_addr;
+    assign lsq_data_load_addr = paging_data ? mem_req_vaddr[XLEN-1:ADDR_SHIFT] : data_load_addr;
 
     // --- Resolve the fetch physical address + stall during a fetch walk ---
     logic        fetch_from_ptw, ptw_fetch_done;
@@ -1638,7 +1663,7 @@ module riscv_core_ooo (
         // The second beat of a split store is the exception: the LSQ already
         // drives the captured physical word address, so bypass the (stale,
         // head-VA based) translation mux.
-        data_addr = (paging_data && !lsq_store_second_beat) ? data_pa[31:2]
+        data_addr = (paging_data && !lsq_store_second_beat) ? data_pa[XLEN-1:ADDR_SHIFT]
                                                             : mem_data_addr;
         data_store = mem_data_store;
         data_store_mask = mem_data_store_mask;
@@ -2099,12 +2124,14 @@ module riscv_core_ooo (
             dbg_cyc <= dbg_cyc + 1;
             for (int i = 0; i < OOO_WIDTH; i += 1) begin
                 if (retire_valid[i])
-                    $display("[%0d] retire[%0d] pc=%h instr=%h exc=%b cause=%0d satp=%h pgD=%b mrq=%b mva=%h",
+                    $display("[%0d] retire[%0d] pc=%h instr=%h rd=%0d wr=%b data=%h exc=%b cause=%0d",
                         dbg_cyc, i, active_commit_packet[i].pc,
                         active_commit_packet[i].instr,
+                        active_commit_packet[i].rd,
+                        active_commit_packet[i].has_dest,
+                        active_commit_packet[i].data,
                         active_commit_packet[i].exception,
-                        active_commit_packet[i].exc_cause, csr_satp,
-                        paging_data, mem_req_valid, mem_req_vaddr);
+                        active_commit_packet[i].exc_cause);
             end
             if (commit_take_trap)
                 $display("[%0d] TRAP cause=%0d epc=%h tval=%h priv=%0d->vec=%h",

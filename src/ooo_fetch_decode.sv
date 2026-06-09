@@ -15,7 +15,7 @@ module ooo_fetch_decode
     // word within the 16-byte fetch block, so each lane is checked independently.
     input  logic [OOO_WIDTH-1:0] fetch_fault_lane,
     input  logic [4:0]       fetch_fault_cause,  // EXC_INSTR_PAGE_FAULT/ACCESS
-    input  logic [31:0]      fetch_pc,
+    input  logic [XLEN-1:0]  fetch_pc,
     input  logic [3:0][31:0] instr,
     output decode_lane_t     decode_lanes [OOO_WIDTH]
 );
@@ -106,18 +106,18 @@ module ooo_fetch_decode
                 decode_lanes[i].valid = fetch_valid;
     end
 
-    function automatic logic [31:0] immediate_for(imm_mode_t mode,
+    function automatic logic [XLEN-1:0] immediate_for(imm_mode_t mode,
             logic [31:0] raw_instr);
         unique case (mode)
-            IMM_I:  immediate_for = {{21{raw_instr[31]}}, raw_instr[30:20]};
-            IMM_S:  immediate_for = {{21{raw_instr[31]}}, raw_instr[30:25],
+            IMM_I:  immediate_for = {{(XLEN-11){raw_instr[31]}}, raw_instr[30:20]};
+            IMM_S:  immediate_for = {{(XLEN-11){raw_instr[31]}}, raw_instr[30:25],
                                       raw_instr[11:7]};
-            IMM_SB: immediate_for = {{20{raw_instr[31]}}, raw_instr[7],
+            IMM_SB: immediate_for = {{(XLEN-12){raw_instr[31]}}, raw_instr[7],
                                       raw_instr[30:25], raw_instr[11:8], 1'b0};
-            IMM_U:  immediate_for = {raw_instr[31:12], 12'b0};
-            IMM_UJ: immediate_for = {{12{raw_instr[31]}}, raw_instr[19:12],
+            IMM_U:  immediate_for = {{(XLEN-32){raw_instr[31]}}, raw_instr[31:12], 12'b0};
+            IMM_UJ: immediate_for = {{(XLEN-20){raw_instr[31]}}, raw_instr[19:12],
                                       raw_instr[20], raw_instr[30:21], 1'b0};
-            default: immediate_for = 32'b0;
+            default: immediate_for = '0;
         endcase
     endfunction
 
@@ -129,6 +129,8 @@ module ooo_fetch_decode
             (opcode == RISCV_ISA::OP_BRANCH) || (opcode == RISCV_ISA::OP_JALR) ||
             (opcode == RISCV_ISA::OP_SYSTEM) || (opcode == RISCV_ISA::OP_LOAD_FP) ||
             (opcode == RISCV_ISA::OP_STORE_FP) || (opcode == RISCV_ISA::OP_AMO) ||
+            // RV64 OP-32 (0x3B) and OP-IMM-32 (0x1B) W-form ops
+            (opcode == 7'h3B) || (opcode == 7'h1B) ||
             ((opcode == RISCV_ISA::OP_FP) &&
              ((raw_instr[31:27] == 5'b11010) ||
               (raw_instr[31:27] == 5'b11110)));
@@ -138,7 +140,8 @@ module ooo_fetch_decode
         logic [6:0] opcode;
         opcode = raw_instr[6:0];
         uses_rs2 = (opcode == RISCV_ISA::OP_OP) || (opcode == RISCV_ISA::OP_STORE) ||
-            (opcode == RISCV_ISA::OP_BRANCH) || (opcode == RISCV_ISA::OP_AMO);
+            (opcode == RISCV_ISA::OP_BRANCH) || (opcode == RISCV_ISA::OP_AMO) ||
+            (opcode == 7'h3B);   // RV64 OP-32 register W-form ops
     endfunction
 
 endmodule: ooo_fetch_decode

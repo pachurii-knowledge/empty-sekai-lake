@@ -2,8 +2,14 @@
 `define OOO_TYPES_VH_
 
 `include "internal_defines.vh"
+`include "riscv_isa.vh"
 
 package OOO_Types;
+
+    // Re-export the ISA width as an OOO_Types localparam so modules that do
+    // `import OOO_Types::*` see XLEN (a wildcard import does not chain the
+    // symbols a package itself imported).
+    localparam int XLEN = RISCV_ISA::XLEN;
 
     localparam int OOO_WIDTH = 4;
     localparam int PHYS_REGS = 64;
@@ -46,7 +52,7 @@ package OOO_Types;
         logic        valid;
         logic        predicted_taken;
         logic        predicted_target_valid;
-        logic [31:0] predicted_target;
+        logic [XLEN-1:0] predicted_target;
         logic [1:0]  provider;
         logic [9:0]  base_index;
         logic [9:0]  index0;
@@ -60,7 +66,7 @@ package OOO_Types;
 
     typedef struct packed {
         logic          valid;
-        logic [31:0]   pc;
+        logic [XLEN-1:0]   pc;
         logic [31:0]   instr;
         ctrl_signals_t ctrl;
         arch_reg_t     rs1;
@@ -73,12 +79,12 @@ package OOO_Types;
         logic          src1_ready;
         logic          src2_ready;
         logic          has_dest;
-        logic [31:0]   imm;
+        logic [XLEN-1:0]   imm;
         branch_mask_t  branch_mask;
         branch_id_t    branch_id;
         active_id_t    active_id;
         logic          control_predicted;
-        logic [31:0]   predicted_pc;
+        logic [XLEN-1:0]   predicted_pc;
         predictor_info_t predictor_info;
         arch_reg_t     fp_rs1;
         arch_reg_t     fp_rs2;
@@ -92,7 +98,7 @@ package OOO_Types;
 
     typedef struct packed {
         logic          valid;
-        logic [31:0]   pc;
+        logic [XLEN-1:0]   pc;
         logic [31:0]   instr;
         ctrl_signals_t ctrl;
         phys_reg_t     prs1;
@@ -101,12 +107,12 @@ package OOO_Types;
         logic          src1_ready;
         logic          src2_ready;
         logic          has_dest;
-        logic [31:0]   imm;
+        logic [XLEN-1:0]   imm;
         branch_mask_t  branch_mask;
         branch_id_t    branch_id;
         active_id_t    active_id;
         logic          control_predicted;
-        logic [31:0]   predicted_pc;
+        logic [XLEN-1:0]   predicted_pc;
         predictor_info_t predictor_info;
         arch_reg_t     fp_rs1;
         arch_reg_t     fp_rs2;
@@ -121,25 +127,25 @@ package OOO_Types;
     typedef struct packed {
         logic          valid;
         active_id_t    active_id;
-        logic [31:0]   pc;
+        logic [XLEN-1:0]   pc;
         logic [31:0]   instr;
         phys_reg_t     prd;
         logic          has_dest;
-        logic [31:0]   data;
+        logic [XLEN-1:0]   data;
         branch_mask_t  branch_mask;
         logic          branch_valid;
         branch_id_t    branch_id;
         logic          branch_mispredict;
-        logic [31:0]   redirect_pc;
+        logic [XLEN-1:0]   redirect_pc;
         logic          control_predicted;
-        logic [31:0]   predicted_pc;
+        logic [XLEN-1:0]   predicted_pc;
         predictor_info_t predictor_info;
         logic          fp_write;
         arch_reg_t     fp_rd;
         fp_reg_data_t   fp_data;
         logic          csr_write;
         logic [11:0]   csr_addr;
-        logic [31:0]   csr_wdata;
+        logic [XLEN-1:0]   csr_wdata;
         logic          fp_fflags_valid;
         logic [4:0]    fp_fflags;
         logic          exception;
@@ -154,15 +160,15 @@ package OOO_Types;
         phys_reg_t     prd;
         phys_reg_t     old_prd;
         logic          has_dest;
-        logic [31:0]   pc;
+        logic [XLEN-1:0]   pc;
         logic [31:0]   instr;
-        logic [31:0]   data;
+        logic [XLEN-1:0]   data;
         logic          fp_write;
         arch_reg_t     fp_rd;
         fp_reg_data_t   fp_data;
         logic          csr_write;
         logic [11:0]   csr_addr;
-        logic [31:0]   csr_wdata;
+        logic [XLEN-1:0]   csr_wdata;
         logic          fp_fflags_valid;
         logic [4:0]    fp_fflags;
         logic          serializing;

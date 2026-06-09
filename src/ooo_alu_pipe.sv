@@ -9,9 +9,9 @@ module ooo_alu_pipe
     input  logic             rst_l,
     input  logic             issue_valid,
     input  issue_entry_t     issue_entry,
-    input  logic [31:0]      rs1_data,
-    input  logic [31:0]      rs2_data,
-    input  logic [31:0]      csr_rdata,
+    input  logic [XLEN-1:0]  rs1_data,
+    input  logic [XLEN-1:0]  rs2_data,
+    input  logic [XLEN-1:0]  csr_rdata,
     input  logic             csr_illegal,
     input  branch_mask_t     abort_mask,
     output writeback_packet_t writeback
@@ -106,16 +106,16 @@ module ooo_alu_pipe
     end
 
 
-    function automatic logic [31:0] result_for(issue_entry_t entry,
-            logic [31:0] src1, logic [31:0] src2);
-        logic [31:0] alu_a;
-        logic [31:0] alu_b;
+    function automatic logic [XLEN-1:0] result_for(issue_entry_t entry,
+            logic [XLEN-1:0] src1, logic [XLEN-1:0] src2);
+        logic [XLEN-1:0] alu_a;
+        logic [XLEN-1:0] alu_b;
         alu_a = entry.ctrl.usePC ? entry.pc : src1;
         alu_b = entry.ctrl.useImm ? entry.imm : src2;
         unique case (entry.ctrl.rd_source)
-            RD_PC4: result_for = entry.pc + 32'd4;
+            RD_PC4: result_for = entry.pc + XLEN'(4);
             RD_IMM: result_for = entry.imm;
-            RD_CMP: result_for = {31'b0, branch_cmp(src1,
+            RD_CMP: result_for = {{(XLEN-1){1'b0}}, branch_cmp(src1,
                 entry.ctrl.useImm ? entry.imm : src2, entry.ctrl.alu_op)};
             default: begin
                 if (entry.ctrl.exec_class == EXEC_CSR) begin
@@ -318,10 +318,10 @@ module ooo_alu_pipe
         end
     endfunction
 
-    function automatic logic [31:0] csr_write_data_for(issue_entry_t entry,
-            logic [31:0] src1, logic [31:0] old_value);
-        logic [31:0] operand;
-        operand = entry.ctrl.useImm ? {27'b0, entry.instr[19:15]} : src1;
+    function automatic logic [XLEN-1:0] csr_write_data_for(issue_entry_t entry,
+            logic [XLEN-1:0] src1, logic [XLEN-1:0] old_value);
+        logic [XLEN-1:0] operand;
+        operand = entry.ctrl.useImm ? {{(XLEN-5){1'b0}}, entry.instr[19:15]} : src1;
         unique case (entry.ctrl.csr_op)
             CSR_RW, CSR_RWI: csr_write_data_for = operand;
             CSR_RS, CSR_RSI: csr_write_data_for = old_value | operand;
@@ -331,7 +331,7 @@ module ooo_alu_pipe
     endfunction
 
     function automatic logic branch_mispredict_for(issue_entry_t entry,
-            logic [31:0] src1, logic [31:0] src2);
+            logic [XLEN-1:0] src1, logic [XLEN-1:0] src2);
         if (entry.control_predicted) begin
             branch_mispredict_for = actual_target_for(entry, src1, src2) !=
                 entry.predicted_pc;
@@ -341,80 +341,84 @@ module ooo_alu_pipe
             branch_mispredict_for = 1'b1;
         end else begin
             branch_mispredict_for = actual_target_for(entry, src1, src2) !=
-                (entry.pc + 32'd4);
+                (entry.pc + XLEN'(4));
         end
     endfunction
 
     function automatic logic control_taken(issue_entry_t entry,
-            logic [31:0] src1, logic [31:0] src2);
+            logic [XLEN-1:0] src1, logic [XLEN-1:0] src2);
         control_taken = (entry.ctrl.pc_source == PC_uncond) ||
             (entry.ctrl.pc_source == PC_indirect) ||
             ((entry.ctrl.pc_source == PC_cond) &&
              branch_cmp(src1, src2, entry.ctrl.alu_op));
     endfunction
 
-    function automatic logic [31:0] actual_target_for(issue_entry_t entry,
-            logic [31:0] src1, logic [31:0] src2);
+    function automatic logic [XLEN-1:0] actual_target_for(issue_entry_t entry,
+            logic [XLEN-1:0] src1, logic [XLEN-1:0] src2);
         if (entry.ctrl.pc_source == PC_uncond) begin
             actual_target_for = entry.pc + entry.imm;
         end else if (entry.ctrl.pc_source == PC_indirect) begin
-            actual_target_for = (src1 + entry.imm) & 32'hffff_fffe;
+            actual_target_for = (src1 + entry.imm) & {{(XLEN-1){1'b1}}, 1'b0};
         end else if ((entry.ctrl.pc_source == PC_cond) &&
                 branch_cmp(src1, src2, entry.ctrl.alu_op)) begin
             actual_target_for = entry.pc + entry.imm;
         end else begin
-            actual_target_for = entry.pc + 32'd4;
+            actual_target_for = entry.pc + XLEN'(4);
         end
     endfunction
 
-    function automatic logic [31:0] alu_result(logic [31:0] a, logic [31:0] b,
-            alu_op_t op);
-        logic signed [63:0] signed_product;
-        logic signed [64:0] mixed_product;
-        logic [63:0] unsigned_product;
-        signed_product = signed'(a) * signed'(b);
-        mixed_product = $signed({a[31], a}) * $signed({1'b0, b});
-        unsigned_product = {32'b0, a} * {32'b0, b};
+    // Sign-extend a 32-bit value to XLEN (RV64 W-form results).
+    function automatic logic [XLEN-1:0] sext32(logic [31:0] v);
+        sext32 = XLEN'($signed(v));   // sign-extend the 32-bit value to XLEN
+    endfunction
+
+    function automatic logic [XLEN-1:0] alu_result(logic [XLEN-1:0] a,
+            logic [XLEN-1:0] b, alu_op_t op);
+        localparam logic [XLEN-1:0] MIN_INT = {1'b1, {(XLEN-1){1'b0}}};
+        logic signed [2*XLEN-1:0] signed_product;
+        logic signed [2*XLEN+1:0] mixed_product;
+        logic [2*XLEN-1:0] unsigned_product;
+        signed_product   = signed'(a) * signed'(b);
+        mixed_product    = $signed({a[XLEN-1], a}) * $signed({1'b0, b});
+        unsigned_product = {{XLEN{1'b0}}, a} * {{XLEN{1'b0}}, b};
         unique case (op)
             ALU_ADD: alu_result = a + b;
             ALU_SUB: alu_result = a - b;
             ALU_XOR: alu_result = a ^ b;
             ALU_OR:  alu_result = a | b;
             ALU_AND: alu_result = a & b;
-            ALU_SLL: alu_result = a << b[4:0];
-            ALU_SRL: alu_result = a >> b[4:0];
-            ALU_SRA: alu_result = signed'(a) >>> b[4:0];
-            ALU_SLT: alu_result = {31'b0, signed'(a) < signed'(b)};
-            ALU_SLTU: alu_result = {31'b0, a < b};
-            ALU_MUL: alu_result = signed_product[31:0];
-            ALU_MULH: alu_result = signed_product[63:32];
-            ALU_MULHSU: alu_result = mixed_product[63:32];
-            ALU_MULHU: alu_result = unsigned_product[63:32];
+            ALU_SLL: alu_result = a << b[$clog2(XLEN)-1:0];
+            ALU_SRL: alu_result = a >> b[$clog2(XLEN)-1:0];
+            ALU_SRA: alu_result = signed'(a) >>> b[$clog2(XLEN)-1:0];
+            ALU_SLT: alu_result = {{(XLEN-1){1'b0}}, signed'(a) < signed'(b)};
+            ALU_SLTU: alu_result = {{(XLEN-1){1'b0}}, a < b};
+            ALU_MUL: alu_result = signed_product[XLEN-1:0];
+            ALU_MULH: alu_result = signed_product[2*XLEN-1:XLEN];
+            ALU_MULHSU: alu_result = mixed_product[2*XLEN-1:XLEN];
+            ALU_MULHU: alu_result = unsigned_product[2*XLEN-1:XLEN];
             ALU_DIV: begin
-                if (b == 32'b0) begin
-                    alu_result = 32'hffff_ffff;
-                end else if ((a == 32'h8000_0000) && (b == 32'hffff_ffff)) begin
-                    alu_result = 32'h8000_0000;
-                end else begin
-                    alu_result = signed'(a) / signed'(b);
-                end
+                if (b == '0)                          alu_result = '1;
+                else if ((a == MIN_INT) && (b == '1)) alu_result = MIN_INT;
+                else                                  alu_result = signed'(a) / signed'(b);
             end
-            ALU_DIVU: alu_result = (b == 32'b0) ? 32'hffff_ffff : (a / b);
+            ALU_DIVU: alu_result = (b == '0) ? '1 : (a / b);
             ALU_REM: begin
-                if (b == 32'b0) begin
-                    alu_result = a;
-                end else if ((a == 32'h8000_0000) && (b == 32'hffff_ffff)) begin
-                    alu_result = 32'b0;
-                end else begin
-                    alu_result = signed'(a) % signed'(b);
-                end
+                if (b == '0)                          alu_result = a;
+                else if ((a == MIN_INT) && (b == '1)) alu_result = '0;
+                else                                  alu_result = signed'(a) % signed'(b);
             end
-            ALU_REMU: alu_result = (b == 32'b0) ? a : (a % b);
-            default: alu_result = 32'b0;
+            ALU_REMU: alu_result = (b == '0) ? a : (a % b);
+            // RV64 W-form ops: 32-bit operate, sign-extend bit 31 to XLEN.
+            ALU_ADDW: alu_result = sext32(a[31:0] +  b[31:0]);
+            ALU_SUBW: alu_result = sext32(a[31:0] -  b[31:0]);
+            ALU_SLLW: alu_result = sext32(a[31:0] << b[4:0]);
+            ALU_SRLW: alu_result = sext32(a[31:0] >> b[4:0]);
+            ALU_SRAW: alu_result = sext32($signed(a[31:0]) >>> b[4:0]);
+            default: alu_result = '0;
         endcase
     endfunction
 
-    function automatic logic branch_cmp(logic [31:0] a, logic [31:0] b,
+    function automatic logic branch_cmp(logic [XLEN-1:0] a, logic [XLEN-1:0] b,
             alu_op_t op);
         unique case (op)
             ALU_BEQ: branch_cmp = (a == b);

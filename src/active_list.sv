@@ -19,7 +19,7 @@ module active_list
     input  rename_packet_t        allocate_packet [OOO_WIDTH],
     input  logic [OOO_WIDTH-1:0]  writeback_valid,
     input  active_id_t            writeback_id [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0][31:0] writeback_data,
+    input  logic [OOO_WIDTH-1:0][XLEN-1:0] writeback_data,
     input  logic [OOO_WIDTH-1:0]  writeback_exception,
     input  logic [OOO_WIDTH-1:0][4:0] writeback_exc_cause,
     input  logic [OOO_WIDTH-1:0]  writeback_halted,
@@ -28,7 +28,7 @@ module active_list
     input  fp_reg_data_t          writeback_fp_data [OOO_WIDTH],
     input  logic [OOO_WIDTH-1:0]  writeback_csr_write,
     input  logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr,
-    input  logic [OOO_WIDTH-1:0][31:0] writeback_csr_wdata,
+    input  logic [OOO_WIDTH-1:0][XLEN-1:0] writeback_csr_wdata,
     input  logic [OOO_WIDTH-1:0]  writeback_fp_fflags_valid,
     input  logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags,
     input  branch_mask_t          reset_mask,
@@ -48,15 +48,15 @@ module active_list
         logic exception;
         logic [4:0] exc_cause;
         logic halted;
-        logic [31:0] pc;
+        logic [XLEN-1:0] pc;
         logic [31:0] instr;
-        logic [31:0] data;
+        logic [XLEN-1:0] data;
         logic fp_write;
         arch_reg_t fp_rd;
         fp_reg_data_t fp_data;
         logic csr_write;
         logic [11:0] csr_addr;
-        logic [31:0] csr_wdata;
+        logic [XLEN-1:0] csr_wdata;
         logic fp_fflags_valid;
         logic [4:0] fp_fflags;
         logic serializing;

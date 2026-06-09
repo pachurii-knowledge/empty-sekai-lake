@@ -12,12 +12,12 @@ module ittage_predictor
     input  logic            clk,
     input  logic            rst_l,
     input  logic            lookup_valid,
-    input  logic [31:0]     lookup_pc,
+    input  logic [XLEN-1:0] lookup_pc,
     output logic            prediction_valid,
-    output logic [31:0]     prediction_target,
+    output logic [XLEN-1:0] prediction_target,
     output predictor_info_t prediction_info,
     input  logic            update_valid,
-    input  logic [31:0]     update_target,
+    input  logic [XLEN-1:0] update_target,
     input  predictor_info_t update_info
 );
 
@@ -27,9 +27,9 @@ module ittage_predictor
     typedef logic [1:0] useful_counter_t;
 
     logic [HISTORY_BITS-1:0] history_q;
-    logic [31:0] base_target [ENTRIES];
+    logic [XLEN-1:0] base_target [ENTRIES];
     logic base_valid [ENTRIES];
-    logic [31:0] tage_target [3][ENTRIES];
+    logic [XLEN-1:0] tage_target [3][ENTRIES];
     confidence_counter_t tage_confidence [3][ENTRIES];
     useful_counter_t tage_useful [3][ENTRIES];
     logic [TAG_BITS-1:0] tage_tag [3][ENTRIES];
