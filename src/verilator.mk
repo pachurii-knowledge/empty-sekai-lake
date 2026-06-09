@@ -80,6 +80,12 @@ ifeq ($(AGENT_DEBUG),1)
 	VERILATOR_CFLAGS += -DAGENT_DEBUG
 endif
 
+# RV64=1 selects the 64-bit datapath (XLEN=64, Sv39). Composes with OOO/
+# SUPERSCALAR; default (unset) builds RV32G. See plans/rv64-linux.md (Track 2).
+ifeq ($(RV64),1)
+	VERILATOR_CFLAGS += -DRV64
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

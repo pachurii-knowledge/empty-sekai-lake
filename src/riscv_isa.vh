@@ -37,9 +37,16 @@ package RISCV_ISA;
     localparam REG_NUM_WIDTH    = $clog2(NUM_REGS);
 
     /* The size of registers, in bits and bytes. This defines the architecture
-     * as either 32-bit or 64-bit. */
+     * as either 32-bit or 64-bit. Selected at build time: -DRV64 (RV64=1) gives
+     * a 64-bit datapath, default is 32-bit. This reparameterizes the register
+     * file, the memory subsystem (WORD_BYTES=XLEN_BYTES, MEMORY_ADDR_WIDTH) and
+     * every module that widths off RISCV_ISA::XLEN. */
     localparam BYTE_WIDTH       = 8;
+`ifdef RV64
+    parameter XLEN              = 64;
+`else
     parameter XLEN              = 32;
+`endif
     localparam XLEN_BYTES       = XLEN / BYTE_WIDTH;
 
     // The sizes of opcodes and function codes in bits

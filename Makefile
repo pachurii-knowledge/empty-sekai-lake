@@ -21,7 +21,15 @@ RISCV_ENTRY_POINT ?= main
 RISCV_CC ?= riscv64-unknown-elf-gcc
 RISCV_OBJCOPY ?= riscv64-unknown-elf-objcopy
 RISCV_OBJDUMP ?= riscv64-unknown-elf-objdump
-RISCV_CFLAGS ?= -static -nostdlib -nostartfiles -march=rv32i -mabi=ilp32 \
+# Target ISA for assembling tests. RV64=1 builds rv64 test binaries to match an
+# RV64 simulator (make verilator-build RV64=1); default is rv32.
+RISCV_ARCH ?= rv32i
+RISCV_ABI  ?= ilp32
+ifeq ($(RV64),1)
+override RISCV_ARCH := rv64g
+override RISCV_ABI  := lp64
+endif
+RISCV_CFLAGS ?= -static -nostdlib -nostartfiles -march=$(RISCV_ARCH) -mabi=$(RISCV_ABI) \
 		-Wall -Wextra -std=c11 -pedantic -g \
 		-Werror=implicit-function-declaration
 RISCV_AS_LDFLAGS ?= -Wl,-e$(RISCV_ENTRY_POINT)
