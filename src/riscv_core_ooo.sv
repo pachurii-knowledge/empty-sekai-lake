@@ -201,7 +201,7 @@ module riscv_core_ooo
     logic [XLEN-1:0] csr_mstatus, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
     logic [XLEN-1:0] csr_mtvec, csr_stvec, csr_mepc, csr_sepc, csr_satp;
     logic [31:0] csr_pmpcfg_arr [4];
-    logic [31:0] csr_pmpaddr_arr [16];
+    logic [XLEN-1:0] csr_pmpaddr_arr [16];
     logic        csr_menvcfg_adue;
     logic [63:0] clint_mtime;
     logic        irq_mtimer, irq_msoft;
@@ -541,18 +541,17 @@ module riscv_core_ooo
     // ===================== Sv32 MMU (Phase 4) =====================
     // satp / mstatus-derived translation context. Identical to the scalar core.
     logic        satp_mode;
-    logic [21:0] satp_ppn;
-    logic [8:0]  satp_asid;
+    logic [RISCV_Priv::VM_PPN_W-1:0]  satp_ppn;
+    logic [RISCV_Priv::VM_ASID_W-1:0] satp_asid;
     logic        mstatus_mprv, mstatus_sum, mstatus_mxr;
     RISCV_Priv::priv_mode_t mpp_mode, priv_data;
     logic        paging_fetch, paging_data;
 
 `ifdef RV64
-    // Sv39 satp layout: MODE[63:60] (8 = Sv39), ASID[59:44], PPN[43:0]. The
-    // PPN/ASID slices feed the Sv39 walker (widened in R5).
+    // Sv39 satp layout: MODE[63:60] (8 = Sv39), ASID[59:44], PPN[43:0].
     assign satp_mode    = (csr_satp[63:60] == 4'd8);
-    assign satp_ppn     = csr_satp[21:0];
-    assign satp_asid    = csr_satp[52:44];
+    assign satp_ppn     = csr_satp[43:0];
+    assign satp_asid    = csr_satp[59:44];
 `else
     assign satp_mode    = csr_satp[31];
     assign satp_ppn     = csr_satp[21:0];
@@ -569,11 +568,22 @@ module riscv_core_ooo
     // TLB flush: SFENCE.VMA or any satp write (driven in the commit block).
     logic tlb_flush;
 
-    // Compute a 32-bit (capped) physical byte address from a leaf translation.
-    function automatic logic [XLEN-1:0] make_pa(input logic [21:0] ppn,
-            input logic superpage, input logic [XLEN-1:0] va);
-        if (superpage) make_pa = {ppn[19:10], va[21:0]};
-        else           make_pa = {ppn[19:0],  va[11:0]};
+    // Compute an XLEN-capped physical byte address from a leaf translation
+    // found at the given level (level > 0 substitutes the VA's low VPN slices
+    // into the superpage's PPN).
+    function automatic logic [XLEN-1:0] make_pa(
+            input logic [RISCV_Priv::VM_PPN_W-1:0] ppn,
+            input logic [1:0] level, input logic [XLEN-1:0] va);
+`ifdef RV64
+        unique case (level)
+            2'd2:    make_pa = {8'b0, ppn[43:18], va[29:0]};  // 1 GiB
+            2'd1:    make_pa = {8'b0, ppn[43:9],  va[20:0]};  // 2 MiB
+            default: make_pa = {8'b0, ppn,        va[11:0]};  // 4 KiB
+        endcase
+`else
+        if (level != 2'd0) make_pa = {ppn[19:10], va[21:0]};  // 4 MiB
+        else               make_pa = {ppn[19:0],  va[11:0]};  // 4 KiB
+`endif
     endfunction
 
     // Leaf-PTE permission fault (excludes A/D, which trigger a re-walk).
@@ -607,40 +617,63 @@ module riscv_core_ooo
     logic [1:0]  data_acc;
     assign data_acc = mem_req_store ? 2'd2 : 2'd1;
 
+    logic        data_noncanon, fetch_noncanon;
+`ifdef RV64
+    // Sv39 canonical check: VA bits [63:39] must all equal bit 38. A TLB
+    // lookup truncates to VPN bits, so a non-canonical VA could falsely hit a
+    // canonical entry -- gate the hit and walk the (faulting) access instead.
+    assign data_noncanon  = paging_data &&
+        (mem_req_vaddr[XLEN-1:39] != {(XLEN-39){mem_req_vaddr[38]}});
+    assign fetch_noncanon = paging_fetch &&
+        (pc_q[XLEN-1:39] != {(XLEN-39){pc_q[38]}});
+`else
+    assign data_noncanon  = 1'b0;
+    assign fetch_noncanon = 1'b0;
+`endif
+
     // --- DTLB ---
-    logic        dtlb_hit, dtlb_super;
-    logic [21:0] dtlb_ppn;
+    logic        dtlb_hit;
+    logic [1:0]  dtlb_level;
+    logic [RISCV_Priv::VM_PPN_W-1:0] dtlb_ppn;
     logic [7:0]  dtlb_perm;
     logic        d_need_ad, dtlb_usable;
     assign d_need_ad   = !dtlb_perm[RISCV_Priv::PTE_A] ||
                          ((data_acc == 2'd2) && !dtlb_perm[RISCV_Priv::PTE_D]);
-    assign dtlb_usable = dtlb_hit && !d_need_ad;
+    // A non-canonical Sv39 VA must not use a (VPN-truncated) TLB hit; it goes
+    // to the walker, which faults it.
+    assign dtlb_usable = dtlb_hit && !d_need_ad && !data_noncanon;
 
     // --- Page-table walker (shared; data has priority over fetch) ---
-    logic        ptw_req, ptw_done, ptw_fault, ptw_busy, ptw_super;
+    logic        ptw_req, ptw_done, ptw_fault, ptw_busy;
+    logic [1:0]  ptw_level;
     logic        ptw_fault_access;       // PTW fault is a PMP-on-PTE access fault
     logic        ptw_pte_pmp_fault;      // PMP denies the in-flight PTE access
     logic        ptw_mem_is_write;       // in-flight PTE access is an A/D write
-    logic [21:0] ptw_ppn;
+    logic [RISCV_Priv::VM_PPN_W-1:0] ptw_ppn;
     logic [7:0]  ptw_perm;
-    logic [19:0] ptw_vpn;
-    logic [19:0] ptw_walk_vpn;     // VPN the in-flight walk was launched for
+    logic [RISCV_Priv::VM_VPN_W-1:0] ptw_vpn;
+    logic [RISCV_Priv::VM_VPN_W-1:0] ptw_walk_vpn; // VPN the walk was launched for
     logic        ptw_walk_is_data; // that walk is a data (vs fetch) access
     logic [1:0]  ptw_access;
     RISCV_Priv::priv_mode_t ptw_priv;
-    logic [31:0] ptw_mem_addr;
+    logic [XLEN-1:0] ptw_mem_addr;
 
-    logic        itlb_hit, itlb_super;
-    logic [21:0] itlb_ppn;
+    logic        itlb_hit;
+    logic [1:0]  itlb_level;
+    logic [RISCV_Priv::VM_PPN_W-1:0] itlb_ppn;
     logic [7:0]  itlb_perm;
     logic        data_need_walk, fetch_need_walk;
     logic        ptw_for_data;
+    logic        itlb_usable;
+    assign itlb_usable = itlb_hit && !fetch_noncanon;
     assign data_need_walk  = paging_data && mem_req_valid && !dtlb_usable;
-    assign fetch_need_walk = paging_fetch && !itlb_hit;
+    assign fetch_need_walk = paging_fetch && !itlb_usable;
     // Data accesses have priority over instruction fetch for the shared walker.
     assign ptw_for_data = data_need_walk;
     assign ptw_req    = data_need_walk || fetch_need_walk;
-    assign ptw_vpn    = ptw_for_data ? mem_req_vaddr[31:12] : pc_q[31:12];
+    assign ptw_vpn    = ptw_for_data ?
+        mem_req_vaddr[RISCV_Priv::VM_VPN_W+11:12] :
+        pc_q[RISCV_Priv::VM_VPN_W+11:12];
     assign ptw_access = ptw_for_data ? data_acc : 2'd0;
     assign ptw_priv   = ptw_for_data ? priv_data : cur_priv;
 
@@ -654,6 +687,7 @@ module riscv_core_ooo
         .mstatus_sum(mstatus_sum),
         .mstatus_mxr(mstatus_mxr),
         .adue(csr_menvcfg_adue),
+        .req_noncanonical(ptw_for_data ? data_noncanon : fetch_noncanon),
         .mem_req(),
         .mem_we(ptw_we),
         .mem_is_write(ptw_mem_is_write),
@@ -668,11 +702,11 @@ module riscv_core_ooo
         .fault_access(ptw_fault_access),
         .ppn(ptw_ppn),
         .perm(ptw_perm),
-        .superpage(ptw_super),
+        .leaf_level(ptw_level),
         .walk_vpn(ptw_walk_vpn),
         .walk_is_data(ptw_walk_is_data)
     );
-    assign ptw_addr = ptw_mem_addr[31:2];
+    assign ptw_addr = ptw_mem_addr[XLEN-1:ADDR_SHIFT];
 
     // PMP on the implicit PTE access. Per the priv spec these accesses are checked
     // as Supervisor (reads need R, A/D writes need W); a violation aborts the walk
@@ -689,30 +723,30 @@ module riscv_core_ooo
     mmu_tlb #(.ENTRIES(16)) ITLB (
         .clk, .rst_l,
         .lookup_en(paging_fetch),
-        .lookup_vpn(pc_q[31:12]),
+        .lookup_vpn(pc_q[RISCV_Priv::VM_VPN_W+11:12]),
         .lookup_asid(satp_asid),
         .hit(itlb_hit), .hit_ppn(itlb_ppn), .hit_perm(itlb_perm),
-        .hit_superpage(itlb_super),
+        .hit_level(itlb_level),
         // Fill against the VPN the PTW actually walked, gated by the walk's
         // latched class -- not the live fetch/data head, which may have moved.
         .fill_en(ptw_done && !ptw_fault && !ptw_walk_is_data),
         .fill_vpn(ptw_walk_vpn),
         .fill_asid(satp_asid),
-        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_superpage(ptw_super),
+        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_level(ptw_level),
         .flush_en(tlb_flush)
     );
 
     mmu_tlb #(.ENTRIES(16)) DTLB (
         .clk, .rst_l,
         .lookup_en(paging_data && mem_req_valid),
-        .lookup_vpn(mem_req_vaddr[31:12]),
+        .lookup_vpn(mem_req_vaddr[RISCV_Priv::VM_VPN_W+11:12]),
         .lookup_asid(satp_asid),
         .hit(dtlb_hit), .hit_ppn(dtlb_ppn), .hit_perm(dtlb_perm),
-        .hit_superpage(dtlb_super),
+        .hit_level(dtlb_level),
         .fill_en(ptw_done && !ptw_fault && ptw_walk_is_data),
         .fill_vpn(ptw_walk_vpn),
         .fill_asid(satp_asid),
-        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_superpage(ptw_super),
+        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_level(ptw_level),
         .flush_en(tlb_flush)
     );
 
@@ -725,8 +759,8 @@ module riscv_core_ooo
     assign data_from_ptw = ptw_for_data && ptw_done && !ptw_fault;
     always_comb begin
         if (!paging_data)        data_pa = mem_req_vaddr;
-        else if (dtlb_usable)    data_pa = make_pa(dtlb_ppn, dtlb_super, mem_req_vaddr);
-        else if (data_from_ptw)  data_pa = make_pa(ptw_ppn, ptw_super, mem_req_vaddr);
+        else if (dtlb_usable)    data_pa = make_pa(dtlb_ppn, dtlb_level, mem_req_vaddr);
+        else if (data_from_ptw)  data_pa = make_pa(ptw_ppn, ptw_level, mem_req_vaddr);
         else                     data_pa = mem_req_vaddr;
     end
     assign data_perm_fault =
@@ -773,8 +807,8 @@ module riscv_core_ooo
     assign ptw_fetch_done = (!ptw_for_data) && ptw_done;
     always_comb begin
         if (!paging_fetch)       fetch_pa = pc_q;
-        else if (itlb_hit)       fetch_pa = make_pa(itlb_ppn, itlb_super, pc_q);
-        else if (fetch_from_ptw) fetch_pa = make_pa(ptw_ppn, ptw_super, pc_q);
+        else if (itlb_usable)    fetch_pa = make_pa(itlb_ppn, itlb_level, pc_q);
+        else if (fetch_from_ptw) fetch_pa = make_pa(ptw_ppn, ptw_level, pc_q);
         else                     fetch_pa = pc_q;
     end
     // Freeze the frontend while the walker resolves the fetch translation.
@@ -786,7 +820,7 @@ module riscv_core_ooo
     // mtval = faulting VA.
     logic fetch_perm_fault;
     assign fetch_perm_fault =
-        (itlb_hit && perm_bad(itlb_perm, 2'd0, cur_priv,
+        (itlb_usable && perm_bad(itlb_perm, 2'd0, cur_priv,
             mstatus_sum, mstatus_mxr)) ||
         (fetch_need_walk && !ptw_for_data && ptw_done && ptw_fault);
     // A PMP fault on a PTE access during a fetch walk is an instruction *access*
@@ -804,7 +838,7 @@ module riscv_core_ooo
     logic fetch_pa_resolved;
     logic [OOO_WIDTH-1:0] pmp_fetch_fault_lane;
     logic [OOO_WIDTH-1:0] fetch_lane_in_block;
-    assign fetch_pa_resolved = !paging_fetch || itlb_hit || fetch_from_ptw;
+    assign fetch_pa_resolved = !paging_fetch || itlb_usable || fetch_from_ptw;
     genvar fpl;
     generate
         for (fpl = 0; fpl < OOO_WIDTH; fpl += 1) begin : fetch_pmp_gen

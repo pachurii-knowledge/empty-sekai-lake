@@ -16,11 +16,11 @@
 module pmp_checker
     import RISCV_Priv::*;
 (
-    input  logic [31:0]       paddr,            // byte physical address
+    input  logic [MXLEN-1:0]  paddr,            // byte physical address
     input  logic [1:0]        access,           // 0 = fetch, 1 = load, 2 = store
     input  priv_mode_t        priv,
     input  logic [31:0]       pmpcfg [4],
-    input  logic [31:0]       pmpaddr [16],
+    input  logic [MXLEN-1:0]  pmpaddr [16],
     output logic              fault
 );
 
@@ -33,25 +33,29 @@ module pmp_checker
     localparam logic [1:0] A_NA4   = 2'd2;
     localparam logic [1:0] A_NAPOT = 2'd3;
 
-    logic [29:0] addr_word;
-    assign addr_word = paddr[31:2];
+    // Implemented pmpaddr bits: PA[33:2] at RV32 (the registers hold 32 bits),
+    // PA[55:2] at RV64 (54 bits).
+    localparam int PMP_AW = (MXLEN == 64) ? 54 : 30;
+
+    logic [PMP_AW-1:0] addr_word;
+    assign addr_word = paddr[PMP_AW+1:2];
 
     function automatic logic [7:0] cfg_byte(input int idx);
         cfg_byte = pmpcfg[idx / 4][(idx % 4) * 8 +: 8];
     endfunction
 
     // NAPOT match: a has k trailing ones encoding a 2^(k+3) byte region.
-    function automatic logic napot_match(input logic [29:0] a,
-            input logic [29:0] addr);
-        logic [30:0] xor1;
-        logic [29:0] ignore;
+    function automatic logic napot_match(input logic [PMP_AW-1:0] a,
+            input logic [PMP_AW-1:0] addr);
+        logic [PMP_AW:0] xor1;
+        logic [PMP_AW-1:0] ignore;
         // a (= byte addr >> 2) has k trailing ones encoding a 2^(k+3)-byte region,
         // i.e. 2^(k+1) words; the low (k+1) bits of the word address are ignored.
         // a ^ (a+1) is exactly those (k+1) low bits, so it IS the ignore mask
         // (matching the Sail model's NAPOT begin/size computation).
-        xor1   = {1'b0, a} ^ ({1'b0, a} + 31'd1);  // (k+1) trailing ones
-        ignore = xor1[29:0];                        // low (k+1) bits to ignore
-        napot_match = ((addr ^ a) & ~ignore) == 30'b0;
+        xor1   = {1'b0, a} ^ ({1'b0, a} + 1'b1);   // (k+1) trailing ones
+        ignore = xor1[PMP_AW-1:0];                  // low (k+1) bits to ignore
+        napot_match = ((addr ^ a) & ~ignore) == '0;
     endfunction
 
     logic        any_enabled;
@@ -68,7 +72,7 @@ module pmp_checker
             logic [7:0] cfg;
             logic [1:0] a_mode;
             logic       hit_i;
-            logic [29:0] lo, hi;
+            logic [PMP_AW-1:0] lo, hi;
             cfg    = cfg_byte(i);
             a_mode = cfg[4:3];
             hit_i  = 1'b0;
@@ -76,12 +80,12 @@ module pmp_checker
 
             unique case (a_mode)
                 A_TOR: begin
-                    lo = (i == 0) ? 30'b0 : pmpaddr[i-1][29:0];
-                    hi = pmpaddr[i][29:0];
+                    lo = (i == 0) ? '0 : pmpaddr[i-1][PMP_AW-1:0];
+                    hi = pmpaddr[i][PMP_AW-1:0];
                     hit_i = (addr_word >= lo) && (addr_word < hi);
                 end
-                A_NA4:   hit_i = (addr_word == pmpaddr[i][29:0]);
-                A_NAPOT: hit_i = napot_match(pmpaddr[i][29:0], addr_word);
+                A_NA4:   hit_i = (addr_word == pmpaddr[i][PMP_AW-1:0]);
+                A_NAPOT: hit_i = napot_match(pmpaddr[i][PMP_AW-1:0], addr_word);
                 default: hit_i = 1'b0;
             endcase
 

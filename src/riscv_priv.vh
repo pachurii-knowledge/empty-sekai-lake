@@ -170,6 +170,18 @@ package RISCV_Priv;
     localparam int SV32_PGSHIFT = 12;
     localparam int SV32_PTESIZE = 4;
 
+    /*------------------------------------------------------------------------
+     * Virtual-memory geometry, selected by MXLEN: Sv32 (2-level, 4-byte PTEs)
+     * at RV32, Sv39 (3-level, 8-byte PTEs) at RV64. Shared by the PTW, the
+     * TLBs and both cores' translation plumbing.
+     *----------------------------------------------------------------------*/
+    localparam int VM_LEVELS    = (MXLEN == 64) ? 3 : 2;
+    localparam int VM_VPN_W     = (MXLEN == 64) ? 27 : 20;  // va[38:12] / va[31:12]
+    localparam int VM_VPN_SLICE = (MXLEN == 64) ? 9 : 10;   // VPN bits per level
+    localparam int VM_PPN_W     = (MXLEN == 64) ? 44 : 22;
+    localparam int VM_PTESHIFT  = (MXLEN == 64) ? 3 : 2;    // log2(PTE bytes)
+    localparam int VM_ASID_W    = (MXLEN == 64) ? 16 : 9;
+
     // PTE bit positions
     localparam int PTE_V = 0;
     localparam int PTE_R = 1;

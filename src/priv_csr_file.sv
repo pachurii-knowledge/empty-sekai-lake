@@ -78,7 +78,7 @@ module priv_csr_file
 
     // PMP configuration exposed to the PMP checker
     output logic [31:0] pmpcfg_o  [4],
-    output logic [31:0] pmpaddr_o [16],
+    output logic [MXLEN-1:0] pmpaddr_o [16],
 
     // menvcfg.ADUE: when set, the PTW performs hardware A/D updates (Svadu);
     // when clear, a page needing an A/D update faults instead (Svade).
@@ -138,9 +138,13 @@ module priv_csr_file
     logic [4:0]  fflags_q;
     logic [2:0]  frm_q;
 
-    // PMP
+    // PMP. The cfg state is kept as four 32-bit words (eight bytes pack into
+    // the even pmpcfg CSRs on RV64); pmpaddr implements PA[33:2] (32 bits) at
+    // RV32 and PA[55:2] (54 bits, WARL-zero above) at RV64.
+    localparam logic [MXLEN-1:0] PMPADDR_MASK =
+        (MXLEN == 64) ? MXLEN'(64'h003F_FFFF_FFFF_FFFF) : MXLEN'(32'hFFFF_FFFF);
     logic [31:0] pmpcfg_q  [4];
-    logic [31:0] pmpaddr_q [16];
+    logic [MXLEN-1:0] pmpaddr_q [16];
 
     assign frm_value = frm_q;
     assign priv      = priv_q;
@@ -406,7 +410,7 @@ module priv_csr_file
             fflags_q    <= 5'b0;
             frm_q       <= 3'b0;
             for (int i = 0; i < 4; i += 1)  pmpcfg_q[i]  <= 32'b0;
-            for (int i = 0; i < 16; i += 1) pmpaddr_q[i] <= 32'b0;
+            for (int i = 0; i < 16; i += 1) pmpaddr_q[i] <= '0;
         end else begin
             // Free-running counters, gated by mcountinhibit (CY bit0 / IR bit2).
             if (!mcountinhibit_q[0]) mcycle_q <= mcycle_q + 64'd1;
@@ -584,7 +588,7 @@ module priv_csr_file
                     // A locked entry (or the base of a locked TOR entry above)
                     // ignores pmpaddr writes.
                     if (!pmp_addr_locked(addr - CSR_PMPADDR0))
-                        pmpaddr_q[addr - CSR_PMPADDR0] <= wdata[31:0];
+                        pmpaddr_q[addr - CSR_PMPADDR0] <= wdata & PMPADDR_MASK;
                 end
             end
         endcase

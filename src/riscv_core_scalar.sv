@@ -609,18 +609,17 @@ module riscv_core_scalar
     //===============================Sv32 MMU=========================//
     // satp / mstatus-derived translation context
     logic        satp_mode;
-    logic [21:0] satp_ppn;
-    logic [8:0]  satp_asid;
+    logic [RISCV_Priv::VM_PPN_W-1:0]  satp_ppn;
+    logic [RISCV_Priv::VM_ASID_W-1:0] satp_asid;
     logic        mstatus_mprv, mstatus_sum, mstatus_mxr;
     RISCV_Priv::priv_mode_t mpp_mode, priv_data;
     logic        paging_fetch, paging_data;
 
 `ifdef RV64
-    // Sv39 satp layout: MODE[63:60] (8 = Sv39), ASID[59:44], PPN[43:0]. The
-    // PPN/ASID slices feed the Sv39 walker (widened in R5).
+    // Sv39 satp layout: MODE[63:60] (8 = Sv39), ASID[59:44], PPN[43:0].
     assign satp_mode    = (csr_satp[63:60] == 4'd8);
-    assign satp_ppn     = csr_satp[21:0];
-    assign satp_asid    = csr_satp[52:44];
+    assign satp_ppn     = csr_satp[43:0];
+    assign satp_asid    = csr_satp[59:44];
 `else
     assign satp_mode    = csr_satp[31];
     assign satp_ppn     = csr_satp[21:0];
@@ -636,12 +635,22 @@ module riscv_core_scalar
     assign paging_fetch = satp_mode && (cur_priv  != RISCV_Priv::PRIV_M);
     assign paging_data  = satp_mode && (priv_data != RISCV_Priv::PRIV_M);
 
-    // Compute a physical byte address from a leaf translation. (Sv32 layout;
-    // the Sv39 widening is a later phase -- bare mode bypasses this.)
-    function automatic logic [XLEN-1:0] make_pa(input logic [21:0] ppn,
-            input logic superpage, input logic [XLEN-1:0] va);
-        if (superpage) make_pa = {ppn[19:10], va[21:0]};
-        else           make_pa = {ppn[19:0],  va[11:0]};
+    // Compute a physical byte address from a leaf translation found at the
+    // given level (level > 0 substitutes the VA's low VPN slices into the
+    // superpage's PPN).
+    function automatic logic [XLEN-1:0] make_pa(
+            input logic [RISCV_Priv::VM_PPN_W-1:0] ppn,
+            input logic [1:0] level, input logic [XLEN-1:0] va);
+`ifdef RV64
+        unique case (level)
+            2'd2:    make_pa = {8'b0, ppn[43:18], va[29:0]};  // 1 GiB
+            2'd1:    make_pa = {8'b0, ppn[43:9],  va[20:0]};  // 2 MiB
+            default: make_pa = {8'b0, ppn,        va[11:0]};  // 4 KiB
+        endcase
+`else
+        if (level != 2'd0) make_pa = {ppn[19:10], va[21:0]};  // 4 MiB
+        else               make_pa = {ppn[19:0],  va[11:0]};  // 4 KiB
+`endif
     endfunction
 
     // Leaf-PTE permission fault (excludes A/D, which trigger a re-walk).
@@ -669,48 +678,65 @@ module riscv_core_scalar
     endfunction
 
     // --- shared PTW <-> memory port ---
-    logic        ptw_req, ptw_done, ptw_fault, ptw_busy, ptw_super;
-    logic [21:0] ptw_ppn;
+    logic        ptw_req, ptw_done, ptw_fault, ptw_busy;
+    logic [1:0]  ptw_level;
+    logic [RISCV_Priv::VM_PPN_W-1:0] ptw_ppn;
     logic [7:0]  ptw_perm;
-    logic [19:0] ptw_vpn;
+    logic [RISCV_Priv::VM_VPN_W-1:0] ptw_vpn;
     logic [1:0]  ptw_access;
     RISCV_Priv::priv_mode_t ptw_priv;
-    logic [31:0] ptw_mem_addr;
+    logic [XLEN-1:0] ptw_mem_addr;
 
     // --- DTLB lookup (data side, at EX) ---
     logic        dmem_op_E;
     logic [1:0]  data_acc;
     logic        dtlb_hit;
-    logic [21:0] dtlb_ppn;
+    logic [RISCV_Priv::VM_PPN_W-1:0] dtlb_ppn;
     logic [7:0]  dtlb_perm;
-    logic        dtlb_super;
+    logic [1:0]  dtlb_level;
     logic        d_need_ad;
     logic        dtlb_usable;
     logic        data_need_walk;
+    logic        data_noncanon, fetch_noncanon;
 
     assign dmem_op_E = (ctrl_signals_E.memRead || ctrl_signals_E.memWrite) && valid_E;
     assign data_acc  = ctrl_signals_E.memWrite ? 2'd2 : 2'd1;
     assign d_need_ad = !dtlb_perm[RISCV_Priv::PTE_A] ||
                        ((data_acc == 2'd2) && !dtlb_perm[RISCV_Priv::PTE_D]);
-    assign dtlb_usable  = dtlb_hit && !d_need_ad;
+`ifdef RV64
+    // Sv39 canonical check: VA bits [63:39] must equal bit 38. A truncated
+    // VPN lookup could falsely hit the TLB, so the access is sent to the
+    // walker, which page-faults it without walking.
+    assign data_noncanon  = paging_data &&
+        (alu_out_E[XLEN-1:39] != {(XLEN-39){alu_out_E[38]}});
+    assign fetch_noncanon = paging_fetch &&
+        (pc_F1[XLEN-1:39] != {(XLEN-39){pc_F1[38]}});
+`else
+    assign data_noncanon  = 1'b0;
+    assign fetch_noncanon = 1'b0;
+`endif
+    assign dtlb_usable  = dtlb_hit && !d_need_ad && !data_noncanon;
     assign data_need_walk = paging_data && dmem_op_E && !dtlb_usable &&
         (~flush_M1) && (~flush_W);
 
     // --- ITLB lookup (fetch side, at F1) ---
-    logic        itlb_hit;
-    logic [21:0] itlb_ppn;
+    logic        itlb_hit, itlb_usable;
+    logic [RISCV_Priv::VM_PPN_W-1:0] itlb_ppn;
     logic [7:0]  itlb_perm;
-    logic        itlb_super;
+    logic [1:0]  itlb_level;
     logic        fetch_need_walk;
     logic [XLEN-1:0] phys_pc;
 
-    assign fetch_need_walk = paging_fetch && !itlb_hit;
+    assign itlb_usable = itlb_hit && !fetch_noncanon;
+    assign fetch_need_walk = paging_fetch && !itlb_usable;
 
     // --- PTW arbitration: data side has priority over fetch ---
     logic ptw_for_data;
     assign ptw_for_data = data_need_walk;
     assign ptw_req    = data_need_walk || fetch_need_walk;
-    assign ptw_vpn    = ptw_for_data ? alu_out_E[31:12] : pc_F1[31:12];
+    assign ptw_vpn    = ptw_for_data ?
+        alu_out_E[RISCV_Priv::VM_VPN_W+11:12] :
+        pc_F1[RISCV_Priv::VM_VPN_W+11:12];
     assign ptw_access = ptw_for_data ? data_acc : 2'd0;
     assign ptw_priv   = ptw_for_data ? priv_data : cur_priv;
 
@@ -728,6 +754,7 @@ module riscv_core_scalar
         .mstatus_sum(mstatus_sum),
         .mstatus_mxr(mstatus_mxr),
         .adue(csr_menvcfg_adue),
+        .req_noncanonical(ptw_for_data ? data_noncanon : fetch_noncanon),
         .mem_req(),
         .mem_we(ptw_we),
         .mem_is_write(),
@@ -742,35 +769,35 @@ module riscv_core_scalar
         .fault_access(),
         .ppn(ptw_ppn),
         .perm(ptw_perm),
-        .superpage(ptw_super)
+        .leaf_level(ptw_level)
     );
-    assign ptw_addr = ptw_mem_addr[31:2];
+    assign ptw_addr = ptw_mem_addr[XLEN-1:ADDR_SHIFT];
 
     mmu_tlb #(.ENTRIES(16)) ITLB (
         .clk, .rst_l,
         .lookup_en(paging_fetch),
-        .lookup_vpn(pc_F1[31:12]),
+        .lookup_vpn(pc_F1[RISCV_Priv::VM_VPN_W+11:12]),
         .lookup_asid(satp_asid),
         .hit(itlb_hit), .hit_ppn(itlb_ppn), .hit_perm(itlb_perm),
-        .hit_superpage(itlb_super),
+        .hit_level(itlb_level),
         .fill_en(ptw_done && !ptw_fault && !ptw_for_data),
-        .fill_vpn(pc_F1[31:12]),
+        .fill_vpn(pc_F1[RISCV_Priv::VM_VPN_W+11:12]),
         .fill_asid(satp_asid),
-        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_superpage(ptw_super),
+        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_level(ptw_level),
         .flush_en(tlb_flush)
     );
 
     mmu_tlb #(.ENTRIES(16)) DTLB (
         .clk, .rst_l,
         .lookup_en(paging_data && dmem_op_E),
-        .lookup_vpn(alu_out_E[31:12]),
+        .lookup_vpn(alu_out_E[RISCV_Priv::VM_VPN_W+11:12]),
         .lookup_asid(satp_asid),
         .hit(dtlb_hit), .hit_ppn(dtlb_ppn), .hit_perm(dtlb_perm),
-        .hit_superpage(dtlb_super),
+        .hit_level(dtlb_level),
         .fill_en(ptw_done && !ptw_fault && ptw_for_data),
-        .fill_vpn(alu_out_E[31:12]),
+        .fill_vpn(alu_out_E[RISCV_Priv::VM_VPN_W+11:12]),
         .fill_asid(satp_asid),
-        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_superpage(ptw_super),
+        .fill_ppn(ptw_ppn), .fill_perm(ptw_perm), .fill_level(ptw_level),
         .flush_en(tlb_flush)
     );
 
@@ -779,16 +806,16 @@ module riscv_core_scalar
     assign ptw_stall = ptw_req && !ptw_done;
 
     // --- Resolve the data physical address at EX ---
-    logic [31:0] pa_E;
+    logic [XLEN-1:0] pa_E;
     logic        data_from_ptw;
     assign data_from_ptw = ptw_for_data && ptw_done && !ptw_fault;
     always_comb begin
         if (!paging_data) begin
             pa_E = alu_out_E;
         end else if (dtlb_usable) begin
-            pa_E = make_pa(dtlb_ppn, dtlb_super, alu_out_E);
+            pa_E = make_pa(dtlb_ppn, dtlb_level, alu_out_E);
         end else if (data_from_ptw) begin
-            pa_E = make_pa(ptw_ppn, ptw_super, alu_out_E);
+            pa_E = make_pa(ptw_ppn, ptw_level, alu_out_E);
         end else begin
             pa_E = alu_out_E;     // walk in progress; address unused until done
         end
@@ -807,7 +834,7 @@ module riscv_core_scalar
 
     // --- PMP on the data physical address ---
     logic [31:0] pmpcfg_arr [4];
-    logic [31:0] pmpaddr_arr [16];
+    logic [XLEN-1:0] pmpaddr_arr [16];
     logic        data_pmp_fault;
     pmp_checker DataPMP (
         .paddr(pa_E), .access(data_acc), .priv(priv_data),
@@ -823,10 +850,10 @@ module riscv_core_scalar
     always_comb begin
         if (!paging_fetch) begin
             phys_pc = pc_F1;
-        end else if (itlb_hit) begin
-            phys_pc = make_pa(itlb_ppn, itlb_super, pc_F1);
+        end else if (itlb_usable) begin
+            phys_pc = make_pa(itlb_ppn, itlb_level, pc_F1);
         end else if (fetch_from_ptw) begin
-            phys_pc = make_pa(ptw_ppn, ptw_super, pc_F1);
+            phys_pc = make_pa(ptw_ppn, ptw_level, pc_F1);
         end else begin
             phys_pc = pc_F1;
         end
@@ -837,7 +864,7 @@ module riscv_core_scalar
         ifault_F1     = 1'b0;
         ifault_acc_F1 = 1'b0;
         if (paging_fetch) begin
-            if (itlb_hit && perm_bad(itlb_perm, 2'd0, cur_priv,
+            if (itlb_usable && perm_bad(itlb_perm, 2'd0, cur_priv,
                     mstatus_sum, mstatus_mxr))
                 ifault_F1 = 1'b1;
             else if ((!ptw_for_data) && ptw_done && ptw_fault)
