@@ -20,13 +20,13 @@ module trap_controller
     import RISCV_Priv::*;
 (
     input  priv_mode_t  priv,
-    input  logic [31:0] mstatus,
-    input  logic [31:0] mie_csr,
-    input  logic [31:0] mip_csr,
-    input  logic [31:0] medeleg,
-    input  logic [31:0] mideleg,
-    input  logic [31:0] mtvec,
-    input  logic [31:0] stvec,
+    input  logic [MXLEN-1:0] mstatus,
+    input  logic [MXLEN-1:0] mie_csr,
+    input  logic [MXLEN-1:0] mip_csr,
+    input  logic [MXLEN-1:0] medeleg,
+    input  logic [MXLEN-1:0] mideleg,
+    input  logic [MXLEN-1:0] mtvec,
+    input  logic [MXLEN-1:0] stvec,
 
     // Synchronous exception request from the committing instruction
     input  logic        exc_valid,
@@ -36,7 +36,7 @@ module trap_controller
     output logic        trap_is_interrupt,
     output logic [4:0]  trap_cause,
     output priv_mode_t  trap_target_priv,
-    output logic [31:0] trap_vector
+    output logic [MXLEN-1:0] trap_vector
 );
 
     localparam int SSI_BIT = 1;
@@ -48,8 +48,8 @@ module trap_controller
 
     logic mie_global, sie_global;
     logic m_enabled, s_enabled;
-    logic [31:0] pending;
-    logic [31:0] m_ints, s_ints;
+    logic [MXLEN-1:0] pending;
+    logic [MXLEN-1:0] m_ints, s_ints;
     logic        take_m_int, take_s_int;
     logic [4:0]  m_cause, s_cause;
 
@@ -66,7 +66,7 @@ module trap_controller
     assign s_ints  = pending & mideleg;    // delegated to S
 
     // Standard interrupt priority: MEI > MSI > MTI > SEI > SSI > STI.
-    function automatic logic [4:0] pick_int(input logic [31:0] bits);
+    function automatic logic [4:0] pick_int(input logic [MXLEN-1:0] bits);
         if (bits[MEI_BIT])      pick_int = INT_M_EXTERNAL;
         else if (bits[MSI_BIT]) pick_int = INT_M_SOFTWARE;
         else if (bits[MTI_BIT]) pick_int = INT_M_TIMER;
@@ -77,8 +77,8 @@ module trap_controller
     endfunction
 
     always_comb begin
-        take_m_int = m_enabled && (m_ints != 32'b0);
-        take_s_int = s_enabled && (s_ints != 32'b0);
+        take_m_int = m_enabled && (m_ints != '0);
+        take_s_int = s_enabled && (s_ints != '0);
         m_cause = pick_int(m_ints);
         s_cause = pick_int(s_ints);
 
@@ -109,18 +109,18 @@ module trap_controller
     end
 
     // Trap vector computation (Direct vs Vectored).
-    logic [31:0] base;
+    logic [MXLEN-1:0] base;
     logic [1:0]  mode;
     always_comb begin
         if (trap_target_priv == PRIV_M) begin
-            base = {mtvec[31:2], 2'b00};
+            base = {mtvec[MXLEN-1:2], 2'b00};
             mode = mtvec[1:0];
         end else begin
-            base = {stvec[31:2], 2'b00};
+            base = {stvec[MXLEN-1:2], 2'b00};
             mode = stvec[1:0];
         end
         if ((mode == 2'b01) && trap_is_interrupt) begin
-            trap_vector = base + ({25'b0, trap_cause, 2'b00});
+            trap_vector = base + MXLEN'({trap_cause, 2'b00});
         end else begin
             trap_vector = base;
         end

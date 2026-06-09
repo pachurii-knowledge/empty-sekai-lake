@@ -29,16 +29,16 @@ module priv_csr_file
     // CSR read port (combinational). Port 0 is used by the scalar core; the
     // out-of-order core additionally uses port 1 for its second ALU issue slot.
     input  logic [11:0] read_addr,
-    output logic [31:0] read_data,
+    output logic [MXLEN-1:0] read_data,
     output logic        read_illegal,
     input  logic [11:0] read_addr1,
-    output logic [31:0] read_data1,
+    output logic [MXLEN-1:0] read_data1,
     output logic        read_illegal1,
 
     // CSR write port (applied at retire of a CSR instruction)
     input  logic        write_valid,
     input  logic [11:0] write_addr,
-    input  logic [31:0] write_data,
+    input  logic [MXLEN-1:0] write_data,
 
     // Accrued FP flags (from FP units)
     input  logic        fp_fflags_valid,
@@ -55,8 +55,8 @@ module priv_csr_file
     input  logic        trap_valid,
     input  logic        trap_is_interrupt,
     input  logic [4:0]  trap_cause,
-    input  logic [31:0] trap_epc,
-    input  logic [31:0] trap_tval,
+    input  logic [MXLEN-1:0] trap_epc,
+    input  logic [MXLEN-1:0] trap_tval,
     input  priv_mode_t  trap_target_priv,
 
     // Trap return
@@ -65,16 +65,16 @@ module priv_csr_file
 
     // Architectural state exposed to the rest of the core / trap_controller
     output priv_mode_t  priv,
-    output logic [31:0] mstatus,
-    output logic [31:0] medeleg,
-    output logic [31:0] mideleg,
-    output logic [31:0] mie_csr,
-    output logic [31:0] mip_csr,
-    output logic [31:0] mtvec,
-    output logic [31:0] stvec,
-    output logic [31:0] mepc,
-    output logic [31:0] sepc,
-    output logic [31:0] satp,
+    output logic [MXLEN-1:0] mstatus,
+    output logic [MXLEN-1:0] medeleg,
+    output logic [MXLEN-1:0] mideleg,
+    output logic [MXLEN-1:0] mie_csr,
+    output logic [MXLEN-1:0] mip_csr,
+    output logic [MXLEN-1:0] mtvec,
+    output logic [MXLEN-1:0] stvec,
+    output logic [MXLEN-1:0] mepc,
+    output logic [MXLEN-1:0] sepc,
+    output logic [MXLEN-1:0] satp,
 
     // PMP configuration exposed to the PMP checker
     output logic [31:0] pmpcfg_o  [4],
@@ -95,12 +95,12 @@ module priv_csr_file
     localparam int SEI_BIT = 9;
     localparam int MEI_BIT = 11;
     // Software-writable / S-mode visible interrupt mask
-    localparam logic [31:0] S_INT_MASK = 32'h0000_0222;  // SSI|STI|SEI
-    localparam logic [31:0] M_INT_MASK = 32'h0000_0AAA;  // all M+S enables
+    localparam logic [MXLEN-1:0] S_INT_MASK = MXLEN'('h0000_0222);  // SSI|STI|SEI
+    localparam logic [MXLEN-1:0] M_INT_MASK = MXLEN'('h0000_0AAA);  // all M+S enables
     /* m/scounteren WARL mask: only CY (bit0), TM (bit1) and IR (bit2) are
      * implemented; the programmable HPM counters (bits 3-31) are read-zero, so
      * their enable bits are hardwired to zero. */
-    localparam logic [31:0] COUNTEREN_MASK = 32'h0000_0007;
+    localparam logic [MXLEN-1:0] COUNTEREN_MASK = MXLEN'('h0000_0007);
 
     /*------------------------------------------------------------------------
      * Architectural state
@@ -113,19 +113,19 @@ module priv_csr_file
     logic [1:0]  st_fs_q;
     logic        st_mprv_q, st_sum_q, st_mxr_q, st_tvm_q, st_tw_q, st_tsr_q;
 
-    logic [31:0] mtvec_q, stvec_q;
-    logic [31:0] mepc_q, sepc_q;
-    logic [31:0] mcause_q, scause_q;
-    logic [31:0] mtval_q, stval_q;
-    logic [31:0] mscratch_q, sscratch_q;
-    logic [31:0] medeleg_q, mideleg_q;
-    logic [31:0] mie_q;                 // interrupt-enable register
-    logic [31:0] mideleg_seip_q;        // unused placeholder (kept 0)
-    logic [31:0] satp_q;
-    logic [31:0] mcounteren_q, scounteren_q;
-    logic [31:0] mcountinhibit_q;       // CY (bit0) / IR (bit2) implemented
-    localparam logic [31:0] MCNTINHIBIT_MASK = 32'h0000_0005;
-    logic [31:0] menvcfg_q;
+    logic [MXLEN-1:0] mtvec_q, stvec_q;
+    logic [MXLEN-1:0] mepc_q, sepc_q;
+    logic [MXLEN-1:0] mcause_q, scause_q;
+    logic [MXLEN-1:0] mtval_q, stval_q;
+    logic [MXLEN-1:0] mscratch_q, sscratch_q;
+    logic [MXLEN-1:0] medeleg_q, mideleg_q;
+    logic [MXLEN-1:0] mie_q;            // interrupt-enable register
+    logic [MXLEN-1:0] mideleg_seip_q;   // unused placeholder (kept 0)
+    logic [MXLEN-1:0] satp_q;
+    logic [MXLEN-1:0] mcounteren_q, scounteren_q;
+    logic [MXLEN-1:0] mcountinhibit_q;  // CY (bit0) / IR (bit2) implemented
+    localparam logic [MXLEN-1:0] MCNTINHIBIT_MASK = MXLEN'('h0000_0005);
+    logic [MXLEN-1:0] menvcfg_q;
     logic        menvcfg_adue_q;        // menvcfg.ADUE (bit 61 -> menvcfgh[29])
     logic        senvcfg_fiom_q;        // senvcfg.FIOM (bit 0); other fields 0
     // Software-writable interrupt-pending bits (S-mode bits)
@@ -153,9 +153,9 @@ module priv_csr_file
     /*------------------------------------------------------------------------
      * Assembled read-only views
      *----------------------------------------------------------------------*/
-    logic [31:0] mstatus_v;
+    logic [MXLEN-1:0] mstatus_v;
     always_comb begin
-        mstatus_v = 32'b0;
+        mstatus_v = '0;
         mstatus_v[MSTATUS_SIE_BIT]  = st_sie_q;
         mstatus_v[MSTATUS_MIE_BIT]  = st_mie_q;
         mstatus_v[MSTATUS_SPIE_BIT] = st_spie_q;
@@ -170,12 +170,17 @@ module priv_csr_file
         mstatus_v[MSTATUS_TW_BIT]   = st_tw_q;
         mstatus_v[MSTATUS_TSR_BIT]  = st_tsr_q;
         mstatus_v[MSTATUS_SD_BIT]   = (st_fs_q == 2'b11);
+`ifdef RV64
+        // SXL/UXL are WARL read-only 2: S and U execute at 64-bit.
+        mstatus_v[MSTATUS_UXL_LO+:2] = 2'd2;
+        mstatus_v[MSTATUS_SXL_LO+:2] = 2'd2;
+`endif
     end
 
     // mip: hardware bits OR software-writable S bits
-    logic [31:0] mip_v;
+    logic [MXLEN-1:0] mip_v;
     always_comb begin
-        mip_v = 32'b0;
+        mip_v = '0;
         mip_v[MTI_BIT] = irq_m_timer;
         mip_v[MSI_BIT] = irq_m_software;
         mip_v[MEI_BIT] = irq_m_external;
@@ -184,15 +189,15 @@ module priv_csr_file
         mip_v[SSI_BIT] = ssip_q;
     end
 
-    localparam logic [31:0] MISA_VALUE =
-        (32'b1 << 30) |   // MXL = 1 (RV32)
-        (32'b1 << 0)  |   // A
-        (32'b1 << 3)  |   // D
-        (32'b1 << 5)  |   // F
-        (32'b1 << 8)  |   // I
-        (32'b1 << 12) |   // M
-        (32'b1 << 18) |   // S
-        (32'b1 << 20);    // U
+    localparam logic [MXLEN-1:0] MISA_VALUE =
+        (MXLEN'(MXLEN == 64 ? 2 : 1) << (MXLEN - 2)) |   // MXL
+        (MXLEN'(1) << 0)  |   // A
+        (MXLEN'(1) << 3)  |   // D
+        (MXLEN'(1) << 5)  |   // F
+        (MXLEN'(1) << 8)  |   // I
+        (MXLEN'(1) << 12) |   // M
+        (MXLEN'(1) << 18) |   // S
+        (MXLEN'(1) << 20);    // U
 
     assign mstatus = mstatus_v;
     assign medeleg = medeleg_q;
@@ -215,27 +220,32 @@ module priv_csr_file
     end
 
     task automatic read_csr(input logic [11:0] addr,
-            output logic [31:0] data, output logic illegal);
+            output logic [MXLEN-1:0] data, output logic illegal);
         logic priv_ok;
-        data = 32'b0;
+        data = '0;
         illegal = 1'b0;
         // Minimum privilege required is encoded in addr[9:8].
         priv_ok = (priv_q >= priv_mode_t'(addr[9:8]));
         unique case (addr)
-            CSR_FFLAGS:    data = {27'b0, fflags_q};
-            CSR_FRM:       data = {29'b0, frm_q};
-            CSR_FCSR:      data = {24'b0, frm_q, fflags_q};
+            CSR_FFLAGS:    data = MXLEN'(fflags_q);
+            CSR_FRM:       data = MXLEN'(frm_q);
+            CSR_FCSR:      data = MXLEN'({frm_q, fflags_q});
 
+            // The counter/timer CSRs are 64-bit; on RV32 they are read through
+            // the low half plus the *H high-half aliases, which do not exist
+            // on RV64 (they fall to the illegal default there).
             CSR_CYCLE,
-            CSR_MCYCLE:    data = mcycle_q[31:0];
+            CSR_MCYCLE:    data = MXLEN'(mcycle_q[MXLEN-1:0]);
+            CSR_TIME:      data = MXLEN'(mtime[MXLEN-1:0]);
+            CSR_INSTRET,
+            CSR_MINSTRET:  data = MXLEN'(minstret_q[MXLEN-1:0]);
+`ifndef RV64
             CSR_CYCLEH,
             CSR_MCYCLEH:   data = mcycle_q[63:32];
-            CSR_TIME:      data = mtime[31:0];
             CSR_TIMEH:     data = mtime[63:32];
-            CSR_INSTRET,
-            CSR_MINSTRET:  data = minstret_q[31:0];
             CSR_INSTRETH,
             CSR_MINSTRETH: data = minstret_q[63:32];
+`endif
 
             // Supervisor
             CSR_SSTATUS:   data = mstatus_v & SSTATUS_MASK;
@@ -254,28 +264,35 @@ module priv_csr_file
             end
             // senvcfg: only FIOM (bit 0) is implemented (no Zicbom/Zicboz), the
             // rest read as zero (WARL).
-            CSR_SENVCFG:   data = {31'b0, senvcfg_fiom_q};
+            CSR_SENVCFG:   data = MXLEN'(senvcfg_fiom_q);
 
             // Machine information
-            CSR_MVENDORID: data = 32'b0;
-            CSR_MARCHID:   data = 32'b0;
-            CSR_MIMPID:    data = 32'b0;
-            CSR_MHARTID:   data = 32'b0;
+            CSR_MVENDORID: data = '0;
+            CSR_MARCHID:   data = '0;
+            CSR_MIMPID:    data = '0;
+            CSR_MHARTID:   data = '0;
 
             // Machine trap setup
             CSR_MSTATUS:   data = mstatus_v;
-            CSR_MSTATUSH:  data = 32'b0;
             CSR_MISA:      data = MISA_VALUE;
             CSR_MEDELEG:   data = medeleg_q;
             CSR_MIDELEG:   data = mideleg_q;
             CSR_MIE:       data = mie_q;
             CSR_MTVEC:     data = mtvec_q;
             CSR_MCOUNTEREN:data = mcounteren_q;
+`ifdef RV64
+            // menvcfg is a single 64-bit CSR on RV64; ADUE lives at its native
+            // bit 61 (Svadu HW A/D update). STCE/PBMTE and the rest are WARL
+            // read-zero. mstatush/menvcfgh do not exist (illegal default).
+            CSR_MENVCFG:   data = menvcfg_q | (MXLEN'(menvcfg_adue_q) << 61);
+`else
+            CSR_MSTATUSH:  data = 32'b0;
             CSR_MENVCFG:   data = menvcfg_q;
             // menvcfgh holds the upper 32 bits of menvcfg on RV32. Only ADUE
             // (bit 61 -> menvcfgh[29]) is implemented (Svadu HW A/D update);
             // STCE/PBMTE and the rest read as zero and ignore writes (WARL).
             CSR_MENVCFGH:  data = {2'b0, menvcfg_adue_q, 29'b0};
+`endif
 
             // Machine trap handling
             CSR_MSCRATCH:  data = mscratch_q;
@@ -284,10 +301,17 @@ module priv_csr_file
             CSR_MTVAL:     data = mtval_q;
             CSR_MIP:       data = mip_v;
 
+`ifdef RV64
+            // RV64 packs eight PMP cfg bytes per even-numbered pmpcfg CSR; the
+            // odd-numbered pmpcfg1/3 do not exist (illegal default).
+            CSR_PMPCFG0:   data = {pmpcfg_q[1], pmpcfg_q[0]};
+            CSR_PMPCFG2:   data = {pmpcfg_q[3], pmpcfg_q[2]};
+`else
             CSR_PMPCFG0:   data = pmpcfg_q[0];
             CSR_PMPCFG1:   data = pmpcfg_q[1];
             CSR_PMPCFG2:   data = pmpcfg_q[2];
             CSR_PMPCFG3:   data = pmpcfg_q[3];
+`endif
 
             default: begin
                 if ((addr >= CSR_PMPADDR0) && (addr <= CSR_PMPADDR0 + 12'd15)) begin
@@ -302,19 +326,22 @@ module priv_csr_file
                 end else if (addr == CSR_MCOUNTINHIBIT) begin
                     data = mcountinhibit_q;
                 end else if ((addr >= CSR_MHPMEVENT3)   && (addr <= CSR_MHPMEVENT31))  begin
-                    data = 32'b0;                       // mhpmevent3-31   (0x323-0x33F)
-                end else if ((addr >= CSR_MHPMEVENT3H)  && (addr <= CSR_MHPMEVENT31H)) begin
-                    data = 32'b0;                       // mhpmevent3h-31h (0x723-0x73F)
+                    data = '0;                          // mhpmevent3-31   (0x323-0x33F)
                 end else if ((addr >= CSR_MHPMCOUNTER3)  && (addr <= CSR_MHPMCOUNTER31))  begin
-                    data = 32'b0;                       // mhpmcounter3-31  (0xB03-0xB1F)
-                end else if ((addr >= CSR_MHPMCOUNTER3H) && (addr <= CSR_MHPMCOUNTER31H)) begin
-                    data = 32'b0;                       // mhpmcounter3h-31h(0xB83-0xB9F)
+                    data = '0;                          // mhpmcounter3-31  (0xB03-0xB1F)
                 end else if ((addr >= CSR_HPMCOUNTER3)   && (addr <= CSR_HPMCOUNTER31))  begin
-                    data = 32'b0;                       // hpmcounter3-31   (0xC03-0xC1F)
+                    data = '0;                          // hpmcounter3-31   (0xC03-0xC1F)
+`ifndef RV64
+                // The high-half counter aliases exist only on RV32.
+                end else if ((addr >= CSR_MHPMEVENT3H)  && (addr <= CSR_MHPMEVENT31H)) begin
+                    data = '0;                          // mhpmevent3h-31h (0x723-0x73F)
+                end else if ((addr >= CSR_MHPMCOUNTER3H) && (addr <= CSR_MHPMCOUNTER31H)) begin
+                    data = '0;                          // mhpmcounter3h-31h(0xB83-0xB9F)
                 end else if ((addr >= CSR_HPMCOUNTER3H)  && (addr <= CSR_HPMCOUNTER31H)) begin
-                    data = 32'b0;                       // hpmcounter3h-31h (0xC83-0xC9F)
+                    data = '0;                          // hpmcounter3h-31h (0xC83-0xC9F)
+`endif
                 end else begin
-                    data = 32'b0;
+                    data = '0;
                     illegal = 1'b1;
                 end
             end
@@ -351,24 +378,24 @@ module priv_csr_file
             st_tvm_q    <= 1'b0;
             st_tw_q     <= 1'b0;
             st_tsr_q    <= 1'b0;
-            mtvec_q     <= 32'b0;
-            stvec_q     <= 32'b0;
-            mepc_q      <= 32'b0;
-            sepc_q      <= 32'b0;
-            mcause_q    <= 32'b0;
-            scause_q    <= 32'b0;
-            mtval_q     <= 32'b0;
-            stval_q     <= 32'b0;
-            mscratch_q  <= 32'b0;
-            sscratch_q  <= 32'b0;
-            medeleg_q   <= 32'b0;
-            mideleg_q   <= 32'b0;
-            mie_q       <= 32'b0;
-            satp_q      <= 32'b0;
-            mcounteren_q<= 32'b0;
-            scounteren_q<= 32'b0;
-            mcountinhibit_q <= 32'b0;
-            menvcfg_q   <= 32'b0;
+            mtvec_q     <= '0;
+            stvec_q     <= '0;
+            mepc_q      <= '0;
+            sepc_q      <= '0;
+            mcause_q    <= '0;
+            scause_q    <= '0;
+            mtval_q     <= '0;
+            stval_q     <= '0;
+            mscratch_q  <= '0;
+            sscratch_q  <= '0;
+            medeleg_q   <= '0;
+            mideleg_q   <= '0;
+            mie_q       <= '0;
+            satp_q      <= '0;
+            mcounteren_q<= '0;
+            scounteren_q<= '0;
+            mcountinhibit_q <= '0;
+            menvcfg_q   <= '0;
             menvcfg_adue_q <= 1'b0;
             senvcfg_fiom_q <= 1'b0;
             ssip_q      <= 1'b0;
@@ -391,16 +418,17 @@ module priv_csr_file
 
             if (trap_valid) begin
                 // Trap entry. Save state into the target privilege's CSRs.
+                // The cause interrupt flag lives at bit MXLEN-1.
                 if (trap_target_priv == PRIV_M) begin
-                    mepc_q   <= {trap_epc[31:2], 2'b0};
-                    mcause_q <= {trap_is_interrupt, 26'b0, trap_cause};
+                    mepc_q   <= {trap_epc[MXLEN-1:2], 2'b0};
+                    mcause_q <= {trap_is_interrupt, {(MXLEN-6){1'b0}}, trap_cause};
                     mtval_q  <= trap_tval;
                     st_mpie_q <= st_mie_q;
                     st_mie_q  <= 1'b0;
                     st_mpp_q  <= priv_q;
                 end else begin
-                    sepc_q   <= {trap_epc[31:2], 2'b0};
-                    scause_q <= {trap_is_interrupt, 26'b0, trap_cause};
+                    sepc_q   <= {trap_epc[MXLEN-1:2], 2'b0};
+                    scause_q <= {trap_is_interrupt, {(MXLEN-6){1'b0}}, trap_cause};
                     stval_q  <= trap_tval;
                     st_spie_q <= st_sie_q;
                     st_sie_q  <= 1'b0;
@@ -450,7 +478,7 @@ module priv_csr_file
      * Apply a CSR write (WARL masking handled per register)
      *----------------------------------------------------------------------*/
     task automatic apply_csr_write(input logic [11:0] addr,
-            input logic [31:0] wdata);
+            input logic [MXLEN-1:0] wdata);
         unique case (addr)
             CSR_FFLAGS: fflags_q <= wdata[4:0];
             CSR_FRM:    frm_q    <= wdata[2:0];
@@ -469,16 +497,25 @@ module priv_csr_file
                 st_mxr_q  <= wdata[MSTATUS_MXR_BIT];
             end
             CSR_SIE:    mie_q <= (mie_q & ~mideleg_q) | (wdata & mideleg_q & S_INT_MASK);
-            CSR_STVEC:  stvec_q <= {wdata[31:2], 1'b0, wdata[0]};
+            CSR_STVEC:  stvec_q <= {wdata[MXLEN-1:2], 1'b0, wdata[0]};
             CSR_SCOUNTEREN: scounteren_q <= wdata & COUNTEREN_MASK;
             CSR_SSCRATCH: sscratch_q <= wdata;
-            CSR_SEPC:   sepc_q <= {wdata[31:2], 2'b0};
+            CSR_SEPC:   sepc_q <= {wdata[MXLEN-1:2], 2'b0};
             CSR_SCAUSE: scause_q <= wdata;
             CSR_STVAL:  stval_q <= wdata;
             CSR_SIP: begin
                 if (mideleg_q[SSI_BIT]) ssip_q <= wdata[SSI_BIT];
             end
+`ifdef RV64
+            // satp MODE[63:60] is WARL: only Bare (0) and Sv39 (8) are
+            // supported; a write with any other MODE has no effect at all.
+            CSR_SATP: begin
+                if ((wdata[63:60] == 4'd0) || (wdata[63:60] == 4'd8))
+                    satp_q <= wdata;
+            end
+`else
             CSR_SATP:   satp_q <= wdata;
+`endif
             CSR_SENVCFG: senvcfg_fiom_q <= wdata[0];
 
             CSR_MSTATUS: begin
@@ -496,16 +533,25 @@ module priv_csr_file
                 st_tw_q   <= wdata[MSTATUS_TW_BIT];
                 st_tsr_q  <= wdata[MSTATUS_TSR_BIT];
             end
-            CSR_MEDELEG: medeleg_q <= wdata & 32'h0000_F7FF;
+            CSR_MEDELEG: medeleg_q <= wdata & MXLEN'('h0000_F7FF);
             CSR_MIDELEG: mideleg_q <= wdata & S_INT_MASK;
             CSR_MIE:     mie_q <= wdata & M_INT_MASK;
-            CSR_MTVEC:   mtvec_q <= {wdata[31:2], 1'b0, wdata[0]};
+            CSR_MTVEC:   mtvec_q <= {wdata[MXLEN-1:2], 1'b0, wdata[0]};
             CSR_MCOUNTEREN: mcounteren_q <= wdata & COUNTEREN_MASK;
             CSR_MCOUNTINHIBIT: mcountinhibit_q <= wdata & MCNTINHIBIT_MASK;
+`ifdef RV64
+            // 64-bit menvcfg: ADUE at its native bit 61; everything else WARL
+            // read-zero (kept out of menvcfg_q so the read can OR ADUE in).
+            CSR_MENVCFG: begin
+                menvcfg_q <= wdata & ~(MXLEN'(1) << 61);
+                menvcfg_adue_q <= wdata[61];
+            end
+`else
             CSR_MENVCFG: menvcfg_q <= wdata;
             CSR_MENVCFGH: menvcfg_adue_q <= wdata[29];   // WARL: only ADUE
+`endif
             CSR_MSCRATCH: mscratch_q <= wdata;
-            CSR_MEPC:    mepc_q <= {wdata[31:2], 2'b0};
+            CSR_MEPC:    mepc_q <= {wdata[MXLEN-1:2], 2'b0};
             CSR_MCAUSE:  mcause_q <= wdata;
             CSR_MTVAL:   mtval_q <= wdata;
             CSR_MIP: begin
@@ -517,16 +563,28 @@ module priv_csr_file
                 seip_sw_q <= wdata[SEI_BIT];
             end
             // PMP config writes honour per-byte lock (L) and WARL masking.
+`ifdef RV64
+            // RV64: each even pmpcfg CSR carries eight cfg bytes.
+            CSR_PMPCFG0: begin
+                pmpcfg_q[0] <= pmp_cfg_word_wr(pmpcfg_q[0], wdata[31:0]);
+                pmpcfg_q[1] <= pmp_cfg_word_wr(pmpcfg_q[1], wdata[63:32]);
+            end
+            CSR_PMPCFG2: begin
+                pmpcfg_q[2] <= pmp_cfg_word_wr(pmpcfg_q[2], wdata[31:0]);
+                pmpcfg_q[3] <= pmp_cfg_word_wr(pmpcfg_q[3], wdata[63:32]);
+            end
+`else
             CSR_PMPCFG0: pmpcfg_q[0] <= pmp_cfg_word_wr(pmpcfg_q[0], wdata);
             CSR_PMPCFG1: pmpcfg_q[1] <= pmp_cfg_word_wr(pmpcfg_q[1], wdata);
             CSR_PMPCFG2: pmpcfg_q[2] <= pmp_cfg_word_wr(pmpcfg_q[2], wdata);
             CSR_PMPCFG3: pmpcfg_q[3] <= pmp_cfg_word_wr(pmpcfg_q[3], wdata);
+`endif
             default: begin
                 if ((addr >= CSR_PMPADDR0) && (addr <= CSR_PMPADDR0 + 12'd15)) begin
                     // A locked entry (or the base of a locked TOR entry above)
                     // ignores pmpaddr writes.
                     if (!pmp_addr_locked(addr - CSR_PMPADDR0))
-                        pmpaddr_q[addr - CSR_PMPADDR0] <= wdata;
+                        pmpaddr_q[addr - CSR_PMPADDR0] <= wdata[31:0];
                 end
             end
         endcase

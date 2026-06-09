@@ -11,7 +11,11 @@
 `ifndef RISCV_PRIV_VH_
 `define RISCV_PRIV_VH_
 
+`include "riscv_isa.vh"     // XLEN (MXLEN == XLEN on this implementation)
+
 package RISCV_Priv;
+
+    localparam int MXLEN = RISCV_ISA::XLEN;
 
     /*------------------------------------------------------------------------
      * Privilege modes
@@ -147,11 +151,15 @@ package RISCV_Priv;
     localparam int MSTATUS_TVM_BIT  = 20;
     localparam int MSTATUS_TW_BIT   = 21;
     localparam int MSTATUS_TSR_BIT  = 22;
-    localparam int MSTATUS_SD_BIT   = 31;
+    // RV64-only two-bit fields (read-only 2 = 64-bit on this implementation)
+    localparam int MSTATUS_UXL_LO   = 32;  // [33:32]
+    localparam int MSTATUS_SXL_LO   = 34;  // [35:34]
+    localparam int MSTATUS_SD_BIT   = MXLEN - 1;
 
     // sstatus is a restricted view of mstatus; this mask exposes the S-visible
-    // fields (SIE, SPIE, SPP, FS, SUM, MXR, SD).
-    localparam logic [31:0] SSTATUS_MASK = 32'h800DE122;
+    // fields (SIE, SPIE, SPP, FS, XS, SUM, MXR, SD — plus UXL on RV64).
+    localparam logic [MXLEN-1:0] SSTATUS_MASK = (MXLEN == 64) ?
+        MXLEN'(64'h8000_0003_000D_E122) : MXLEN'(32'h800D_E122);
 
     /*------------------------------------------------------------------------
      * Sv32 virtual memory

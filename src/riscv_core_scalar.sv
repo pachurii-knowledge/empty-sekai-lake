@@ -390,10 +390,10 @@ module riscv_core_scalar
     // existing flush machinery squashes younger instructions precisely.
 
     RISCV_Priv::priv_mode_t cur_priv;
-    logic [31:0] csr_mstatus, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
-    logic [31:0] csr_mtvec, csr_stvec, csr_mepc, csr_sepc, csr_satp;
+    logic [XLEN-1:0] csr_mstatus, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
+    logic [XLEN-1:0] csr_mtvec, csr_stvec, csr_mepc, csr_sepc, csr_satp;
     logic        csr_menvcfg_adue;
-    logic [31:0] csr_read_data_E;
+    logic [XLEN-1:0] csr_read_data_E;
     logic        csr_read_illegal_E;
     logic [2:0]  csr_frm_E;
 
@@ -404,8 +404,8 @@ module riscv_core_scalar
 
     // CSR access fields for the EX instruction
     logic [11:0] csr_addr_E;
-    logic [31:0] csr_operand_E;
-    logic [31:0] csr_wval_E;
+    logic [XLEN-1:0] csr_operand_E;
+    logic [XLEN-1:0] csr_wval_E;
     logic        csr_is_E;
     logic        csr_does_write_E;
     logic        csr_we_E;
@@ -413,7 +413,7 @@ module riscv_core_scalar
     assign csr_addr_E   = instr_E[31:20];
     assign csr_is_E     = (ctrl_signals_E.exec_class == EXEC_CSR);
     assign csr_operand_E = ctrl_signals_E.useImm ?
-        {27'b0, instr_E[19:15]} : rs1_data_muxed_E;
+        XLEN'(instr_E[19:15]) : rs1_data_muxed_E;
     assign csr_does_write_E = ctrl_signals_E.csr_write;
 
     always_comb begin
@@ -431,7 +431,7 @@ module riscv_core_scalar
     logic priv_illegal_E;        // privileged instruction used at too-low priv
     logic exc_valid_E;
     logic [4:0] exc_cause_E;
-    logic [31:0] exc_tval_E;
+    logic [XLEN-1:0] exc_tval_E;
 
     // mret legal only in M; sret legal in S/M and not when mstatus.TSR && S
     assign priv_illegal_E = valid_E && (
@@ -497,7 +497,7 @@ module riscv_core_scalar
     logic        tc_trap_valid, tc_is_int;
     logic [4:0]  tc_cause;
     RISCV_Priv::priv_mode_t tc_target;
-    logic [31:0] tc_vector;
+    logic [XLEN-1:0] tc_vector;
     logic        gate_E;     // EX instruction is committable this cycle
 
     assign gate_E = (~mem_stall) && (~flush_M1) && (~flush_W) && (~halted);
@@ -603,8 +603,8 @@ module riscv_core_scalar
     );
 
     // Pipeline the CSR read result to M1 for the rd writeback path.
-    logic [31:0] csr_read_data_M1;
-    register #(32, 32'b0) CSR_RDATA_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(csr_read_data_E), .Q(csr_read_data_M1));
+    logic [XLEN-1:0] csr_read_data_M1;
+    register #(XLEN, '0) CSR_RDATA_E_M1_REG(.clk, .rst_l, .en(~halted & ~mem_stall), .clear(1'b0), .D(csr_read_data_E), .Q(csr_read_data_M1));
 
     //===============================Sv32 MMU=========================//
     // satp / mstatus-derived translation context
@@ -615,9 +615,17 @@ module riscv_core_scalar
     RISCV_Priv::priv_mode_t mpp_mode, priv_data;
     logic        paging_fetch, paging_data;
 
+`ifdef RV64
+    // Sv39 satp layout: MODE[63:60] (8 = Sv39), ASID[59:44], PPN[43:0]. The
+    // PPN/ASID slices feed the Sv39 walker (widened in R5).
+    assign satp_mode    = (csr_satp[63:60] == 4'd8);
+    assign satp_ppn     = csr_satp[21:0];
+    assign satp_asid    = csr_satp[52:44];
+`else
     assign satp_mode    = csr_satp[31];
     assign satp_ppn     = csr_satp[21:0];
     assign satp_asid    = csr_satp[30:22];
+`endif
     assign mstatus_mprv = csr_mstatus[RISCV_Priv::MSTATUS_MPRV_BIT];
     assign mstatus_sum  = csr_mstatus[RISCV_Priv::MSTATUS_SUM_BIT];
     assign mstatus_mxr  = csr_mstatus[RISCV_Priv::MSTATUS_MXR_BIT];

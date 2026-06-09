@@ -185,11 +185,11 @@ module riscv_core_ooo
     logic [OOO_WIDTH-1:0][4:0] writeback_exc_cause;
     logic [OOO_WIDTH-1:0] writeback_halted;
 
-    logic [31:0] csr_read_data [2];
+    logic [XLEN-1:0] csr_read_data [2];
     logic [1:0] csr_read_illegal;
     logic csr_commit_write;
     logic [11:0] csr_commit_addr;
-    logic [31:0] csr_commit_wdata;
+    logic [XLEN-1:0] csr_commit_wdata;
     logic csr_fp_fflags_valid;
     logic [4:0] csr_fp_fflags;
     logic [2:0] csr_frm;
@@ -198,8 +198,8 @@ module riscv_core_ooo
     // --- Privileged-ISA / trap state (Phase 3) ---
     // Architectural privilege + CSR state exposed by priv_csr_file.
     RISCV_Priv::priv_mode_t cur_priv;
-    logic [31:0] csr_mstatus, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
-    logic [31:0] csr_mtvec, csr_stvec, csr_mepc, csr_sepc, csr_satp;
+    logic [XLEN-1:0] csr_mstatus, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
+    logic [XLEN-1:0] csr_mtvec, csr_stvec, csr_mepc, csr_sepc, csr_satp;
     logic [31:0] csr_pmpcfg_arr [4];
     logic [31:0] csr_pmpaddr_arr [16];
     logic        csr_menvcfg_adue;
@@ -217,15 +217,15 @@ module riscv_core_ooo
     // Commit-time trap evaluation (driven combinationally in the commit block).
     logic        commit_exc_valid;
     logic [4:0]  commit_exc_cause;
-    logic [31:0] commit_exc_tval;
-    logic [31:0] commit_trap_epc;
+    logic [XLEN-1:0] commit_exc_tval;
+    logic [XLEN-1:0] commit_trap_epc;
     logic        commit_take_trap, commit_take_ret, commit_ret_from_s;
     // trap_controller outputs
     logic        tc_trap_valid, tc_is_int;
     logic [4:0]  tc_cause;
     RISCV_Priv::priv_mode_t tc_target;
-    logic [31:0] tc_vector;
-    logic [31:0] trap_redirect_pc;
+    logic [XLEN-1:0] tc_vector;
+    logic [XLEN-1:0] trap_redirect_pc;
 
     // --- Precise interrupts via ROB drain (Phase 3b) ---
     // When an interrupt is pending+enabled we stop dispatching new instructions
@@ -238,7 +238,7 @@ module riscv_core_ooo
     logic        m_irq_en, s_irq_en;
     logic        irq_drain_q, irq_drain_next;
     logic        commit_take_int;
-    logic [31:0] commit_int_epc;
+    logic [XLEN-1:0] commit_int_epc;
     // WFI: while wfi_wait_q the core idles (dispatch suppressed) until an
     // enabled interrupt is pending (wfi_wake), ignoring the global enable.
     logic        wfi_wait_q, wfi_wait_next, wfi_wait_set, wfi_wake;
@@ -547,9 +547,17 @@ module riscv_core_ooo
     RISCV_Priv::priv_mode_t mpp_mode, priv_data;
     logic        paging_fetch, paging_data;
 
+`ifdef RV64
+    // Sv39 satp layout: MODE[63:60] (8 = Sv39), ASID[59:44], PPN[43:0]. The
+    // PPN/ASID slices feed the Sv39 walker (widened in R5).
+    assign satp_mode    = (csr_satp[63:60] == 4'd8);
+    assign satp_ppn     = csr_satp[21:0];
+    assign satp_asid    = csr_satp[52:44];
+`else
     assign satp_mode    = csr_satp[31];
     assign satp_ppn     = csr_satp[21:0];
     assign satp_asid    = csr_satp[30:22];
+`endif
     assign mstatus_mprv = csr_mstatus[RISCV_Priv::MSTATUS_MPRV_BIT];
     assign mstatus_sum  = csr_mstatus[RISCV_Priv::MSTATUS_SUM_BIT];
     assign mstatus_mxr  = csr_mstatus[RISCV_Priv::MSTATUS_MXR_BIT];
