@@ -71,7 +71,15 @@ module ptw
     // have advanced by the time the walk completes -- using the live address
     // would tag the fill with the wrong VPN.
     output logic [VM_VPN_W-1:0] walk_vpn,
-    output logic        walk_is_data
+    output logic        walk_is_data,
+    // The privilege and satp.PPN this walk was launched under, also latched at
+    // request time. The integrating core must gate *consuming* a completed walk
+    // (resolved PA or fault) on these matching the live access context -- a walk
+    // launched in another mode/address space (e.g. a speculative S-mode fetch of
+    // a user VA during a trap window, walking the kernel page table) faults, and
+    // that fault must not be mistaken for the current access's translation.
+    output priv_mode_t  walk_priv,
+    output logic [VM_PPN_W-1:0] walk_satp
 );
 
     localparam logic [1:0] ACC_FETCH = 2'd0;
@@ -94,6 +102,7 @@ module ptw
     logic [MXLEN-1:0] pte_addr_q;// address of current PTE (for A/D writeback)
     logic [1:0]  level_q, level_n;       // current walk level (LEVELS-1 .. 0)
     logic [VM_PPN_W-1:0] base_q, base_n; // current table base PPN
+    logic [VM_PPN_W-1:0] walk_satp_q;    // satp.PPN this walk was launched under
     logic        walk_bad_q, walk_bad_n; // invalid / pointer-depth / misaligned /
                                          // non-canonical: page fault at done
     logic        noncanon_q;
@@ -126,7 +135,7 @@ module ptw
             vpn_q <= '0; acc_q <= 2'b0; priv_q <= PRIV_M;
             sum_q <= 1'b0; mxr_q <= 1'b0;
             pte_q <= '0; pte_addr_q <= '0;
-            level_q <= '0; base_q <= '0;
+            level_q <= '0; base_q <= '0; walk_satp_q <= '0;
             walk_bad_q <= 1'b0; noncanon_q <= 1'b0;
             fault_level_q <= '0;
             pte_af_q <= 1'b0;
@@ -142,6 +151,7 @@ module ptw
                 sum_q  <= mstatus_sum;
                 mxr_q  <= mstatus_mxr;
                 noncanon_q <= req_noncanonical;
+                walk_satp_q <= satp_ppn;
             end
             // Capture PTE reads when the memory acknowledges the request
             if ((state_q == S_REQ) && mem_ack) begin
@@ -302,6 +312,8 @@ module ptw
     assign ppn          = pte_ppn;
     assign walk_vpn     = vpn_q;
     assign walk_is_data = (acc_q != ACC_FETCH);
+    assign walk_priv    = priv_q;
+    assign walk_satp    = walk_satp_q;
     // Reflect the A/D bits the hardware update set (Svadu) in the reported perm,
     // so the TLB is filled with the post-update PTE. Otherwise a store would see
     // a stale D=0 in the DTLB after its A/D walk, fail dtlb_usable on the commit

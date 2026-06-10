@@ -657,6 +657,8 @@ module riscv_core_ooo
     logic [RISCV_Priv::VM_VPN_W-1:0] ptw_vpn;
     logic [RISCV_Priv::VM_VPN_W-1:0] ptw_walk_vpn; // VPN the walk was launched for
     logic        ptw_walk_is_data; // that walk is a data (vs fetch) access
+    RISCV_Priv::priv_mode_t ptw_walk_priv;          // privilege the walk launched under
+    logic [RISCV_Priv::VM_PPN_W-1:0] ptw_walk_satp; // satp.PPN the walk launched under
     logic [1:0]  ptw_access;
     RISCV_Priv::priv_mode_t ptw_priv;
     logic [XLEN-1:0] ptw_mem_addr;
@@ -707,8 +709,29 @@ module riscv_core_ooo
         .perm(ptw_perm),
         .leaf_level(ptw_level),
         .walk_vpn(ptw_walk_vpn),
-        .walk_is_data(ptw_walk_is_data)
+        .walk_is_data(ptw_walk_is_data),
+        .walk_priv(ptw_walk_priv),
+        .walk_satp(ptw_walk_satp)
     );
+    // A completed walk's result (resolved PA or fault) may be consumed only by an
+    // access whose full translation request -- (VPN, satp.PPN, privilege) --
+    // matches the one the walk was launched for. Fetches/loads are speculative, so
+    // a walk can outlive its request: a mispredicted fetch of an unmapped VA
+    // launches a walk that faults at the page-table root, and without the VPN
+    // check the architectural fetch of a *different, valid* VPN in the same
+    // address space adopts that root fault -> spurious page fault (this crashed
+    // /sh at 0xd8c, the insn after the sret from its first syscall). walk_priv /
+    // walk_satp additionally reject a walk launched in another mode / address
+    // space (e.g. a speculative S-mode fetch of a user VA in a trap window,
+    // walking the kernel page table). The TLB *fills* already key on walk_vpn;
+    // this extends the same precision to the immediate PA/fault consumption.
+    logic ptw_ctx_fetch, ptw_ctx_data;
+    assign ptw_ctx_fetch =
+        (ptw_walk_vpn  == pc_q[RISCV_Priv::VM_VPN_W+11:12]) &&
+        (ptw_walk_priv == cur_priv) && (ptw_walk_satp == satp_ppn);
+    assign ptw_ctx_data  =
+        (ptw_walk_vpn  == mem_req_vaddr[RISCV_Priv::VM_VPN_W+11:12]) &&
+        (ptw_walk_priv == priv_data) && (ptw_walk_satp == satp_ppn);
     assign ptw_addr = ptw_mem_addr[XLEN-1:ADDR_SHIFT];
 
     // PMP on the implicit PTE access. Per the priv spec these accesses are checked
@@ -759,7 +782,14 @@ module riscv_core_ooo
     logic        data_perm_fault;
     logic        lsq_xlate_stall, lsq_xlate_fault;
     logic [4:0]  lsq_xlate_cause;
-    assign data_from_ptw = ptw_for_data && ptw_done && !ptw_fault;
+    // Consume the completed walk's result by its *latched* class, exactly as
+    // the TLB fills do (ptw_walk_is_data, not the combinational ptw_for_data).
+    // ptw_for_data tracks the *current* head's want; if a fetch walk completes
+    // on a cycle when a data access has *newly* started wanting a walk,
+    // ptw_for_data=1 but the result belongs to the fetch walk. Gating on the
+    // latched class keeps the data load from grabbing a fetch walk's PPN (which
+    // mistranslated VA 0x800096f0 -> PA 0x800076f0 and corrupted a syscall ptr).
+    assign data_from_ptw = ptw_done && !ptw_fault && ptw_walk_is_data && ptw_ctx_data;
     always_comb begin
         if (!paging_data)        data_pa = mem_req_vaddr;
         else if (dtlb_usable)    data_pa = make_pa(dtlb_ppn, dtlb_level, mem_req_vaddr);
@@ -769,7 +799,7 @@ module riscv_core_ooo
     assign data_perm_fault =
         (dtlb_usable && perm_bad(dtlb_perm, data_acc, priv_data,
             mstatus_sum, mstatus_mxr)) ||
-        (data_need_walk && ptw_done && ptw_fault);
+        (data_need_walk && ptw_walk_is_data && ptw_done && ptw_fault && ptw_ctx_data);
     // PMP on the resolved data physical address (checked in any mode, on the
     // post-translation PA). Only meaningful once the PA is resolved -- during a
     // walk data_pa is the (stale) VA fallback, so gate the PMP fault on a
@@ -793,7 +823,8 @@ module riscv_core_ooo
     // page fault (priv spec); it overrides the page-fault cause below.
     logic data_ptw_access_fault;
     assign data_ptw_access_fault =
-        data_need_walk && ptw_done && ptw_fault && ptw_fault_access;
+        data_need_walk && ptw_walk_is_data && ptw_done && ptw_fault && ptw_fault_access &&
+        ptw_ctx_data;
     // Page fault (translation) reported ahead of a PMP access fault.
     assign lsq_xlate_cause =
         (paging_data && data_perm_fault && !data_ptw_access_fault) ?
@@ -831,8 +862,11 @@ module riscv_core_ooo
     // --- Resolve the fetch physical address + stall during a fetch walk ---
     logic        fetch_from_ptw, ptw_fetch_done;
     logic        fetch_xlate_stall;
-    assign fetch_from_ptw = (!ptw_for_data) && ptw_done && !ptw_fault;
-    assign ptw_fetch_done = (!ptw_for_data) && ptw_done;
+    // Latched-class gating (mirrors the ITLB fill), not combinational ptw_for_data:
+    // a fetch walk's completion must be consumed by the fetch path even on a cycle
+    // when a data access is concurrently requesting a walk.
+    assign fetch_from_ptw = ptw_done && !ptw_fault && !ptw_walk_is_data && ptw_ctx_fetch;
+    assign ptw_fetch_done = ptw_done && !ptw_walk_is_data && ptw_ctx_fetch;
     always_comb begin
         if (!paging_fetch)       fetch_pa = pc_q;
         else if (itlb_usable)    fetch_pa = make_pa(itlb_ppn, itlb_level, pc_q);
@@ -850,12 +884,13 @@ module riscv_core_ooo
     assign fetch_perm_fault =
         (itlb_usable && perm_bad(itlb_perm, 2'd0, cur_priv,
             mstatus_sum, mstatus_mxr)) ||
-        (fetch_need_walk && !ptw_for_data && ptw_done && ptw_fault);
+        (fetch_need_walk && !ptw_walk_is_data && ptw_done && ptw_fault && ptw_ctx_fetch);
     // A PMP fault on a PTE access during a fetch walk is an instruction *access*
     // fault, not a page fault (priv spec) -- selects the cause below.
     logic fetch_ptw_access_fault;
     assign fetch_ptw_access_fault =
-        fetch_need_walk && !ptw_for_data && ptw_done && ptw_fault && ptw_fault_access;
+        fetch_need_walk && !ptw_walk_is_data && ptw_done && ptw_fault && ptw_fault_access &&
+        ptw_ctx_fetch;
 
     // PMP on the resolved fetch PA (any mode). Gated on a resolved PA so the
     // (stale VA) fallback during a walk is not checked; page fault wins over PMP.
