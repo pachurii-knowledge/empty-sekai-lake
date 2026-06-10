@@ -22,11 +22,23 @@
  * happens when the claim load actually returns (load_en), not speculatively.
  * Completing: writing the source id back to the claim/complete register reopens
  * the gateway.
+ *
+ * The bus is one memory word wide (4 bytes at RV32, 8 at RV64); each bus word
+ * decodes as XLEN/32 32-bit register subwords. Because a claim READ has a side
+ * effect, the claim is taken only when the load's actual byte range (load_off/
+ * load_size from the LSQ head) overlaps the claim register's subword -- a
+ * 32-bit read of the adjacent threshold register must not claim.
  */
+
+`include "riscv_isa.vh"
+`include "riscv_uarch.vh"
 
 `default_nettype none
 
-module plic #(
+module plic
+    import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
+    import RISCV_UArch::MEMORY_ADDR_WIDTH;
+#(
     parameter logic [31:0] BASE = 32'h0C00_0000,
     parameter int          NSOURCES = 31           // sources 1..NSOURCES (<= 31)
 ) (
@@ -36,34 +48,40 @@ module plic #(
     // Level interrupt lines from devices (index 0 unused; source 0 is reserved).
     input  logic [NSOURCES:0] src_irq,
 
-    // Committed data store snoop (word address space: byte addr >> 2)
+    // Committed data store snoop (memory-word address space)
     input  logic        store_en,
-    input  logic [29:0] store_waddr,
-    input  logic [31:0] store_wdata,
-    input  logic [3:0]  store_mask,
+    input  logic [MEMORY_ADDR_WIDTH-1:0] store_waddr,
+    input  logic [XLEN-1:0] store_wdata,
+    input  logic [XLEN_BYTES-1:0] store_mask,
 
     // Combinational load query; load_en marks the cycle the load result is
     // actually consumed (so a claim's side effect is not taken speculatively).
-    input  logic [29:0] load_addr,
+    // load_off is the consuming access's byte offset within the memory word,
+    // for read-side-effect gating (which 32-bit register was read).
+    input  logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
     input  logic        load_en,
+    input  logic [$clog2(XLEN_BYTES)-1:0] load_off,
     output logic        load_hit,
-    output logic [31:0] load_data,
+    output logic [XLEN-1:0] load_data,
 
     output logic        irq_m_external,   // context 0
     output logic        irq_s_external    // context 1
 );
 
+    localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
+    localparam int NSUB = XLEN / 32;
+
     localparam int NCTX = 2;
-    localparam logic [29:0] PRIO_BASE  = 30'((BASE + 32'h0000_0000) >> 2);
-    localparam logic [29:0] PENDING_W  = 30'((BASE + 32'h0000_1000) >> 2);
+    localparam logic [31:0] PRIO_BASE_B  = BASE + 32'h0000_0000;
+    localparam logic [31:0] PENDING_B    = BASE + 32'h0000_1000;
     // Non-standard test/IPI helper: write-1-to-clear the software-pending word.
-    localparam logic [29:0] PENDING_CLR_W = 30'((BASE + 32'h0000_1004) >> 2);
-    localparam logic [29:0] ENABLE0_W  = 30'((BASE + 32'h0000_2000) >> 2);
-    localparam logic [29:0] ENABLE1_W  = 30'((BASE + 32'h0000_2080) >> 2);
-    localparam logic [29:0] THRESH0_W  = 30'((BASE + 32'h0020_0000) >> 2);
-    localparam logic [29:0] CLAIM0_W   = 30'((BASE + 32'h0020_0004) >> 2);
-    localparam logic [29:0] THRESH1_W  = 30'((BASE + 32'h0020_1000) >> 2);
-    localparam logic [29:0] CLAIM1_W   = 30'((BASE + 32'h0020_1004) >> 2);
+    localparam logic [31:0] PENDING_CLR_B = BASE + 32'h0000_1004;
+    localparam logic [31:0] ENABLE0_B    = BASE + 32'h0000_2000;
+    localparam logic [31:0] ENABLE1_B    = BASE + 32'h0000_2080;
+    localparam logic [31:0] THRESH0_B    = BASE + 32'h0020_0000;
+    localparam logic [31:0] CLAIM0_B     = BASE + 32'h0020_0004;
+    localparam logic [31:0] THRESH1_B    = BASE + 32'h0020_1000;
+    localparam logic [31:0] CLAIM1_B     = BASE + 32'h0020_1004;
 
     // State
     logic [2:0]  prio_q     [NSOURCES+1];   // priority per source (0 disables)
@@ -108,38 +126,57 @@ module plic #(
         for (int s = 1; s <= NSOURCES; s += 1) pending_word[s] = gw_pending[s];
     end
 
-    // ---- Combinational read path ----
-    always_comb begin
-        load_hit  = 1'b1;
-        load_data = 32'b0;
-        if ((load_addr >= PRIO_BASE + 30'd1) &&
-                (load_addr <= PRIO_BASE + 30'(NSOURCES))) begin
-            load_data = {29'b0, prio_q[load_addr - PRIO_BASE]};
+    // 32-bit register read at a byte address.
+    function automatic logic [31:0] reg_read(input logic [31:0] baddr,
+            output logic hit);
+        hit = 1'b1;
+        if ((baddr >= PRIO_BASE_B + 32'd4) &&
+                (baddr <= PRIO_BASE_B + 32'(NSOURCES * 4))) begin
+            reg_read = {29'b0, prio_q[baddr[6:2]]};
         end else begin
-            unique case (load_addr)
-                PENDING_W: load_data = pending_word;
-                ENABLE0_W: load_data = enable_q[0];
-                ENABLE1_W: load_data = enable_q[1];
-                THRESH0_W: load_data = {29'b0, thresh_q[0]};
-                THRESH1_W: load_data = {29'b0, thresh_q[1]};
-                CLAIM0_W:  load_data = {26'b0, best_id[0]};
-                CLAIM1_W:  load_data = {26'b0, best_id[1]};
-                default:   load_hit  = 1'b0;
+            unique case (baddr)
+                PENDING_B: reg_read = pending_word;
+                ENABLE0_B: reg_read = enable_q[0];
+                ENABLE1_B: reg_read = enable_q[1];
+                THRESH0_B: reg_read = {29'b0, thresh_q[0]};
+                THRESH1_B: reg_read = {29'b0, thresh_q[1]};
+                CLAIM0_B:  reg_read = {26'b0, best_id[0]};
+                CLAIM1_B:  reg_read = {26'b0, best_id[1]};
+                default: begin
+                    reg_read = 32'b0;
+                    hit = 1'b0;
+                end
             endcase
+        end
+    endfunction
+
+    // ---- Combinational read path (per bus subword) ----
+    always_comb begin
+        logic sub_hit;
+        load_hit  = 1'b0;
+        load_data = '0;
+        for (int i = 0; i < NSUB; i += 1) begin
+            load_data[i*32 +: 32] = reg_read(
+                32'(load_addr << ADDR_SHIFT) + 32'(unsigned'(i) * 4), sub_hit);
+            load_hit |= sub_hit;
         end
     end
 
-    // A claim load that actually completes marks its source in flight.
+    // A claim load that actually completes marks its source in flight. The
+    // claim register the load addressed is selected by its byte offset (a claim
+    // read is a 32-bit access at the register's aligned address).
     logic        claim_take [NCTX];
     logic [5:0]  claim_id   [NCTX];
+    logic [31:0] load_baddr;
+    assign load_baddr = 32'(load_addr << ADDR_SHIFT) + 32'(load_off);
     always_comb begin
         for (int c = 0; c < NCTX; c += 1) begin
             claim_take[c] = 1'b0;
             claim_id[c]   = best_id[c];
         end
-        if (load_en && (best_id[0] != 6'd0) && (load_addr == CLAIM0_W))
+        if (load_en && (load_baddr == CLAIM0_B) && (best_id[0] != 6'd0))
             claim_take[0] = 1'b1;
-        if (load_en && (best_id[1] != 6'd0) && (load_addr == CLAIM1_W))
+        if (load_en && (load_baddr == CLAIM1_B) && (best_id[1] != 6'd0))
             claim_take[1] = 1'b1;
     end
 
@@ -164,32 +201,41 @@ module plic #(
                     sw_pend_q [claim_id[c]] <= 1'b0;
                 end
             end
-            // Register writes (committed stores).
-            if (store_en && (store_mask != 4'b0)) begin
-                if ((store_waddr >= PRIO_BASE + 30'd1) &&
-                        (store_waddr <= PRIO_BASE + 30'(NSOURCES))) begin
-                    if (store_mask[0])
-                        prio_q[store_waddr - PRIO_BASE] <= store_wdata[2:0];
-                end else begin
-                    unique case (store_waddr)
-                        PENDING_W: begin
-                            for (int s = 1; s <= NSOURCES; s += 1)
-                                if (store_wdata[s]) sw_pend_q[s] <= 1'b1;
+            // Register writes (committed stores), per bus subword.
+            if (store_en && (store_mask != '0)) begin
+                for (int i = 0; i < NSUB; i += 1) begin
+                    logic [31:0] baddr;
+                    logic [31:0] wsub;
+                    logic [3:0]  msub;
+                    baddr = 32'(store_waddr << ADDR_SHIFT) + 32'(unsigned'(i) * 4);
+                    wsub  = store_wdata[i*32 +: 32];
+                    msub  = store_mask[i*4 +: 4];
+                    if (msub != 4'b0) begin
+                        if ((baddr >= PRIO_BASE_B + 32'd4) &&
+                                (baddr <= PRIO_BASE_B + 32'(NSOURCES * 4))) begin
+                            if (msub[0]) prio_q[baddr[6:2]] <= wsub[2:0];
+                        end else begin
+                            unique case (baddr)
+                                PENDING_B: begin
+                                    for (int s = 1; s <= NSOURCES; s += 1)
+                                        if (wsub[s]) sw_pend_q[s] <= 1'b1;
+                                end
+                                PENDING_CLR_B: begin
+                                    for (int s = 1; s <= NSOURCES; s += 1)
+                                        if (wsub[s]) sw_pend_q[s] <= 1'b0;
+                                end
+                                ENABLE0_B: enable_q[0] <= wsub;
+                                ENABLE1_B: enable_q[1] <= wsub;
+                                THRESH0_B: if (msub[0]) thresh_q[0] <= wsub[2:0];
+                                THRESH1_B: if (msub[0]) thresh_q[1] <= wsub[2:0];
+                                CLAIM0_B:  if (wsub[5:0] <= 6'(NSOURCES))
+                                               inflight_q[wsub[5:0]] <= 1'b0;
+                                CLAIM1_B:  if (wsub[5:0] <= 6'(NSOURCES))
+                                               inflight_q[wsub[5:0]] <= 1'b0;
+                                default: ;
+                            endcase
                         end
-                        PENDING_CLR_W: begin
-                            for (int s = 1; s <= NSOURCES; s += 1)
-                                if (store_wdata[s]) sw_pend_q[s] <= 1'b0;
-                        end
-                        ENABLE0_W: enable_q[0] <= store_wdata;
-                        ENABLE1_W: enable_q[1] <= store_wdata;
-                        THRESH0_W: if (store_mask[0]) thresh_q[0] <= store_wdata[2:0];
-                        THRESH1_W: if (store_mask[0]) thresh_q[1] <= store_wdata[2:0];
-                        CLAIM0_W:  if (store_wdata[5:0] <= 6'(NSOURCES))
-                                       inflight_q[store_wdata[5:0]] <= 1'b0;
-                        CLAIM1_W:  if (store_wdata[5:0] <= 6'(NSOURCES))
-                                       inflight_q[store_wdata[5:0]] <= 1'b0;
-                        default: ;
-                    endcase
+                    end
                 end
             end
         end

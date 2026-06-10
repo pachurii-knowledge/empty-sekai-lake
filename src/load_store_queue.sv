@@ -55,6 +55,9 @@ module load_store_queue
     // Hold the commit stage off for one cycle while the second store beat drains
     // so a younger store cannot collide on the single memory write port.
     output logic                 store_port_busy,
+    // Byte offset of the in-order head load within the bus word, for
+    // memory-mapped device read side effects (which 32-bit register is read).
+    output logic [ADDR_SHIFT-1:0] head_load_off,
     output writeback_packet_t    load_writeback
 );
 
@@ -124,6 +127,10 @@ module load_store_queue
         (store_probe_hi_q ? XLEN'(XLEN_BYTES) : '0);
     // AMOs read and write; treat as a store so the walker checks W permission.
     assign mem_req_store = entries_q[head_q].entry.ctrl.memWrite;
+
+    // The in-order head load's byte offset (devices snoop the returned load
+    // address, which lines up with the head load this matches).
+    assign head_load_off  = entries_q[head_q].addr[ADDR_SHIFT-1:0];
 
 
     always_comb begin

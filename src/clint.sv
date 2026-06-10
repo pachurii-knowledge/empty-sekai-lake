@@ -11,37 +11,51 @@
  * combinational load-hit/read path for reads of its registers. mtime drives
  * the machine timer interrupt (mtip = mtime >= mtimecmp) and msip drives the
  * machine software interrupt.
+ *
+ * The bus is one memory word wide (4 bytes at RV32, 8 at RV64). The device
+ * registers are 32-bit; each bus word is decoded as XLEN/32 subwords, so on
+ * RV64 a single 8-byte access reads/writes an adjacent register pair (e.g. a
+ * 64-bit ld/sd of mtime or mtimecmp works naturally).
  */
+
+`include "riscv_isa.vh"
+`include "riscv_uarch.vh"
 
 `default_nettype none
 
-module clint #(
+module clint
+    import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
+    import RISCV_UArch::MEMORY_ADDR_WIDTH;
+#(
     parameter logic [31:0] BASE = 32'h0200_0000
 ) (
     input  logic        clk,
     input  logic        rst_l,
 
-    // Data store snoop (word address space: byte addr >> 2)
+    // Data store snoop (memory-word address space: byte addr >> log2(XLEN_BYTES))
     input  logic        store_en,
-    input  logic [29:0] store_waddr,
-    input  logic [31:0] store_wdata,
-    input  logic [3:0]  store_mask,
+    input  logic [MEMORY_ADDR_WIDTH-1:0] store_waddr,
+    input  logic [XLEN-1:0] store_wdata,
+    input  logic [XLEN_BYTES-1:0] store_mask,
 
     // Combinational load query
-    input  logic [29:0] load_addr,
+    input  logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
     output logic        load_hit,
-    output logic [31:0] load_data,
+    output logic [XLEN-1:0] load_data,
 
     output logic        irq_m_timer,
     output logic        irq_m_software,
     output logic [63:0] mtime_out
 );
 
-    localparam logic [29:0] MSIP_W      = 30'((BASE + 32'h0000) >> 2);
-    localparam logic [29:0] MTIMECMP_LO = 30'((BASE + 32'h4000) >> 2);
-    localparam logic [29:0] MTIMECMP_HI = 30'((BASE + 32'h4004) >> 2);
-    localparam logic [29:0] MTIME_LO    = 30'((BASE + 32'hBFF8) >> 2);
-    localparam logic [29:0] MTIME_HI    = 30'((BASE + 32'hBFFC) >> 2);
+    localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
+    localparam int NSUB = XLEN / 32;       // 32-bit registers per bus word
+
+    localparam logic [31:0] MSIP_B      = BASE + 32'h0000;
+    localparam logic [31:0] MTIMECMP_LO = BASE + 32'h4000;
+    localparam logic [31:0] MTIMECMP_HI = BASE + 32'h4004;
+    localparam logic [31:0] MTIME_LO    = BASE + 32'hBFF8;
+    localparam logic [31:0] MTIME_HI    = BASE + 32'hBFFC;
 
     logic [63:0] mtime_q;
     logic [63:0] mtimecmp_q;
@@ -51,18 +65,34 @@ module clint #(
     assign irq_m_timer    = (mtime_q >= mtimecmp_q);
     assign irq_m_software = msip_q;
 
-    // Combinational read path
-    always_comb begin
-        load_hit  = 1'b1;
-        load_data = 32'b0;
-        unique case (load_addr)
-            MSIP_W:      load_data = {31'b0, msip_q};
-            MTIMECMP_LO: load_data = mtimecmp_q[31:0];
-            MTIMECMP_HI: load_data = mtimecmp_q[63:32];
-            MTIME_LO:    load_data = mtime_q[31:0];
-            MTIME_HI:    load_data = mtime_q[63:32];
-            default:     load_hit  = 1'b0;
+    // 32-bit register read at a byte address; hit reports whether the address
+    // decodes to a CLINT register.
+    function automatic logic [31:0] reg_read(input logic [31:0] baddr,
+            output logic hit);
+        hit = 1'b1;
+        unique case (baddr)
+            MSIP_B:      reg_read = {31'b0, msip_q};
+            MTIMECMP_LO: reg_read = mtimecmp_q[31:0];
+            MTIMECMP_HI: reg_read = mtimecmp_q[63:32];
+            MTIME_LO:    reg_read = mtime_q[31:0];
+            MTIME_HI:    reg_read = mtime_q[63:32];
+            default: begin
+                reg_read = 32'b0;
+                hit = 1'b0;
+            end
         endcase
+    endfunction
+
+    // Combinational read path: each bus subword decodes independently.
+    always_comb begin
+        logic sub_hit;
+        load_hit  = 1'b0;
+        load_data = '0;
+        for (int i = 0; i < NSUB; i += 1) begin
+            load_data[i*32 +: 32] = reg_read(
+                32'(load_addr << ADDR_SHIFT) + 32'(unsigned'(i) * 4), sub_hit);
+            load_hit |= sub_hit;
+        end
     end
 
     function automatic logic [31:0] merge(input logic [31:0] old_w,
@@ -80,19 +110,25 @@ module clint #(
             msip_q     <= 1'b0;
         end else begin
             mtime_q <= mtime_q + 64'd1;
-            if (store_en && (store_mask != 4'b0)) begin
-                unique case (store_waddr)
-                    MSIP_W:      if (store_mask[0]) msip_q <= store_wdata[0];
-                    MTIMECMP_LO: mtimecmp_q[31:0]  <= merge(mtimecmp_q[31:0],
-                                                 store_wdata, store_mask);
-                    MTIMECMP_HI: mtimecmp_q[63:32] <= merge(mtimecmp_q[63:32],
-                                                 store_wdata, store_mask);
-                    MTIME_LO:    mtime_q[31:0]  <= merge(mtime_q[31:0],
-                                                 store_wdata, store_mask);
-                    MTIME_HI:    mtime_q[63:32] <= merge(mtime_q[63:32],
-                                                 store_wdata, store_mask);
-                    default: ;
-                endcase
+            if (store_en && (store_mask != '0)) begin
+                for (int i = 0; i < NSUB; i += 1) begin
+                    logic [31:0] baddr;
+                    logic [31:0] wsub;
+                    logic [3:0]  msub;
+                    baddr = 32'(store_waddr << ADDR_SHIFT) + 32'(unsigned'(i) * 4);
+                    wsub  = store_wdata[i*32 +: 32];
+                    msub  = store_mask[i*4 +: 4];
+                    if (msub != 4'b0) begin
+                        unique case (baddr)
+                            MSIP_B:      if (msub[0]) msip_q <= wsub[0];
+                            MTIMECMP_LO: mtimecmp_q[31:0]  <= merge(mtimecmp_q[31:0],  wsub, msub);
+                            MTIMECMP_HI: mtimecmp_q[63:32] <= merge(mtimecmp_q[63:32], wsub, msub);
+                            MTIME_LO:    mtime_q[31:0]  <= merge(mtime_q[31:0],  wsub, msub);
+                            MTIME_HI:    mtime_q[63:32] <= merge(mtime_q[63:32], wsub, msub);
+                            default: ;
+                        endcase
+                    end
+                end
             end
         end
     end

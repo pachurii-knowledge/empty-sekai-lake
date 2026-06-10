@@ -93,8 +93,13 @@ fail:
     .align 2
 handler:
     csrr    t0, mcause
-    li      t1, 0x8000000B          # machine external interrupt
-    bne     t0, t1, fail            # a1 left as whatever; unexpected trap
+    # Machine external interrupt. The interrupt flag is mcause's MSB (bit
+    # XLEN-1), so test the sign and the low cause bits XLEN-portably -- the
+    # RV32 magic 0x8000000B puts the flag at bit 31, wrong on RV64 (bit 63).
+    bge     t0, x0, fail            # not an interrupt (MSB clear) -> unexpected
+    andi    t0, t0, 0xff            # cause field
+    li      t1, 11                  # external interrupt
+    bne     t0, t1, fail
 
     li      t2, 0x0C200004          # claim/complete[ctx0]
     lw      t3, 0(t2)               # claim

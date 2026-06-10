@@ -397,7 +397,7 @@ module riscv_core_scalar
     logic        csr_read_illegal_E;
     logic [2:0]  csr_frm_E;
 
-    logic [31:0] clint_load_data;
+    logic [XLEN-1:0] clint_load_data;
     logic        clint_load_hit;
     logic        irq_mtimer, irq_msoft;
     logic [63:0] clint_mtime;

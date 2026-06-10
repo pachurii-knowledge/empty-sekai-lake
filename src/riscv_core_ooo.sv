@@ -206,13 +206,14 @@ module riscv_core_ooo
     logic [63:0] clint_mtime;
     logic        irq_mtimer, irq_msoft;
     logic        clint_load_hit;
-    logic [31:0] clint_load_data;
+    logic [XLEN-1:0] clint_load_data;
     logic        plic_load_hit;
-    logic [31:0] plic_load_data;
+    logic [XLEN-1:0] plic_load_data;
     logic        plic_m_ext, plic_s_ext;
     logic        uart_load_hit;
-    logic [31:0] uart_load_data;
+    logic [XLEN-1:0] uart_load_data;
     logic        uart_irq;
+    logic [ADDR_SHIFT-1:0] dev_load_off;   // head load byte offset (from LSQ)
 
     // Commit-time trap evaluation (driven combinationally in the commit block).
     logic        commit_exc_valid;
@@ -515,6 +516,7 @@ module riscv_core_ooo
         .store_mask(data_store_mask),
         .load_addr(data_load_addr),
         .load_en(data_load_valid),
+        .load_off(dev_load_off),
         .load_hit(plic_load_hit),
         .load_data(plic_load_data),
         .irq_m_external(plic_m_ext),
@@ -533,6 +535,7 @@ module riscv_core_ooo
         .store_mask(data_store_mask),
         .load_addr(data_load_addr),
         .load_en(data_load_valid),
+        .load_off(dev_load_off),
         .load_hit(uart_load_hit),
         .load_data(uart_load_data),
         .irq(uart_irq)
@@ -1123,6 +1126,7 @@ module riscv_core_ooo
         .data_store_mask(mem_data_store_mask),
         .store_second_beat(lsq_store_second_beat),
         .store_port_busy(lsq_store_port_busy),
+        .head_load_off(dev_load_off),
         .load_writeback
     );
 
