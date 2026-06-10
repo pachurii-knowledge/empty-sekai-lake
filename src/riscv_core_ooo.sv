@@ -801,7 +801,32 @@ module riscv_core_ooo
                            : RISCV_Priv::EXC_LOAD_PAGE_FAULT) :
             (mem_req_store ? RISCV_Priv::EXC_STORE_ACCESS
                            : RISCV_Priv::EXC_LOAD_ACCESS);
-    assign lsq_data_load_addr = paging_data ? mem_req_vaddr[XLEN-1:ADDR_SHIFT] : data_load_addr;
+    // The LSQ matches a returning load against its head entry by address. The
+    // memory read port has a DMEMORY_READ_DELAY-deep latency, so the value that
+    // returns this cycle belongs to the request issued that many cycles ago.
+    // The non-paging branch matches on data_addr_P, which is exactly that
+    // pipelined request address -- so a load only accepts the data for its own
+    // request. The paging branch must do the same in virtual-address space, so
+    // pipeline the request VA word by the identical latency. (Using the live
+    // mem_req_vaddr here is a bug: it always equals the current head, so the
+    // head accepts the first valid response in the pipe -- which can be a
+    // stale, still-draining response from a previous load to a different
+    // address. That silently corrupts the loaded value, e.g. a saved register
+    // restored from the kernel stack under Sv39 page churn.)
+    localparam int DMEM_RD_DELAY = RISCV_UArch::DMEMORY_READ_DELAY;
+    logic [MEMORY_ADDR_WIDTH-1:0] mem_req_vaddr_word_pipe_q [DMEM_RD_DELAY];
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin
+            for (int i = 0; i < DMEM_RD_DELAY; i++)
+                mem_req_vaddr_word_pipe_q[i] <= '0;
+        end else begin
+            mem_req_vaddr_word_pipe_q[0] <= mem_req_vaddr[XLEN-1:ADDR_SHIFT];
+            for (int i = 1; i < DMEM_RD_DELAY; i++)
+                mem_req_vaddr_word_pipe_q[i] <= mem_req_vaddr_word_pipe_q[i-1];
+        end
+    end
+    assign lsq_data_load_addr = paging_data
+        ? mem_req_vaddr_word_pipe_q[DMEM_RD_DELAY-1] : data_load_addr;
 
     // --- Resolve the fetch physical address + stall during a fetch walk ---
     logic        fetch_from_ptw, ptw_fetch_done;
