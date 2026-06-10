@@ -568,7 +568,13 @@ module riscv_decode
                             ctrl_signals.fp_double = 1'b0;
                         end
                         3'b011: begin
+                            // On RV64 an FLD is a native one-word access; the
+                            // RV32 path keeps the two-word LDST_W split.
+`ifdef RV64
+                            ctrl_signals.ldst_mode = LDST_D;
+`else
                             ctrl_signals.ldst_mode = LDST_W;
+`endif
                             ctrl_signals.fp_double = 1'b1;
                         end
                         default: ctrl_signals.illegal_instr = 1'b1;
@@ -591,7 +597,13 @@ module riscv_decode
                             ctrl_signals.fp_double = 1'b0;
                         end
                         3'b011: begin
+                            // On RV64 an FSD is a native one-word access; the
+                            // RV32 path keeps the two-word LDST_W split.
+`ifdef RV64
+                            ctrl_signals.ldst_mode = LDST_D;
+`else
                             ctrl_signals.ldst_mode = LDST_W;
+`endif
                             ctrl_signals.fp_double = 1'b1;
                         end
                         default: ctrl_signals.illegal_instr = 1'b1;
@@ -700,12 +712,28 @@ module riscv_decode
                             ctrl_signals.fp_writes_gpr = 1'b1;
                             ctrl_signals.rfWrite = 1'b1;
                             ctrl_signals.fp_uses_rs2 = 1'b0;
-                            ctrl_signals.fp_op = instr[20] ? FP_CVT_WU : FP_CVT_W;
+                            unique case (instr[24:20])
+                                5'b00000: ctrl_signals.fp_op = FP_CVT_W;
+                                5'b00001: ctrl_signals.fp_op = FP_CVT_WU;
+`ifdef RV64
+                                5'b00010: ctrl_signals.fp_op = FP_CVT_L;
+                                5'b00011: ctrl_signals.fp_op = FP_CVT_LU;
+`endif
+                                default: ctrl_signals.illegal_instr = 1'b1;
+                            endcase
                         end
                         5'b11010: begin
                             ctrl_signals.fp_uses_rs1 = 1'b0;
                             ctrl_signals.fp_uses_rs2 = 1'b0;
-                            ctrl_signals.fp_op = instr[20] ? FP_CVT_F_WU : FP_CVT_F_W;
+                            unique case (instr[24:20])
+                                5'b00000: ctrl_signals.fp_op = FP_CVT_F_W;
+                                5'b00001: ctrl_signals.fp_op = FP_CVT_F_WU;
+`ifdef RV64
+                                5'b00010: ctrl_signals.fp_op = FP_CVT_F_L;
+                                5'b00011: ctrl_signals.fp_op = FP_CVT_F_LU;
+`endif
+                                default: ctrl_signals.illegal_instr = 1'b1;
+                            endcase
                         end
                         5'b11100: begin
                             ctrl_signals.fp_writes_fpr = 1'b0;

@@ -10,7 +10,7 @@ module niigo_fp_unit
     input  logic              issue_valid,
     output logic              issue_ready,
     input  issue_entry_t      issue_entry,
-    input  logic [31:0]       rs1_data,
+    input  logic [XLEN-1:0]   rs1_data,
     input  logic [2:0]        frm,
     input  branch_mask_t      abort_mask,
     // Precise-trap full flush: drop the pending request, the cvfpu internal
@@ -31,7 +31,7 @@ module niigo_fp_unit
     };
 
     issue_entry_t req_entry_q;
-    logic [31:0]  req_int_src_q;
+    logic [XLEN-1:0] req_int_src_q;
     logic         req_valid_q;
     logic         req_is_simple;
     logic         req_aborted;
@@ -74,7 +74,11 @@ module niigo_fp_unit
         (writeback_ready && !simple_writeback_valid);
 
     fpnew_top #(
+`ifdef RV64
+        .Features       ( fpnew_pkg::RV64D          ),
+`else
         .Features       ( fpnew_pkg::RV32D          ),
+`endif
         .Implementation ( NIIGO_CVFPU_IMPL          ),
         .DivSqrtSel     ( fpnew_pkg::THMULTI        ),
         .TagType        ( issue_entry_t             )
@@ -167,8 +171,15 @@ module niigo_fp_unit
         fpnew_op_mod = cvfpu_op_mod(req_entry_q.ctrl.fp_op);
         fpnew_src_fmt = cvfpu_src_format(req_entry_q);
         fpnew_dst_fmt = cvfpu_dst_format(req_entry_q);
-        fpnew_int_fmt = fpnew_pkg::INT32;
+        fpnew_int_fmt = is_l_cvt(req_entry_q.ctrl.fp_op) ?
+            fpnew_pkg::INT64 : fpnew_pkg::INT32;
     end
+
+    // RV64 L-form conversions: 64-bit integer operand/result.
+    function automatic logic is_l_cvt(input fp_op_t op);
+        is_l_cvt = (op == FP_CVT_L) || (op == FP_CVT_LU) ||
+            (op == FP_CVT_F_L) || (op == FP_CVT_F_LU);
+    endfunction
 
     function automatic logic is_simple_op(input issue_entry_t entry);
         is_simple_op = (entry.ctrl.fp_op == FP_MV_X) ||
@@ -229,9 +240,13 @@ module niigo_fp_unit
             FP_LE:      cvfpu_operation = fpnew_pkg::CMP;
             FP_CLASS:   cvfpu_operation = fpnew_pkg::CLASSIFY;
             FP_CVT_W,
-            FP_CVT_WU:  cvfpu_operation = fpnew_pkg::F2I;
+            FP_CVT_WU,
+            FP_CVT_L,
+            FP_CVT_LU:  cvfpu_operation = fpnew_pkg::F2I;
             FP_CVT_F_W,
-            FP_CVT_F_WU: cvfpu_operation = fpnew_pkg::I2F;
+            FP_CVT_F_WU,
+            FP_CVT_F_L,
+            FP_CVT_F_LU: cvfpu_operation = fpnew_pkg::I2F;
             FP_CVT_F_F: cvfpu_operation = fpnew_pkg::F2F;
             FP_MADD,
             FP_MSUB:    cvfpu_operation = fpnew_pkg::FMADD;
@@ -247,7 +262,9 @@ module niigo_fp_unit
             FP_MSUB,
             FP_NMADD,
             FP_CVT_WU,
-            FP_CVT_F_WU: cvfpu_op_mod = 1'b1;
+            FP_CVT_LU,
+            FP_CVT_F_WU,
+            FP_CVT_F_LU: cvfpu_op_mod = 1'b1;
             default:     cvfpu_op_mod = 1'b0;
         endcase
     endfunction
@@ -269,7 +286,7 @@ module niigo_fp_unit
     endfunction
 
     function automatic logic [2:0][63:0] cvfpu_operands(
-            input issue_entry_t entry, input logic [31:0] int_src);
+            input issue_entry_t entry, input logic [XLEN-1:0] int_src);
         cvfpu_operands = '0;
         unique case (entry.ctrl.fp_op)
             FP_ADD,
@@ -288,7 +305,11 @@ module niigo_fp_unit
             end
             FP_CVT_F_W,
             FP_CVT_F_WU: begin
-                cvfpu_operands[0] = {32'b0, int_src};
+                cvfpu_operands[0] = {32'b0, int_src[31:0]};
+            end
+            FP_CVT_F_L,
+            FP_CVT_F_LU: begin
+                cvfpu_operands[0] = 64'(int_src);
             end
             default: begin
                 cvfpu_operands[0] = entry.fp_src1_data;
@@ -315,17 +336,22 @@ module niigo_fp_unit
     endfunction
 
     function automatic writeback_packet_t packet_for_simple(
-            input issue_entry_t entry, input logic [31:0] int_src);
+            input issue_entry_t entry, input logic [XLEN-1:0] int_src);
         writeback_packet_t packet;
         packet = base_packet(entry);
         unique case (entry.ctrl.fp_op)
             FP_MV_X: begin
-                packet.data = entry.fp_src1_data[31:0];
+                // FMV.X.D moves all 64 bits; FMV.X.W sign-extends bit 31
+                // (identity at XLEN=32).
+                packet.data = entry.ctrl.fp_double ?
+                    XLEN'(entry.fp_src1_data) :
+                    XLEN'($signed(entry.fp_src1_data[31:0]));
                 packet.fp_write = 1'b0;
             end
             FP_MV_F_X: begin
-                packet.fp_data = entry.ctrl.fp_double ? {32'b0, int_src} :
-                    {32'hffff_ffff, int_src};
+                // FMV.D.X moves all 64 bits; FMV.W.X NaN-boxes the low word.
+                packet.fp_data = entry.ctrl.fp_double ? 64'(int_src) :
+                    {32'hffff_ffff, int_src[31:0]};
             end
             default: begin
             end
@@ -337,7 +363,10 @@ module niigo_fp_unit
             input logic [63:0] result, input fpnew_pkg::status_t status);
         writeback_packet_t packet;
         packet = base_packet(entry);
-        packet.data = result[31:0];
+        // 32-bit integer results (FCVT.W/WU, compares, classify) sign-extend
+        // to XLEN per RV64; the L-form conversions return the full 64 bits.
+        packet.data = is_l_cvt(entry.ctrl.fp_op) ?
+            XLEN'(result) : XLEN'($signed(result[31:0]));
         packet.fp_data = result;
         packet.fp_fflags = {status.NV, status.DZ, status.OF, status.UF, status.NX};
         return packet;

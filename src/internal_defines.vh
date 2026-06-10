@@ -150,6 +150,10 @@ typedef enum logic [5:0] {
     FP_CVT_WU,
     FP_CVT_F_W,
     FP_CVT_F_WU,
+    FP_CVT_L,               // RV64: FCVT.L.{S,D}  (fp -> signed 64-bit int)
+    FP_CVT_LU,              // RV64: FCVT.LU.{S,D} (fp -> unsigned 64-bit int)
+    FP_CVT_F_L,             // RV64: FCVT.{S,D}.L  (signed 64-bit int -> fp)
+    FP_CVT_F_LU,            // RV64: FCVT.{S,D}.LU (unsigned 64-bit int -> fp)
     FP_CVT_F_F,
     FP_MV_X,
     FP_MV_F_X,

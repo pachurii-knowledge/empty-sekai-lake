@@ -188,20 +188,30 @@ module load_store_queue
             end
         end
 
-        // Re-derive the byte-offset-dependent store fields for plain integer
-        // stores once both the address and data operands are resolved. This is
+        // Re-derive the byte-offset-dependent store fields for plain stores
+        // once both the address and data operands are resolved. This is
         // idempotent and corrects the case where the data arrived (and was
-        // formatted) before the address, so addr[1:0] was not yet known. AMO/SC
-        // stores are word-aligned (offset always 0, and their store_data may be
-        // an amo_result) and FP stores are full-word, so both are left alone.
+        // formatted) before the address, so the byte offset was not yet known.
+        // AMO/SC stores are word-aligned (offset always 0, and their
+        // store_data may be an amo_result) and are left alone. On RV32, FP
+        // stores are full-word (offset-independent) and also skipped; on RV64
+        // they go through the same byte-split path (their data -- store_raw =
+        // fp_src2_data -- is always present from dispatch, so only the address
+        // needs to have resolved).
         for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
             if (entries_next[i].entry.valid &&
                     entries_next[i].entry.ctrl.memWrite &&
                     !entries_next[i].entry.ctrl.memRead &&
-                    (entries_next[i].entry.ctrl.exec_class != EXEC_FP) &&
                     (entries_next[i].entry.ctrl.exec_class != EXEC_AMO) &&
                     entries_next[i].addr_ready &&
-                    entries_next[i].data_ready) begin
+`ifdef RV64
+                    ((entries_next[i].entry.ctrl.exec_class == EXEC_FP) ||
+                     entries_next[i].data_ready)
+`else
+                    (entries_next[i].entry.ctrl.exec_class != EXEC_FP) &&
+                    entries_next[i].data_ready
+`endif
+                    ) begin
                 format_store_split(
                     entries_next[i].entry.ctrl.ldst_mode,
                     entries_next[i].addr[ADDR_SHIFT-1:0],
@@ -432,8 +442,13 @@ module load_store_queue
                         entries_next[head_next].entry.ctrl.fp_writes_fpr;
                     load_writeback.fp_rd = entries_next[head_next].entry.fp_rd;
 `ifdef RV64
+                    // load_writeback.data was just extracted at the access
+                    // width/offset (FLD decodes LDST_D, FLW LDST_W), so an FLD
+                    // is the full value and an FLW NaN-boxes its low word --
+                    // correct for any byte offset and for misaligned splits.
                     load_writeback.fp_data = entries_next[head_next].entry.ctrl.fp_double ?
-                        data_load[63:0] : {32'hffff_ffff, data_load[31:0]};
+                        load_writeback.data :
+                        {32'hffff_ffff, load_writeback.data[31:0]};
 `else
                     load_writeback.fp_data = entries_next[head_next].entry.ctrl.fp_double ?
                         {data_load, entries_next[head_next].load_low_word} :
@@ -490,7 +505,14 @@ module load_store_queue
                     entries_next[tail_next].store_hi_pa = '0;
                     entries_next[tail_next].store_raw =
                         (insert_entry[lane].ctrl.exec_class == EXEC_FP) ?
-                            '0 : insert_rs2_data[lane];
+`ifdef RV64
+                            // FP store data is positioned by the same
+                            // format_store_split path as integer stores.
+                            XLEN'(insert_entry[lane].fp_src2_data)
+`else
+                            '0
+`endif
+                            : insert_rs2_data[lane];
                     if (insert_entry[lane].src1_ready) begin
                         entries_next[tail_next].addr = insert_rs1_data[lane] +
                             ((insert_entry[lane].ctrl.exec_class == EXEC_AMO) ?
@@ -501,6 +523,19 @@ module load_store_queue
                     if (insert_entry[lane].src2_ready ||
                             insert_entry[lane].ctrl.fp_uses_rs2) begin
                         if (insert_entry[lane].ctrl.exec_class == EXEC_FP) begin
+`ifdef RV64
+                            // FSD decodes LDST_D / FSW LDST_W, so FP stores
+                            // position through the generic byte-split path
+                            // exactly like integer stores.
+                            format_store_split(insert_entry[lane].ctrl.ldst_mode,
+                                entries_next[tail_next].addr[ADDR_SHIFT-1:0],
+                                XLEN'(insert_entry[lane].fp_src2_data),
+                                entries_next[tail_next].store_data,
+                                entries_next[tail_next].store_mask,
+                                entries_next[tail_next].store_data_hi,
+                                entries_next[tail_next].store_mask_hi);
+                            entries_next[tail_next].store_data_upper = '0;
+`else
                             // FP store: each word is full-width (FSW = low word
                             // only; FSD = both words). No byte-level splitting.
                             entries_next[tail_next].store_data =
@@ -512,6 +547,7 @@ module load_store_queue
                                 insert_entry[lane].ctrl.fp_double ? 4'b1111 : 4'b0000;
                             entries_next[tail_next].store_data_upper =
                                 insert_entry[lane].fp_src2_data[63:32];
+`endif
                         end else begin
                             format_store_split(insert_entry[lane].ctrl.ldst_mode,
                                 entries_next[tail_next].addr[ADDR_SHIFT-1:0],
