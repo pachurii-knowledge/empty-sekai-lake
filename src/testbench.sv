@@ -164,8 +164,10 @@ module top;
         .ptw_rdata  (ptw_rdata)
     );
 
-    // Keep a count of the cycles that have passed, and the current PC value
-    assign pc = {instr_addr, 2'b00};
+    // Keep a count of the cycles that have passed, and the current PC value.
+    // instr_addr is a memory-word address (byte addr >> log2(XLEN_BYTES)), so
+    // the byte PC restores those low zero bits (2 on RV32, 3 on RV64).
+    assign pc = {instr_addr, {$clog2(XLEN_BYTES){1'b0}}};
     always_ff @(posedge clk) begin
         if (!rst_l) begin
             cycle_count = 0;

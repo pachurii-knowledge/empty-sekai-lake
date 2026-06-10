@@ -85,6 +85,12 @@ module load_store_queue
         // Captured physical word address of the high beat (from xlate_pa during
         // the high-word probe). Used to drive the second write after retire.
         logic [XLEN-1:0] store_hi_pa;
+        // Captured physical address of the (low) beat, latched when the store
+        // is proven translatable at the completion probe. The store then writes
+        // memory at commit using THIS PA -- not a re-evaluated live translation,
+        // which can have been evicted from the small DTLB by the time the store
+        // reaches commit (a later cycle), orphaning the committed store.
+        logic [XLEN-1:0] store_lo_pa;
     } mem_entry_t;
 
     // Byte-address -> word-address shift for the word-granular memory bus.
@@ -317,6 +323,8 @@ module load_store_queue
             load_writeback.data = (reservation_valid_q &&
                 (reservation_addr_q == entries_next[head_next].addr)) ? '0 : XLEN'(1);
             if (load_writeback.data == '0) begin
+                // SC succeeds: capture its PA for the commit write-back.
+                entries_next[head_next].store_lo_pa = xlate_pa;
                 entries_next[head_next].issued_load = 1'b1;
                 reservation_valid_next = 1'b0;
             end else begin
@@ -331,6 +339,9 @@ module load_store_queue
                 entries_next[head_next].entry.src1_ready && !entries_next[head_next].issued_load) begin
             data_load_en = 1'b1;
             data_addr = entries_next[head_next].addr[XLEN-1:ADDR_SHIFT];
+            // Capture the PA for an AMO's write-back beat (same address it read);
+            // harmless for a pure load.
+            entries_next[head_next].store_lo_pa = xlate_pa;
             entries_next[head_next].issued_load = 1'b1;
         end
 
@@ -348,13 +359,18 @@ module load_store_queue
                 !entries_next[head_next].issued_load) begin
             if (!needs_two_beats(entries_next[head_next].entry.ctrl,
                     entries_next[head_next].addr)) begin
+                // Single-beat store proven translatable: latch its PA and mark
+                // it complete. The commit write below uses this latched PA.
+                entries_next[head_next].store_lo_pa = xlate_pa;
                 load_writeback.valid = 1'b1;
                 load_writeback.active_id = entries_next[head_next].entry.active_id;
                 load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
                 load_writeback.has_dest = 1'b0;
                 entries_next[head_next].issued_load = 1'b1;
             end else if (!store_probe_hi_q) begin
-                // Low word translated OK; probe the high word next cycle.
+                // Low word translated OK: capture its PA, then probe the high
+                // word next cycle.
+                entries_next[head_next].store_lo_pa = xlate_pa;
                 store_probe_hi_next = 1'b1;
             end else begin
                 // High word translated OK; capture its PA and complete.
@@ -470,13 +486,21 @@ module load_store_queue
             end
         end
 
-        if (head_xlate_ok && !double_store_pending_q && commit_store && entries_next[head_next].entry.valid &&
+        // Store commit: the committing store was already proven translatable at
+        // its completion probe (which latched store_lo_pa), so write it using
+        // that captured PA -- NOT a re-evaluated live translation (head_xlate_ok),
+        // whose DTLB entry can have been evicted between the probe and commit,
+        // leaving the committed store orphaned and wedging the queue. store_lo_pa
+        // is a physical address, so assert store_second_beat to tell the core
+        // port to use data_addr directly (skip the head-VA translation mux).
+        if (!double_store_pending_q && commit_store && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memWrite &&
                 (entries_next[head_next].entry.active_id == commit_store_id)) begin
-            // First (low) beat: written through the normal head-VA translation.
-            data_addr = entries_next[head_next].addr[XLEN-1:ADDR_SHIFT];
+            // First (low) beat: written at the captured physical address.
+            data_addr = entries_next[head_next].store_lo_pa[XLEN-1:ADDR_SHIFT];
             data_store = entries_next[head_next].store_data;
             data_store_mask = entries_next[head_next].store_mask;
+            store_second_beat = 1'b1;
             // Second (high) beat of a two-beat store: queue a fire-and-forget
             // write at the high word's captured physical address. The high page
             // was already proven fault-free during the probe above, so this
@@ -510,6 +534,7 @@ module load_store_queue
                     entries_next[tail_next].double_low_valid = 1'b0;
                     entries_next[tail_next].load_low_word = '0;
                     entries_next[tail_next].store_hi_pa = '0;
+                    entries_next[tail_next].store_lo_pa = '0;
                     entries_next[tail_next].store_raw =
                         (insert_entry[lane].ctrl.exec_class == EXEC_FP) ?
 `ifdef RV64
