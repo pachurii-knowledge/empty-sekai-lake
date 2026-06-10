@@ -33,14 +33,16 @@ if grep -q "ECALL invoked with halt argument" "$OUTPUT/sim.log"; then
   exit 0
 fi
 
+# The register dump prints a0 at the build's XLEN width (8 hex digits on
+# RV32, 16 on RV64) -- match any number of leading zeros.
 if [[ -f "$OUTPUT/simulation.reg" ]] &&
-   grep -qE 'x10\s+\(a0\)\s+= 0x0000000a \(10\)' "$OUTPUT/simulation.reg"; then
+   grep -qE 'x10\s+\(a0\)\s+= 0x0+a \(10\)' "$OUTPUT/simulation.reg"; then
   echo "RVCP-SUMMARY: TEST PASSED - Test File \"$(basename "$ELF")\""
   exit 0
 fi
 
 if [[ -f "$OUTPUT/simulation.reg" ]] &&
-   grep -qE 'x10\s+\(a0\)\s+= 0x0000000b \(11\)' "$OUTPUT/simulation.reg"; then
+   grep -qE 'x10\s+\(a0\)\s+= 0x0+b \(11\)' "$OUTPUT/simulation.reg"; then
   echo "RVCP-SUMMARY: TEST FAILED - Test File \"$(basename "$ELF")\" (self-check fail)" >&2
   exit 1
 fi

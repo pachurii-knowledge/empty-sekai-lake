@@ -235,18 +235,28 @@ module top;
         if (sig_enabled) begin
             int unsigned waddr;
             int          fd;
-            logic [29:0] idx;
+            logic [MEMORY_ADDR_WIDTH-1:0] idx;
             fd = $fopen(sig_out_path, "w");
             if (fd == 0) begin
                 $display("SIG: unable to open %s for writing", sig_out_path);
             end else begin
+                // One line per memory word at the build's word size (4 bytes
+                // on RV32, 8 on RV64), matching the reference signature
+                // granularity for that XLEN.
                 for (waddr = sig_begin_addr; waddr < sig_end_addr;
-                        waddr += 4) begin
-                    idx = waddr[31:2];
+                        waddr += XLEN_BYTES) begin
+                    idx = MEMORY_ADDR_WIDTH'(waddr >> $clog2(XLEN_BYTES));
+`ifdef RV64
+                    if (Memory.memory.exists(idx))
+                        $fdisplay(fd, "%016x", Memory.memory[idx]);
+                    else
+                        $fdisplay(fd, "%016x", 64'h0);
+`else
                     if (Memory.memory.exists(idx))
                         $fdisplay(fd, "%08x", Memory.memory[idx]);
                     else
                         $fdisplay(fd, "%08x", 32'h0);
+`endif
                 end
                 $fclose(fd);
                 $display("SIG: wrote signature [%08h,%08h) to %s",

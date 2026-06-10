@@ -13,12 +13,17 @@ sym() { readelf -s "$ELF" 2>/dev/null | awk -v n="$1" '$8==n{print $2; exit}'; }
 base=$(sym failure_type)
 end=$(printf "%08x" $((16#$base + 0x128)))
 
+# The signature dumper emits one line per memory word: 4 bytes on an RV32
+# build, 8 on RV64. Match the ELF class.
+WORD=4
+if readelf -h "$ELF" 2>/dev/null | grep -q "ELF64"; then WORD=8; fi
+
 python3 "$ROOT/scripts/load_elf_mem.py" "$ELF" -o "$OUT" --no-bootstrap >/dev/null 2>&1
 ( cd "$OUT" && timeout "${NIIGO_TEST_TIMEOUT:-150}" "$VTOP" \
     +sig_begin="$base" +sig_end="$end" +sig_out="$OUT/diag.sig" > sim.log 2>&1 )
 
 a0=$(grep -oE 'x10 .a0.\s+= 0x[0-9a-f]+' "$OUT/simulation.reg" 2>/dev/null | head -1)
-w() { local off=$(( (16#$1 - 16#$base)/4 )); sed -n "$((off+1))p" "$OUT/diag.sig"; }
+w() { local off=$(( (16#$1 - 16#$base)/WORD )); sed -n "$((off+1))p" "$OUT/diag.sig"; }
 echo "=== $(basename "$ELF" .elf)  [$a0] ==="
 echo "  failure_type   = $(w "$(sym failure_type)")"
 echo "  failing_instr  = $(w "$(sym failing_instruction)")"

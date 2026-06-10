@@ -161,7 +161,7 @@ module ittage_predictor
     endtask
 
     task automatic train_target(input predictor_info_t info,
-            input logic [31:0] target);
+            input logic [XLEN-1:0] target);
         if (info.provider != 2'd0) begin
             decrement_provider(info);
         end
@@ -199,7 +199,7 @@ module ittage_predictor
     task automatic allocate_entry(input int table_id,
             input logic [INDEX_BITS-1:0] index,
             input logic [TAG_BITS-1:0] entry_tag,
-            input logic [31:0] target);
+            input logic [XLEN-1:0] target);
         tage_tag[table_id][index] = entry_tag;
         tage_target[table_id][index] = target;
         tage_confidence[table_id][index] = 2'b01;

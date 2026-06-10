@@ -31,9 +31,11 @@ def run_one(elf: Path, output_root: Path, timeout: int) -> tuple[Path, bool, str
 def collect_elfs(elf_dir: Path, extensions: list[str]) -> list[Path]:
     elfs: list[Path] = []
     for ext in extensions:
-        path = elf_dir / "rv32i" / ext
-        if path.is_dir():
-            elfs.extend(sorted(path.glob("*.elf")))
+        # ACT lays tests out under an arch subdirectory (rv32i/ or rv64i/).
+        for arch in ("rv32i", "rv64i"):
+            path = elf_dir / arch / ext
+            if path.is_dir():
+                elfs.extend(sorted(path.glob("*.elf")))
     return elfs
 
 

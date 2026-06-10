@@ -41,7 +41,7 @@ module riscv_core_ooo
 
     logic [XLEN-1:0] pc_q, pc_next;
     logic [XLEN-1:0] fetch_pa;   // translated fetch address (driven in MMU section)
-    logic [1:0][31:0] fetch_pc_pipe_q, fetch_pc_pipe_next;
+    logic [1:0][XLEN-1:0] fetch_pc_pipe_q, fetch_pc_pipe_next;
     logic [1:0] fetch_valid_pipe_q, fetch_valid_pipe_next;
     // Fetch fault piped alongside fetch_pc/fetch_valid so it reaches decode
     // aligned with the PC it belongs to (computed in the MMU section).
