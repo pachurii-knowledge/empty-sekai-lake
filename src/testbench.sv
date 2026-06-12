@@ -108,6 +108,7 @@ module top;
     logic                          ifetch_inval;
     logic                          dmem_req_device, core_dcache_flush_req;
     logic                          dcache_flush_done, dcache_flush_req_ms;
+    logic                          hpm_l1i_miss, hpm_l1d_miss, hpm_l1d_wb;
 `ifdef L1D_CACHE
     // Halt flush: once the core halts, hold the L1D writeback-flush request
     // (OR'd with any fence.i request) until the memsys reports done, so the
@@ -165,6 +166,9 @@ module top;
         .dmem_req_device (dmem_req_device),
         .dcache_flush_req(core_dcache_flush_req),
         .dcache_flush_done(dcache_flush_done),
+        .hpm_l1i_miss    (hpm_l1i_miss),
+        .hpm_l1d_miss    (hpm_l1d_miss),
+        .hpm_l1d_wb      (hpm_l1d_wb),
         .halted          (halted)
     );
 
@@ -181,6 +185,9 @@ module top;
         .dmem_req_device  (dmem_req_device),
         .dcache_flush_req (dcache_flush_req_ms),
         .dcache_flush_done(dcache_flush_done),
+        .hpm_l1i_miss     (hpm_l1i_miss),
+        .hpm_l1d_miss     (hpm_l1d_miss),
+        .hpm_l1d_wb       (hpm_l1d_wb),
         .dmem_req_valid   (dmem_req_valid),
         .dmem_req_ready   (dmem_req_ready),
         .dmem_req_write   (dmem_req_write),

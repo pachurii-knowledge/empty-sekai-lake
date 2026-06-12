@@ -45,6 +45,13 @@ module priv_csr_file
     input  logic [4:0]  fp_fflags,
     output logic [2:0]  frm_value,
 
+    // Cache event pulses driving mhpmcounter3-5 (phase C3): L1I miss / L1D miss
+    // / L1D writeback. Left unconnected (-> 0) on scalar / L1=0 builds, so those
+    // counters read zero exactly as before.
+    input  logic        cache_ev_l1i_miss,
+    input  logic        cache_ev_l1d_miss,
+    input  logic        cache_ev_l1d_wb,
+
     // Hardware interrupt sources
     input  logic        irq_m_timer,
     input  logic        irq_m_software,
@@ -124,7 +131,27 @@ module priv_csr_file
     logic [MXLEN-1:0] satp_q;
     logic [MXLEN-1:0] mcounteren_q, scounteren_q;
     logic [MXLEN-1:0] mcountinhibit_q;  // CY (bit0) / IR (bit2) implemented
-    localparam logic [MXLEN-1:0] MCNTINHIBIT_MASK = MXLEN'('h0000_0005);
+    // CY (bit0), IR (bit2), and the three implemented HPM counters HPM3-5
+    // (bits 3-5) are inhibitable; everything else reads/writes zero.
+    localparam logic [MXLEN-1:0] MCNTINHIBIT_MASK = MXLEN'('h0000_003D);
+
+    // Phase-C3 cache event counters (mhpmcounter3-5 / hpmcounter3-5).
+    logic [63:0] hpm3_q, hpm4_q, hpm5_q;  // L1I miss / L1D miss / L1D writeback
+    function automatic logic [MXLEN-1:0] hpm_read(input logic [11:0] idx,
+            input logic hi);
+        logic [63:0] c;
+        unique case (idx)
+            12'd0:   c = hpm3_q;
+            12'd1:   c = hpm4_q;
+            12'd2:   c = hpm5_q;
+            default: c = 64'd0;
+        endcase
+`ifdef RV64
+        hpm_read = c[MXLEN-1:0];
+`else
+        hpm_read = hi ? c[63:32] : c[31:0];
+`endif
+    endfunction
     logic [MXLEN-1:0] menvcfg_q;
     logic        menvcfg_adue_q;        // menvcfg.ADUE (bit 61 -> menvcfgh[29])
     logic        senvcfg_fiom_q;        // senvcfg.FIOM (bit 0); other fields 0
@@ -332,17 +359,17 @@ module priv_csr_file
                 end else if ((addr >= CSR_MHPMEVENT3)   && (addr <= CSR_MHPMEVENT31))  begin
                     data = '0;                          // mhpmevent3-31   (0x323-0x33F)
                 end else if ((addr >= CSR_MHPMCOUNTER3)  && (addr <= CSR_MHPMCOUNTER31))  begin
-                    data = '0;                          // mhpmcounter3-31  (0xB03-0xB1F)
+                    data = hpm_read(addr - CSR_MHPMCOUNTER3, 1'b0);  // mhpmcounter3-31
                 end else if ((addr >= CSR_HPMCOUNTER3)   && (addr <= CSR_HPMCOUNTER31))  begin
-                    data = '0;                          // hpmcounter3-31   (0xC03-0xC1F)
+                    data = hpm_read(addr - CSR_HPMCOUNTER3, 1'b0);   // hpmcounter3-31
 `ifndef RV64
                 // The high-half counter aliases exist only on RV32.
                 end else if ((addr >= CSR_MHPMEVENT3H)  && (addr <= CSR_MHPMEVENT31H)) begin
                     data = '0;                          // mhpmevent3h-31h (0x723-0x73F)
                 end else if ((addr >= CSR_MHPMCOUNTER3H) && (addr <= CSR_MHPMCOUNTER31H)) begin
-                    data = '0;                          // mhpmcounter3h-31h(0xB83-0xB9F)
+                    data = hpm_read(addr - CSR_MHPMCOUNTER3H, 1'b1); // mhpmcounter3h-31h
                 end else if ((addr >= CSR_HPMCOUNTER3H)  && (addr <= CSR_HPMCOUNTER31H)) begin
-                    data = '0;                          // hpmcounter3h-31h (0xC83-0xC9F)
+                    data = hpm_read(addr - CSR_HPMCOUNTER3H, 1'b1);  // hpmcounter3h-31h
 `endif
                 end else begin
                     data = '0;
@@ -407,6 +434,9 @@ module priv_csr_file
             seip_sw_q   <= 1'b0;
             mcycle_q    <= 64'b0;
             minstret_q  <= 64'b0;
+            hpm3_q      <= 64'b0;
+            hpm4_q      <= 64'b0;
+            hpm5_q      <= 64'b0;
             fflags_q    <= 5'b0;
             frm_q       <= 3'b0;
             for (int i = 0; i < 4; i += 1)  pmpcfg_q[i]  <= 32'b0;
@@ -416,6 +446,10 @@ module priv_csr_file
             if (!mcountinhibit_q[0]) mcycle_q <= mcycle_q + 64'd1;
             if (retire && !mcountinhibit_q[2])
                 minstret_q <= minstret_q + 64'd1;
+            // Cache event counters HPM3-5 (phase C3), gated by mcountinhibit[3-5].
+            if (cache_ev_l1i_miss && !mcountinhibit_q[3]) hpm3_q <= hpm3_q + 64'd1;
+            if (cache_ev_l1d_miss && !mcountinhibit_q[4]) hpm4_q <= hpm4_q + 64'd1;
+            if (cache_ev_l1d_wb   && !mcountinhibit_q[5]) hpm5_q <= hpm5_q + 64'd1;
 
             // Accumulate FP flags every cycle.
             if (fp_fflags_valid) fflags_q <= fflags_q | fp_fflags;

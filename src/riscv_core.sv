@@ -50,6 +50,9 @@ module riscv_core
     output logic             dmem_req_device,
     output logic             dcache_flush_req,
     input  logic             dcache_flush_done,
+    input  logic             hpm_l1i_miss,
+    input  logic             hpm_l1d_miss,
+    input  logic             hpm_l1d_wb,
     output logic             halted
 );
 
@@ -81,6 +84,9 @@ module riscv_core
         .dmem_req_device,
         .dcache_flush_req,
         .dcache_flush_done,
+        .hpm_l1i_miss,
+        .hpm_l1d_miss,
+        .hpm_l1d_wb,
         .halted
     );
 

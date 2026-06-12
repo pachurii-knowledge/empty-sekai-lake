@@ -61,6 +61,14 @@ package NIIGO_Mem;
                         {LINE_WORD_BITS{1'b0}}};
     endfunction
 
+    // ---- AXI4 geometry (phase X1): one 64 B line == one 512 b beat ----
+    localparam int AXI_ADDR_W = 64;
+    localparam int AXI_DATA_W = LINE_BITS;       // 512
+    localparam int AXI_ID_W   = 4;
+    localparam int AXI_STRB_W = AXI_DATA_W / 8;  // 64
+    localparam logic [2:0] AXI_SIZE_LINE = 3'd6; // 2^6 = 64 bytes
+    localparam logic [1:0] AXI_BURST_INCR = 2'b01;
+
     // ---- NMI op + id encodings (plan §4) ----
     typedef enum logic [2:0] {
         NMI_RD_LINE  = 3'd0,

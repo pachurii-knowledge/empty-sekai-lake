@@ -79,6 +79,10 @@ module niigo_memsys
     // writes back all dirty lines; otherwise it completes immediately.
     input  logic                          dcache_flush_req,
     output logic                          dcache_flush_done,
+    // Cache event pulses for mhpmcounter3-5 (phase C3). Zero in the L1=0 build.
+    output logic                          hpm_l1i_miss,
+    output logic                          hpm_l1d_miss,
+    output logic                          hpm_l1d_wb,
 
     // ---- Core: data port ----
     input  logic                          dmem_req_valid,
@@ -495,8 +499,7 @@ module niigo_memsys
     assign mem_ptw_we    = 1'b0;
     assign mem_ptw_wdata = '0;
     logic unused_c2;
-    assign unused_c2 = (|mem_ptw_rdata) | mem_d_excpt |
-        l1d_ev_access | l1d_ev_miss | l1d_ev_wb;
+    assign unused_c2 = (|mem_ptw_rdata) | mem_d_excpt | l1d_ev_access;
 `endif /* L1D_CACHE */
 
 `ifdef L1_CACHES
@@ -533,6 +536,76 @@ module niigo_memsys
     logic [XLEN-1:0]               adp_wr_data;
     logic [XLEN_BYTES-1:0]         adp_wr_mask;
 
+`ifdef AXI_MEMSYS
+    // AXI=1: NMI -> AXI4-512 bridge -> (protocol monitor) -> sim AXI slave ->
+    // main_memory. The whole AXI link is internal to the memsys in sim; on the
+    // FPGA the bridge's master is exposed to the shell instead of the shim.
+    // Requires L1 (the bridge accepts line ops only).
+    logic                  ax_awvalid, ax_awready;
+    logic [AXI_ADDR_W-1:0] ax_awaddr;
+    logic [AXI_ID_W-1:0]   ax_awid;
+    logic [7:0]            ax_awlen;
+    logic [2:0]            ax_awsize;
+    logic [1:0]            ax_awburst;
+    logic                  ax_wvalid, ax_wready, ax_wlast;
+    logic [AXI_DATA_W-1:0] ax_wdata;
+    logic [AXI_STRB_W-1:0] ax_wstrb;
+    logic                  ax_bvalid, ax_bready;
+    logic [AXI_ID_W-1:0]   ax_bid;
+    logic [1:0]            ax_bresp;
+    logic                  ax_arvalid, ax_arready;
+    logic [AXI_ADDR_W-1:0] ax_araddr;
+    logic [AXI_ID_W-1:0]   ax_arid;
+    logic [7:0]            ax_arlen;
+    logic [2:0]            ax_arsize;
+    logic [1:0]            ax_arburst;
+    logic                  ax_rvalid, ax_rready, ax_rlast;
+    logic [AXI_ID_W-1:0]   ax_rid;
+    logic [AXI_DATA_W-1:0] ax_rdata;
+    logic [1:0]            ax_rresp;
+
+    nmi_axi_bridge Bridge (
+        .clk, .rst_l,
+        .nmi_req(arb_d_req), .nmi_req_ready(arb_d_ready), .nmi_resp(arb_d_resp),
+        .axi_awvalid(ax_awvalid), .axi_awready(ax_awready), .axi_awaddr(ax_awaddr),
+        .axi_awid(ax_awid), .axi_awlen(ax_awlen), .axi_awsize(ax_awsize), .axi_awburst(ax_awburst),
+        .axi_wvalid(ax_wvalid), .axi_wready(ax_wready), .axi_wdata(ax_wdata),
+        .axi_wstrb(ax_wstrb), .axi_wlast(ax_wlast),
+        .axi_bvalid(ax_bvalid), .axi_bready(ax_bready), .axi_bid(ax_bid), .axi_bresp(ax_bresp),
+        .axi_arvalid(ax_arvalid), .axi_arready(ax_arready), .axi_araddr(ax_araddr),
+        .axi_arid(ax_arid), .axi_arlen(ax_arlen), .axi_arsize(ax_arsize), .axi_arburst(ax_arburst),
+        .axi_rvalid(ax_rvalid), .axi_rready(ax_rready), .axi_rid(ax_rid),
+        .axi_rdata(ax_rdata), .axi_rresp(ax_rresp), .axi_rlast(ax_rlast)
+    );
+
+    axi_chk Chk (
+        .clk, .rst_l,
+        .axi_awvalid(ax_awvalid), .axi_awready(ax_awready), .axi_awaddr(ax_awaddr),
+        .axi_awid(ax_awid), .axi_awlen(ax_awlen), .axi_awsize(ax_awsize), .axi_awburst(ax_awburst),
+        .axi_wvalid(ax_wvalid), .axi_wready(ax_wready), .axi_wdata(ax_wdata), .axi_wlast(ax_wlast),
+        .axi_bvalid(ax_bvalid), .axi_bready(ax_bready), .axi_bid(ax_bid),
+        .axi_arvalid(ax_arvalid), .axi_arready(ax_arready), .axi_araddr(ax_araddr),
+        .axi_arid(ax_arid), .axi_arlen(ax_arlen), .axi_arsize(ax_arsize), .axi_arburst(ax_arburst),
+        .axi_rvalid(ax_rvalid), .axi_rready(ax_rready), .axi_rid(ax_rid), .axi_rlast(ax_rlast)
+    );
+
+    axi_mem_shim Shim (
+        .clk, .rst_l,
+        .axi_awvalid(ax_awvalid), .axi_awready(ax_awready), .axi_awaddr(ax_awaddr),
+        .axi_awid(ax_awid),
+        .axi_wvalid(ax_wvalid), .axi_wready(ax_wready), .axi_wdata(ax_wdata),
+        .axi_wstrb(ax_wstrb), .axi_wlast(ax_wlast),
+        .axi_bvalid(ax_bvalid), .axi_bready(ax_bready), .axi_bid(ax_bid), .axi_bresp(ax_bresp),
+        .axi_arvalid(ax_arvalid), .axi_arready(ax_arready), .axi_araddr(ax_araddr),
+        .axi_arid(ax_arid),
+        .axi_rvalid(ax_rvalid), .axi_rready(ax_rready), .axi_rid(ax_rid),
+        .axi_rdata(ax_rdata), .axi_rresp(ax_rresp), .axi_rlast(ax_rlast),
+        .mem_rd_addr(mem_i_addr), .mem_rd_data(mem_i_load_data),
+        .mem_wr_en(adp_wr_en), .mem_wr_addr(adp_wr_addr),
+        .mem_wr_data(adp_wr_data), .mem_wr_mask(adp_wr_mask)
+    );
+    logic unused_axi_excpt; assign unused_axi_excpt = mem_i_excpt;
+`else
     nmi_mem_adapter Adapter (
         .clk, .rst_l,
         .nmi_req(arb_d_req), .nmi_req_ready(arb_d_ready), .nmi_resp(arb_d_resp),
@@ -543,6 +616,7 @@ module niigo_memsys
         .mem_wr_data(adp_wr_data), .mem_wr_mask(adp_wr_mask),
         .fz_en(fz_en), .fz_seed(fz_seed), .fz_min(fz_min), .fz_max(fz_max)
     );
+`endif
 
 `ifdef L1D_CACHE
     // Line writes drive main_memory's D write port (port 1).
@@ -554,8 +628,49 @@ module niigo_memsys
     // C1: the adapter writes nothing (the D passthrough owns the D port).
     logic unused_l1i_wr;
     assign unused_l1i_wr = adp_wr_en | (|adp_wr_addr) | (|adp_wr_data) |
-        (|adp_wr_mask) | l1i_ev_access | l1i_ev_miss;
+        (|adp_wr_mask) | l1i_ev_access;
 `endif
 `endif /* L1_CACHES */
+
+    // ---- Cache event pulses for mhpmcounter3-5 (phase C3) ----
+`ifdef L1_CACHES
+    assign hpm_l1i_miss = l1i_ev_miss;
+  `ifdef L1D_CACHE
+    assign hpm_l1d_miss = l1d_ev_miss;
+    assign hpm_l1d_wb   = l1d_ev_wb;
+  `else
+    assign hpm_l1d_miss = 1'b0;
+    assign hpm_l1d_wb   = 1'b0;
+  `endif
+`else
+    assign hpm_l1i_miss = 1'b0;
+    assign hpm_l1d_miss = 1'b0;
+    assign hpm_l1d_wb   = 1'b0;
+`endif
+
+`ifdef AGENT_DEBUG
+    // End-of-sim cache statistics (counters + a final summary line).
+    logic [63:0] stat_i_acc, stat_i_miss, stat_d_acc, stat_d_miss, stat_d_wb;
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin
+            stat_i_acc <= '0; stat_i_miss <= '0;
+            stat_d_acc <= '0; stat_d_miss <= '0; stat_d_wb <= '0;
+        end else begin
+`ifdef L1_CACHES
+            if (l1i_ev_access) stat_i_acc  <= stat_i_acc  + 64'd1;
+            if (l1i_ev_miss)   stat_i_miss <= stat_i_miss + 64'd1;
+  `ifdef L1D_CACHE
+            if (l1d_ev_access) stat_d_acc  <= stat_d_acc  + 64'd1;
+            if (l1d_ev_miss)   stat_d_miss <= stat_d_miss + 64'd1;
+            if (l1d_ev_wb)     stat_d_wb   <= stat_d_wb   + 64'd1;
+  `endif
+`endif
+        end
+    end
+    final begin
+        $display("L1 STATS: L1I acc=%0d miss=%0d | L1D acc=%0d miss=%0d wb=%0d",
+            stat_i_acc, stat_i_miss, stat_d_acc, stat_d_miss, stat_d_wb);
+    end
+`endif
 
 endmodule: niigo_memsys

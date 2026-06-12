@@ -58,6 +58,10 @@ module riscv_core_ooo
     // all dirty L1D lines). Under L1=0/C1 the memsys completes it immediately.
     output logic             dcache_flush_req,
     input  logic             dcache_flush_done,
+    // Cache event pulses from the memsys for mhpmcounter3-5 (phase C3).
+    input  logic             hpm_l1i_miss,
+    input  logic             hpm_l1d_miss,
+    input  logic             hpm_l1d_wb,
 
     output logic             halted
 );
@@ -523,6 +527,9 @@ module riscv_core_ooo
         .fp_fflags_valid(csr_fp_fflags_valid),
         .fp_fflags(csr_fp_fflags),
         .frm_value(csr_frm),
+        .cache_ev_l1i_miss(hpm_l1i_miss),
+        .cache_ev_l1d_miss(hpm_l1d_miss),
+        .cache_ev_l1d_wb(hpm_l1d_wb),
         .irq_m_timer(irq_mtimer),
         .irq_m_software(irq_msoft),
         .irq_m_external(plic_m_ext),
