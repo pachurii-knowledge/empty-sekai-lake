@@ -4,8 +4,10 @@
  * Sync-read, single-write tag SRAM, shared by L1I and L1D. Holds only the
  * address tag per (set, way); valid and dirty bits live in flops inside the
  * cache so they can be flash-cleared (fence.i invalidate / halt flush) in one
- * cycle without walking the array. Read returns all WAYS tags for the index,
- * registered one cycle later (aligns with l1_data_array).
+ * cycle without walking the array. Each way is a separate single-port memory
+ * (one read addr, one write addr) so it infers RAM rather than registers on
+ * FPGA; the read returns all WAYS tags for the index, registered one cycle
+ * later (aligns with l1_data_array).
  */
 
 `default_nettype none
@@ -25,21 +27,18 @@ module l1_tag_array #(
     input  logic [TAG_BITS-1:0]        wtag
 );
 
-    logic [TAG_BITS-1:0] tags [SETS][WAYS];
-
-    always_ff @(posedge clk) begin
-        if (ren) begin
-            for (int w = 0; w < WAYS; w += 1) begin
-                rtag[w] <= tags[ridx][w];
+    genvar w;
+    generate
+        for (w = 0; w < WAYS; w += 1) begin : ways
+            logic [TAG_BITS-1:0] tags [SETS];
+            always_ff @(posedge clk) begin
+                if (ren) rtag[w] <= tags[ridx];
+            end
+            always_ff @(posedge clk) begin
+                if (wen && (wway == w[$clog2(WAYS)-1:0])) tags[widx] <= wtag;
             end
         end
-    end
-
-    always_ff @(posedge clk) begin
-        if (wen) begin
-            tags[widx][wway] <= wtag;
-        end
-    end
+    endgenerate
 
 endmodule : l1_tag_array
 
