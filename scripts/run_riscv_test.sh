@@ -19,7 +19,10 @@ fi
 
 (
   cd "$OUTPUT"
-  timeout "$TIMEOUT" "$SIM/verilator_obj/Vtop"
+  # NIIGO_VTOP_ARGS: extra plusargs forwarded to the simulator (e.g.
+  # "+mem_fuzz +mem_seed=2026" for the niigo_memsys latency fuzzer).
+  # shellcheck disable=SC2086
+  timeout "$TIMEOUT" "$SIM/verilator_obj/Vtop" ${NIIGO_VTOP_ARGS:-}
 ) > "$OUTPUT/sim.log" 2>&1 || {
   code=$?
   if [[ $code -eq 124 ]]; then

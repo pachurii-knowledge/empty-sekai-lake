@@ -1105,6 +1105,7 @@ module riscv_core_ooo
         .writeback_fp_fflags,
         .reset_mask,
         .abort_mask,
+        .commit_taken(retire_valid),
         .full(active_full),
         .empty(active_empty),
         .tail(active_tail),

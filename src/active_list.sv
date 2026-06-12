@@ -33,6 +33,16 @@ module active_list
     input  logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags,
     input  branch_mask_t          reset_mask,
     input  branch_mask_t          abort_mask,
+    // Which presented commit lanes the commit unit actually retired this
+    // cycle (a prefix of commit_valid). Only taken entries are popped; a
+    // held lane -- e.g. a store whose write the memory port cannot accept
+    // this cycle -- stays at the head and is re-presented next cycle.
+    // Without this feedback the list popped every presented entry, so a
+    // held store silently vanished from the ROB while the LSQ kept waiting
+    // for its commit_store pulse (a deadlock the N2 memory-latency fuzzer
+    // exposed; unreachable before N1 because store_port_busy could never
+    // coincide with a store at the ROB head under the fixed-latency port).
+    input  logic [OOO_WIDTH-1:0]  commit_taken,
     output logic                  full,
     output logic                  empty,
     output active_id_t            tail,
@@ -77,6 +87,8 @@ module active_list
     active_count_t count_q, count_next;
     logic [$clog2(OOO_WIDTH+1)-1:0] alloc_count;
     int commit_count;
+    active_id_t walk_id;
+    active_count_t walk_left;
 
     assign tail = tail_q;
     assign full = (count_q > ACTIVE_LIST_SIZE - OOO_WIDTH);
@@ -137,48 +149,65 @@ module active_list
             end
         end
 
+        // Present up to OOO_WIDTH completed entries (oldest first) WITHOUT
+        // popping them. The commit unit decides which prefix actually retires
+        // this cycle (commit_taken) -- e.g. a store is held while the memory
+        // port cannot accept its write -- and only that prefix is popped
+        // below; a held entry is re-presented next cycle. Presentation reads
+        // entries_next so same-cycle aborts and writeback payloads are
+        // visible, but `done` comes from the registered entry (a completion
+        // becomes eligible to retire one cycle after its writeback).
+        walk_id = head_next;
+        walk_left = count_next;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            if ((count_next != '0) && entries_next[head_next].valid &&
-                    entries_q[head_next].done) begin
+            if ((walk_left != '0) && entries_next[walk_id].valid &&
+                    entries_q[walk_id].done) begin
                 commit_valid[i] = 1'b1;
                 commit_packet[i].valid = 1'b1;
-                commit_packet[i].active_id = head_next;
-                commit_packet[i].rd = entries_next[head_next].rd;
-                commit_packet[i].prd = entries_next[head_next].prd;
-                commit_packet[i].old_prd = entries_next[head_next].old_prd;
-                commit_packet[i].has_dest = entries_next[head_next].has_dest;
-                commit_packet[i].pc = entries_next[head_next].pc;
-                commit_packet[i].instr = entries_next[head_next].instr;
-                commit_packet[i].data = entries_next[head_next].data;
-                commit_packet[i].fp_write = entries_next[head_next].fp_write;
-                commit_packet[i].fp_rd = entries_next[head_next].fp_rd;
-                commit_packet[i].fp_data = entries_next[head_next].fp_data;
-                commit_packet[i].csr_write = entries_next[head_next].csr_write;
-                commit_packet[i].csr_addr = entries_next[head_next].csr_addr;
-                commit_packet[i].csr_wdata = entries_next[head_next].csr_wdata;
+                commit_packet[i].active_id = walk_id;
+                commit_packet[i].rd = entries_next[walk_id].rd;
+                commit_packet[i].prd = entries_next[walk_id].prd;
+                commit_packet[i].old_prd = entries_next[walk_id].old_prd;
+                commit_packet[i].has_dest = entries_next[walk_id].has_dest;
+                commit_packet[i].pc = entries_next[walk_id].pc;
+                commit_packet[i].instr = entries_next[walk_id].instr;
+                commit_packet[i].data = entries_next[walk_id].data;
+                commit_packet[i].fp_write = entries_next[walk_id].fp_write;
+                commit_packet[i].fp_rd = entries_next[walk_id].fp_rd;
+                commit_packet[i].fp_data = entries_next[walk_id].fp_data;
+                commit_packet[i].csr_write = entries_next[walk_id].csr_write;
+                commit_packet[i].csr_addr = entries_next[walk_id].csr_addr;
+                commit_packet[i].csr_wdata = entries_next[walk_id].csr_wdata;
                 commit_packet[i].fp_fflags_valid =
-                    entries_next[head_next].fp_fflags_valid;
-                commit_packet[i].fp_fflags = entries_next[head_next].fp_fflags;
-                commit_packet[i].serializing = entries_next[head_next].serializing;
-                commit_packet[i].is_store = entries_next[head_next].is_store;
-                commit_packet[i].halted = entries_next[head_next].halted;
-                commit_packet[i].exception = entries_next[head_next].exception;
-                commit_packet[i].exc_cause = entries_next[head_next].exc_cause;
-                // An excepting instruction discards its result: its rd keeps the
-                // old mapping (restored from the architectural map on flush), so
-                // old_prd must NOT be freed here. Its freshly allocated prd is
-                // reclaimed by rolling the free-list head back to the committed
-                // head instead.
+                    entries_next[walk_id].fp_fflags_valid;
+                commit_packet[i].fp_fflags = entries_next[walk_id].fp_fflags;
+                commit_packet[i].serializing = entries_next[walk_id].serializing;
+                commit_packet[i].is_store = entries_next[walk_id].is_store;
+                commit_packet[i].halted = entries_next[walk_id].halted;
+                commit_packet[i].exception = entries_next[walk_id].exception;
+                commit_packet[i].exc_cause = entries_next[walk_id].exc_cause;
+                walk_id = walk_id + 1'b1;
+                walk_left -= 1'b1;
+                commit_count += 1;
+                if (commit_packet[i].halted || commit_packet[i].exception) begin
+                    break;
+                end
+            end
+        end
+
+        // Pop exactly the retired prefix. An excepting instruction discards
+        // its result: its rd keeps the old mapping (restored from the
+        // architectural map on flush), so old_prd must NOT be freed here;
+        // its freshly allocated prd is reclaimed by rolling the free-list
+        // head back to the committed head instead.
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (commit_taken[i]) begin
                 free_valid[i] = entries_next[head_next].has_dest &&
                     !entries_next[head_next].exception;
                 free_prd[i] = entries_next[head_next].old_prd;
                 entries_next[head_next] = '0;
                 head_next = head_next + 1'b1;
                 count_next -= 1'b1;
-                commit_count += 1;
-                if (commit_packet[i].halted || commit_packet[i].exception) begin
-                    break;
-                end
             end
         end
 
