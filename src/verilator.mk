@@ -76,6 +76,16 @@ ifeq ($(OOO),1)
 	VERILATOR_CFLAGS += -DOOO_4WIDE
 endif
 
+# L1=1 enables the split L1I/L1D caches in niigo_memsys (OoO build only).
+# AXI=1 routes the NMI bus through the AXI4-512 bridge + sim slave (requires L1).
+ifeq ($(L1),1)
+	VERILATOR_CFLAGS += -DL1_CACHES
+endif
+
+ifeq ($(AXI),1)
+	VERILATOR_CFLAGS += -DAXI_MEMSYS
+endif
+
 ifeq ($(AGENT_DEBUG),1)
 	VERILATOR_CFLAGS += -DAGENT_DEBUG
 endif

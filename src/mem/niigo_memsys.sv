@@ -51,12 +51,14 @@
 
 `include "riscv_isa.vh"
 `include "riscv_uarch.vh"
+`include "niigo_mem.vh"
 
 `default_nettype none
 
 module niigo_memsys
     import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
+    import NIIGO_Mem::*;
 (
     input  logic clk,
     input  logic rst_l,
@@ -68,6 +70,15 @@ module niigo_memsys
     output logic                          ifetch_resp_valid,
     output logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ifetch_resp_data,
     output logic                          ifetch_resp_excpt,
+    // fence.i / flush: flash-invalidate the L1I (ignored in the L1=0 build).
+    input  logic                          ifetch_inval,
+    // Cacheable/device split for the data port (used at L1D=1; the device hole
+    // bypasses the L1D). Ignored by the L1=0/C1 passthrough.
+    input  logic                          dmem_req_device,
+    // L1D writeback flush handshake (fence.i + halt). At L1D=1 the L1D walks and
+    // writes back all dirty lines; otherwise it completes immediately.
+    input  logic                          dcache_flush_req,
+    output logic                          dcache_flush_done,
 
     // ---- Core: data port ----
     input  logic                          dmem_req_valid,
@@ -184,13 +195,81 @@ module niigo_memsys
         drdy_stall_q = '0;
     end
 
+`ifdef L1_CACHES
     // ------------------------------------------------------------------
-    // Instruction port: combinational read at the request address in the
-    // acceptance cycle; {excpt, data} ride an in-order response queue whose
-    // entries become deliverable after a fixed (default) or randomized
+    // Instruction port (L1=1): the L1I cache serves fetches; misses refill a
+    // 64 B line over the NMI bus (arbiter -> sim adapter) from main_memory's
+    // I-read port. The data (D) and PTW ports remain passthrough below; the
+    // L1D and PTW-through-cache land in phase C2. Refill latency is fuzzed in
+    // the adapter; fetch hits accept every cycle.
+    // ------------------------------------------------------------------
+    nmi_req_t  l1i_nmi_req;
+    logic      l1i_nmi_ready;
+    nmi_resp_t l1i_nmi_resp;
+    logic      l1i_ev_access, l1i_ev_miss;
+
+    l1_icache L1I (
+        .clk, .rst_l,
+        .ifetch_req_valid, .ifetch_req_ready, .ifetch_req_addr,
+        .ifetch_resp_valid, .ifetch_resp_data, .ifetch_resp_excpt,
+        .inval_all(ifetch_inval),
+        .nmi_req(l1i_nmi_req),
+        .nmi_req_ready(l1i_nmi_ready),
+        .nmi_resp(l1i_nmi_resp),
+        .ev_access(l1i_ev_access),
+        .ev_miss(l1i_ev_miss)
+    );
+
+    // NMI arbiter: index 0 reserved for the L1D path (C2), index 1 = L1I.
+    nmi_req_t  arb_m_req  [2];
+    logic      arb_m_ready[2];
+    nmi_resp_t arb_m_resp [2];
+    nmi_req_t  arb_d_req;
+    logic      arb_d_ready;
+    nmi_resp_t arb_d_resp;
+
+    assign arb_m_req[0] = '0;          // L1D path attaches here in C2
+    assign arb_m_req[1] = l1i_nmi_req;
+    assign l1i_nmi_ready = arb_m_ready[1];
+    assign l1i_nmi_resp  = arb_m_resp[1];
+
+    nmi_arbiter #(.N_MASTERS(2)) Arb (
+        .clk, .rst_l,
+        .m_req(arb_m_req), .m_ready(arb_m_ready), .m_resp(arb_m_resp),
+        .d_req(arb_d_req), .d_ready(arb_d_ready), .d_resp(arb_d_resp)
+    );
+
+    // Sim adapter: NMI -> main_memory I-read port (reads only in C1).
+    logic                          adp_wr_en;
+    logic [MEMORY_ADDR_WIDTH-1:0]  adp_wr_addr;
+    logic [XLEN-1:0]               adp_wr_data;
+    logic [XLEN_BYTES-1:0]         adp_wr_mask;
+
+    nmi_mem_adapter Adapter (
+        .clk, .rst_l,
+        .nmi_req(arb_d_req), .nmi_req_ready(arb_d_ready), .nmi_resp(arb_d_resp),
+        .mem_rd_addr(mem_i_addr),
+        .mem_rd_data(mem_i_load_data),
+        .mem_rd_excpt(mem_i_excpt),
+        .mem_wr_en(adp_wr_en), .mem_wr_addr(adp_wr_addr),
+        .mem_wr_data(adp_wr_data), .mem_wr_mask(adp_wr_mask),
+        .fz_en(fz_en), .fz_seed(fz_seed), .fz_min(fz_min), .fz_max(fz_max)
+    );
+
+    // The adapter's write port is unused on the I side (port 0 is read-only).
+    logic unused_l1i_wr;
+    assign unused_l1i_wr = adp_wr_en | (|adp_wr_addr) | (|adp_wr_data) | (|adp_wr_mask)
+        | l1i_ev_access | l1i_ev_miss;
+`else
+    // ------------------------------------------------------------------
+    // Instruction port (L1=0): combinational read at the request address in
+    // the acceptance cycle; {excpt, data} ride an in-order response queue
+    // whose entries become deliverable after a fixed (default) or randomized
     // (fuzz) latency. At most one response delivers per cycle, preserving
     // arrival-order association in the core.
     // ------------------------------------------------------------------
+    logic unused_ifetch_inval;
+    assign unused_ifetch_inval = ifetch_inval;
     assign mem_i_addr = ifetch_req_addr;
 
     typedef struct packed {
@@ -236,6 +315,7 @@ module niigo_memsys
             i_cnt_q <= i_cnt_q + (i_push ? 3'd1 : 3'd0) - (i_pop ? 3'd1 : 3'd0);
         end
     end
+`endif /* L1_CACHES */
 
     // ------------------------------------------------------------------
     // Data port: loads sample memory in the acceptance cycle and ride the
@@ -335,5 +415,12 @@ module niigo_memsys
     assign mem_ptw_we     = ptw_req_we && ptw_req_ack;
     assign mem_ptw_wdata  = ptw_req_wdata;
     assign ptw_resp_rdata = mem_ptw_rdata;
+
+    // No L1D in this build: the writeback-flush handshake completes immediately
+    // and the cacheable/device split is unused (all D/PTW traffic is passthrough
+    // above).
+    assign dcache_flush_done = dcache_flush_req;
+    logic unused_dmem_dev;
+    assign unused_dmem_dev = dmem_req_device;
 
 endmodule: niigo_memsys

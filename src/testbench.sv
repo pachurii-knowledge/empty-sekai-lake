@@ -105,6 +105,22 @@ module top;
     logic                          ptw_mem_req, ptw_mem_we, ptw_mem_ack;
     logic [MEMORY_ADDR_WIDTH-1:0]  ptw_mem_addr_w;
     logic [XLEN-1:0]               ptw_mem_wdata, ptw_mem_rdata;
+    logic                          ifetch_inval;
+    logic                          dmem_req_device, core_dcache_flush_req;
+    logic                          dcache_flush_done, dcache_flush_req_ms;
+`ifdef L1D_CACHE
+    // Halt flush: once the core halts, hold the L1D writeback-flush request
+    // (OR'd with any fence.i request) until the memsys reports done, so the
+    // signature dumper reads a written-back main_memory.
+    logic halt_flush_q;
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) halt_flush_q <= 1'b0;
+        else if (halted) halt_flush_q <= 1'b1;
+    end
+    assign dcache_flush_req_ms = core_dcache_flush_req | halt_flush_q;
+`else
+    assign dcache_flush_req_ms = core_dcache_flush_req;
+`endif
     logic                          ms_d_load_en;
     logic [XLEN_BYTES-1:0]         ms_d_store_mask;
     logic [MEMORY_ADDR_WIDTH-1:0]  ms_d_addr, ms_i_addr, ms_ptw_addr;
@@ -145,6 +161,10 @@ module top;
         .ptw_mem_wdata   (ptw_mem_wdata),
         .ptw_mem_ack     (ptw_mem_ack),
         .ptw_mem_rdata   (ptw_mem_rdata),
+        .ifetch_inval    (ifetch_inval),
+        .dmem_req_device (dmem_req_device),
+        .dcache_flush_req(core_dcache_flush_req),
+        .dcache_flush_done(dcache_flush_done),
         .halted          (halted)
     );
 
@@ -157,6 +177,10 @@ module top;
         .ifetch_resp_valid(ifetch_resp_valid),
         .ifetch_resp_data (ifetch_resp_data),
         .ifetch_resp_excpt(ifetch_resp_excpt),
+        .ifetch_inval     (ifetch_inval),
+        .dmem_req_device  (dmem_req_device),
+        .dcache_flush_req (dcache_flush_req_ms),
+        .dcache_flush_done(dcache_flush_done),
         .dmem_req_valid   (dmem_req_valid),
         .dmem_req_ready   (dmem_req_ready),
         .dmem_req_write   (dmem_req_write),
@@ -309,10 +333,16 @@ module top;
         end
     end
 
-    // Handle terminating simulation whenever halted is asserted
+    // Handle terminating simulation whenever halted is asserted. Under L1D=1
+    // the dirty L1D lines are written back first (dcache_flush_done) so the
+    // signature dumper reads a coherent main_memory.
     always @(posedge clk) begin
         #0;  // Allow all other tasks to finish
-        if (rst_l && halted) begin
+        if (rst_l && halted
+`ifdef L1D_CACHE
+                && dcache_flush_done
+`endif
+            ) begin
             $finish;
         end
     end

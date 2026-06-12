@@ -46,6 +46,19 @@ module riscv_core_ooo
     input  logic             ptw_mem_ack,
     input  logic [XLEN-1:0]  ptw_mem_rdata,
 
+    // fence.i: flash-invalidate the L1I (consumed by niigo_memsys at L1=1;
+    // ignored by the L1=0 passthrough). Pulsed when a fence.i retires.
+    output logic             ifetch_inval,
+    // Cacheable/device split for the data port (L1D=1): high when the current
+    // dmem request targets a memory-mapped device (CLINT/PLIC/UART) and must
+    // bypass the L1D. Ignored by the L1=0/C1 passthrough.
+    output logic             dmem_req_device,
+    // L1D writeback flush handshake: the core raises dcache_flush_req on a
+    // fence.i and holds the frontend until dcache_flush_done (memsys writes back
+    // all dirty L1D lines). Under L1=0/C1 the memsys completes it immediately.
+    output logic             dcache_flush_req,
+    input  logic             dcache_flush_done,
+
     output logic             halted
 );
 
@@ -564,6 +577,39 @@ module riscv_core_ooo
     logic dmem_store_fire;
     assign dmem_store_fire = dmem_req_valid && dmem_req_write && dmem_req_ready;
 
+    // Cacheable/device split (L1D=1): a dmem request to the CLINT/PLIC/UART
+    // device hole bypasses the L1D. Byte PA = word addr << ADDR_SHIFT. Mirrors
+    // NIIGO_Mem::is_device_pa; kept inline so the core needn't import the memsys
+    // package. Harmless when the memsys ignores it (L1=0/C1).
+    logic [XLEN-1:0] dmem_req_bpa;
+    assign dmem_req_bpa = {dmem_req_addr, {ADDR_SHIFT{1'b0}}};
+    assign dmem_req_device =
+        ((dmem_req_bpa >= XLEN'('h0200_0000)) && (dmem_req_bpa < XLEN'('h0201_0000))) ||
+        ((dmem_req_bpa >= XLEN'('h0C00_0000)) && (dmem_req_bpa < XLEN'('h1000_0000))) ||
+        ((dmem_req_bpa >= XLEN'('h0D00_0000)) && (dmem_req_bpa < XLEN'('h0D00_1000)));
+
+    // fence.i L1D-writeback hold (L1D=1 only). On a fence.i retire the core
+    // defers the pc+4 redirect, raises dcache_flush_req, and holds the frontend
+    // until the memsys has written back every dirty L1D line (dcache_flush_done);
+    // only then does it invalidate the L1I and refetch -- so the modified code is
+    // in memory before the I-side refills it. On C1/L1=0 the fence.i path keeps
+    // its immediate redirect and this is inert.
+`ifdef L1D_CACHE
+    logic        fencei_pending_q, fencei_pending_next;
+    logic [XLEN-1:0] fencei_pc_q, fencei_pc_next;
+    assign dcache_flush_req = fencei_pending_q;
+`else
+    assign dcache_flush_req = 1'b0;
+`endif
+    logic fencei_block;
+`ifdef L1D_CACHE
+    assign fencei_block = fencei_pending_q;
+`else
+    assign fencei_block = 1'b0;
+`endif
+    logic unused_flush_done;
+    assign unused_flush_done = dcache_flush_done;
+
     // Minimal CLINT: snoops committed stores for mtimecmp / msip.
     clint Clint (
         .clk,
@@ -1076,7 +1122,7 @@ module riscv_core_ooo
         .free_list_available(free_count_snapshot),
         .suppress_dispatch(redirect_valid || terminal_pending_q ||
             control_pending_q || serial_pending_q || halted_q || irq_drain_q ||
-            wfi_wait_q || commit_take_trap),
+            wfi_wait_q || commit_take_trap || fencei_block),
         .dispatch_valid,
         .dispatch_stall
     );
@@ -1804,7 +1850,7 @@ module riscv_core_ooo
         // instruction still in the frozen frontend (decode is oldest, then the
         // fetch pipeline, then pc_q if the frontend is completely empty).
         if (irq_drain_q && irq_pending_now && active_empty &&
-                !commit_take_trap && !commit_take_ret) begin
+                !commit_take_trap && !commit_take_ret && !fencei_block) begin
             commit_take_int = 1'b1;
             // epc = the oldest unexecuted instruction in the frozen frontend:
             // the presented group (decode is oldest), then the second buffered
@@ -1855,6 +1901,11 @@ module riscv_core_ooo
         fetch_flush = 1'b0;
         fetch_consume = 1'b0;
         fetch_issue = 1'b0;
+        ifetch_inval = 1'b0;
+`ifdef L1D_CACHE
+        fencei_pending_next = fencei_pending_q;
+        fencei_pc_next = fencei_pc_q;
+`endif
         // Synchronous exceptions now redirect to a trap handler instead of
         // halting the core (see commit-time trap detection above). precise_halt
         // (ecall a0=10/11) remains the simulation's clean stop condition.
@@ -1979,8 +2030,23 @@ module riscv_core_ooo
                 end
                 if ((active_commit_packet[i].instr[6:0] == RISCV_ISA::OP_MISC_MEM) &&
                         (active_commit_packet[i].instr[14:12] == 3'b001)) begin
+`ifdef L1D_CACHE
+                    // Defer the redirect: first write back the L1D (the modified
+                    // code may be dirty there), then invalidate the L1I and
+                    // refetch (handled in the fence.i-hold block below).
+                    if (!fencei_pending_q) begin
+                        fencei_pending_next = 1'b1;
+                        fencei_pc_next = active_commit_packet[i].pc + 32'd4;
+                    end
+`else
                     pc_next = active_commit_packet[i].pc + 32'd4;
                     fetch_flush = 1'b1;
+                    // Flash-invalidate the L1I so the refetch past this fence.i
+                    // sees instruction memory as modified by prior stores. The
+                    // refetch is naturally >= 1 cycle later (redirect to pc+4),
+                    // by which point the 1-cycle invalidate has applied.
+                    ifetch_inval = 1'b1;
+`endif
                 end
                 // SFENCE.VMA: flush both TLBs (modeled as a full flush) and
                 // refetch the next instruction so younger fetches re-translate
@@ -2017,6 +2083,24 @@ module riscv_core_ooo
             pc_next = trap_redirect_pc;
             fetch_flush = 1'b1;
         end
+
+`ifdef L1D_CACHE
+        // fence.i L1D-writeback hold (highest priority while active; fence.i is
+        // serializing and interrupts are gated above, so nothing competes).
+        // Hold pc + keep the fetch pipe flushed until the memsys finishes
+        // writing back every dirty L1D line, then invalidate the L1I and redirect
+        // to the instruction after the fence.i.
+        if (fencei_pending_q) begin
+            fetch_flush = 1'b1;
+            if (dcache_flush_done) begin
+                pc_next = fencei_pc_q;
+                ifetch_inval = 1'b1;
+                fencei_pending_next = 1'b0;
+            end else begin
+                pc_next = pc_q;
+            end
+        end
+`endif
     end
 
     // ---- Fetch-side next-state (metadata FIFO + group buffer) ----
@@ -2114,6 +2198,10 @@ module riscv_core_ooo
             serial_pending_q <= 1'b0;
             irq_drain_q <= 1'b0;
             wfi_wait_q <= 1'b0;
+`ifdef L1D_CACHE
+            fencei_pending_q <= 1'b0;
+            fencei_pc_q <= '0;
+`endif
             abort_mask_q <= '0;
             ras_count_q <= '0;
             for (int i = 0; i < FP_REGS; i += 1) begin

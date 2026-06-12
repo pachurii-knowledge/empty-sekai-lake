@@ -46,6 +46,10 @@ module riscv_core
     output logic [XLEN-1:0]  ptw_mem_wdata,
     input  logic             ptw_mem_ack,
     input  logic [XLEN-1:0]  ptw_mem_rdata,
+    output logic             ifetch_inval,
+    output logic             dmem_req_device,
+    output logic             dcache_flush_req,
+    input  logic             dcache_flush_done,
     output logic             halted
 );
 
@@ -73,6 +77,10 @@ module riscv_core
         .ptw_mem_wdata,
         .ptw_mem_ack,
         .ptw_mem_rdata,
+        .ifetch_inval,
+        .dmem_req_device,
+        .dcache_flush_req,
+        .dcache_flush_done,
         .halted
     );
 
