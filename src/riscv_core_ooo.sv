@@ -11,20 +11,42 @@ module riscv_core_ooo
     import RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
 (
-    input  logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
-    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr, data_load,
-    input  logic [MEMORY_ADDR_WIDTH-1:0] data_load_addr,
-    input  logic             data_load_valid,
-    output logic             data_load_en, halted,
-    output logic [XLEN_BYTES-1:0]        data_store_mask,
-    output logic [MEMORY_ADDR_WIDTH-1:0] instr_addr, data_addr,
-    output logic             instr_stall, data_stall,
-    output logic [XLEN-1:0]  data_store,
-    // MMU page-table-walk port (Phase 4 will drive this; tied off for now)
-    output logic [MEMORY_ADDR_WIDTH-1:0] ptw_addr,
-    output logic             ptw_we,
-    output logic [XLEN-1:0]  ptw_wdata,
-    input  logic [XLEN-1:0]  ptw_rdata
+    input  logic             clk, rst_l,
+
+    // Instruction-fetch port: one 16-byte block per request, handshaked.
+    // Responses arrive in request order after an arbitrary >= 1 cycle
+    // latency; the core associates them with requests by arrival order.
+    output logic             ifetch_req_valid,
+    input  logic             ifetch_req_ready,
+    output logic [MEMORY_ADDR_WIDTH-1:0] ifetch_req_addr,
+    input  logic             ifetch_resp_valid,
+    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ifetch_resp_data,
+    input  logic             ifetch_resp_excpt,
+
+    // Data port: one word-granular load or store per request, handshaked.
+    // Load responses arrive in order after an arbitrary >= 1 cycle latency
+    // (the request word address is echoed for the device decode at
+    // delivery); accepted stores are fire-and-forget.
+    output logic             dmem_req_valid,
+    input  logic             dmem_req_ready,
+    output logic             dmem_req_write,
+    output logic [MEMORY_ADDR_WIDTH-1:0] dmem_req_addr,
+    output logic [XLEN-1:0]  dmem_req_wdata,
+    output logic [XLEN_BYTES-1:0]        dmem_req_wmask,
+    input  logic             dmem_resp_valid,
+    input  logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
+    input  logic [XLEN-1:0]  dmem_resp_data,
+
+    // MMU page-table-walk port: the walker's level req/ack word port (PTE
+    // reads + A/D writebacks); rdata is valid in the ack cycle.
+    output logic             ptw_mem_req,
+    output logic             ptw_mem_we,
+    output logic [MEMORY_ADDR_WIDTH-1:0] ptw_mem_addr_w,
+    output logic [XLEN-1:0]  ptw_mem_wdata,
+    input  logic             ptw_mem_ack,
+    input  logic [XLEN-1:0]  ptw_mem_rdata,
+
+    output logic             halted
 );
 
     // Byte-address -> word-address shift for the word-granular memory bus.
@@ -41,15 +63,71 @@ module riscv_core_ooo
 
     logic [XLEN-1:0] pc_q, pc_next;
     logic [XLEN-1:0] fetch_pa;   // translated fetch address (driven in MMU section)
-    logic [1:0][XLEN-1:0] fetch_pc_pipe_q, fetch_pc_pipe_next;
-    logic [1:0] fetch_valid_pipe_q, fetch_valid_pipe_next;
-    // Fetch fault piped alongside fetch_pc/fetch_valid so it reaches decode
-    // aligned with the PC it belongs to (computed in the MMU section).
+    // Fetch fault for pc_q's group, computed combinationally in the MMU
+    // section and captured into the request metadata at issue.
     logic        fetch_fault;            // combinational: any lane of pc_q faults
     logic [OOO_WIDTH-1:0] fetch_fault_lane;  // per-lane fetch fault for pc_q's group
     logic [4:0]  fetch_fault_cause;
-    logic [1:0][OOO_WIDTH-1:0] fetch_fault_lane_pipe_q, fetch_fault_lane_pipe_next;
-    logic [1:0][4:0] fetch_fault_cause_pipe_q, fetch_fault_cause_pipe_next;
+
+    // ---- Handshaked fetch frontend ----
+    // Up to FETCH_DEPTH fetch requests may be in flight or buffered at once
+    // (outstanding requests tracked by a small in-order metadata FIFO, plus a
+    // 2-entry fetched-group buffer presented to decode). Responses arrive in
+    // request order; redirect events mark every outstanding request killed
+    // (its response is dropped on arrival) and clear the group buffer, so no
+    // stale group is ever presented -- the role the old fixed-depth
+    // fetch_pc/fetch_valid pipe clears played, without assuming a fixed
+    // memory latency.
+    localparam int FETCH_DEPTH = 2;
+    typedef struct packed {
+        logic                 valid;
+        logic                 kill;
+        logic [XLEN-1:0]      pc;
+        logic [OOO_WIDTH-1:0] fault_lane;
+        logic [4:0]           fault_cause;
+    } fetch_meta_t;
+    typedef struct packed {
+        logic                 valid;
+        logic [XLEN-1:0]      pc;
+        logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] data;
+        logic                 excpt;
+        logic [OOO_WIDTH-1:0] fault_lane;
+        logic [4:0]           fault_cause;
+    } fetch_group_t;
+    fetch_meta_t  fmeta_q [FETCH_DEPTH];
+    fetch_meta_t  fmeta_next [FETCH_DEPTH];
+    logic         fmeta_rd_q, fmeta_rd_next;   // FETCH_DEPTH == 2: 1-bit ptrs
+    logic         fmeta_wr_q, fmeta_wr_next;
+    logic [1:0]   fmeta_cnt_q, fmeta_cnt_next;
+    fetch_group_t fbuf_q [2];                  // [0] = head (presented)
+    fetch_group_t fbuf_next [2];
+    logic [1:0]   fbuf_cnt_q, fbuf_cnt_next;
+    // Presented group (head of the buffer, or the arriving response bypassed
+    // when the buffer is empty).
+    logic         fgrp_valid;
+    logic [XLEN-1:0] fgrp_pc;
+    logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] fgrp_data;
+    logic         fgrp_excpt;
+    logic [OOO_WIDTH-1:0] fgrp_fault_lane;
+    logic [4:0]   fgrp_fault_cause;
+    // Control strobes computed in the main combinational block.
+    logic         fetch_flush;     // kill all outstanding + buffered fetches
+    logic         fetch_consume;   // pop the presented group
+    logic         fetch_issue;     // issue a fetch for pc_q this cycle
+    logic         fresp_take;      // a response arrives (pops metadata)
+    logic         fresp_live;      // ...and its requester was not killed
+    fetch_meta_t  fmeta_head;
+    assign fmeta_head = fmeta_q[fmeta_rd_q];
+    assign fresp_take = ifetch_resp_valid;
+    assign fresp_live = fresp_take && fmeta_head.valid && !fmeta_head.kill;
+    assign fgrp_valid       = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].valid : fresp_live;
+    assign fgrp_pc          = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].pc    : fmeta_head.pc;
+    assign fgrp_data        = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].data  : ifetch_resp_data;
+    assign fgrp_excpt       = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].excpt : ifetch_resp_excpt;
+    assign fgrp_fault_lane  = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].fault_lane
+                                                   : fmeta_head.fault_lane;
+    assign fgrp_fault_cause = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].fault_cause
+                                                   : fmeta_head.fault_cause;
     logic halted_q, halted_next;
     logic terminal_pending_q, terminal_pending_next;
     logic control_pending_q, control_pending_next;
@@ -280,7 +358,6 @@ module riscv_core_ooo
     logic [MEMORY_ADDR_WIDTH-1:0] mem_data_addr;
     logic [XLEN-1:0] mem_data_store;
     logic [XLEN_BYTES-1:0] mem_data_store_mask;
-    logic [MEMORY_ADDR_WIDTH-1:0] lsq_data_load_addr;
     logic lsq_store_second_beat;
     logic lsq_store_port_busy;
     logic commit_store;
@@ -329,14 +406,17 @@ module riscv_core_ooo
     logic [OOO_WIDTH-1:0][XLEN-1:0] arch_rs2_data;
 
     assign halted = halted_q;
-    assign data_stall = 1'b0;
-    assign instr_stall = !rst_l || halted_q || frontend_stall ||
-        dispatched_unpredicted_control;
-    // instr_addr is the translated fetch block address (fetch_pa, computed in the
-    // MMU section below; identity when paging is off). The 16-byte fetch block
-    // is {fetch_pa[..:4]} as a word address (2 zeros for RV32's 4-byte words, 1
-    // for RV64's 8-byte words).
-    assign instr_addr = {fetch_pa[XLEN-1:4], {(4-ADDR_SHIFT){1'b0}}};
+    // A fetch request fires only if no same-cycle redirect/flush retargets the
+    // PC (fetch_flush setters later in the commit logic override pc_next, so a
+    // request issued for the stale pc_q would be a dead fetch -- suppress it).
+    logic fetch_fire;
+    assign fetch_fire = fetch_issue && !fetch_flush;
+    assign ifetch_req_valid = fetch_fire;
+    // The request address is the translated fetch block address (fetch_pa,
+    // computed in the MMU section below; identity when paging is off). The
+    // 16-byte fetch block is {fetch_pa[..:4]} as a word address (2 zeros for
+    // RV32's 4-byte words, 1 for RV64's 8-byte words).
+    assign ifetch_req_addr = {fetch_pa[XLEN-1:4], {(4-ADDR_SHIFT){1'b0}}};
     assign sequential_next_pc = {pc_q[XLEN-1:4], 4'b0} + XLEN'(16);
     assign dispatch_branch_mask = current_branch_mask & ~reset_mask & ~abort_mask;
 
@@ -347,20 +427,19 @@ module riscv_core_ooo
     always_comb begin
         for (int j = 0; j < 4; j++)
 `ifdef RV64
-            decode_fetch_instr[j] = instr[j/2][ (j[0] ? 32 : 0) +: 32 ];
+            decode_fetch_instr[j] = fgrp_data[j/2][ (j[0] ? 32 : 0) +: 32 ];
 `else
-            decode_fetch_instr[j] = instr[j];
+            decode_fetch_instr[j] = fgrp_data[j];
 `endif
     end
 
     ooo_fetch_decode FetchDecode (
         .rst_l,
-        .fetch_valid(fetch_valid_pipe_q[1] && !halted_q),
-        .instr_mem_excpt,
-        .fetch_fault_lane(fetch_fault_lane_pipe_q[1] &
-            {OOO_WIDTH{fetch_valid_pipe_q[1]}}),
-        .fetch_fault_cause(fetch_fault_cause_pipe_q[1]),
-        .fetch_pc(fetch_pc_pipe_q[1]),
+        .fetch_valid(fgrp_valid && !halted_q),
+        .instr_mem_excpt(fgrp_excpt),
+        .fetch_fault_lane(fgrp_fault_lane & {OOO_WIDTH{fgrp_valid}}),
+        .fetch_fault_cause(fgrp_fault_cause),
+        .fetch_pc(fgrp_pc),
         .instr(decode_fetch_instr),
         .decode_lanes
     );
@@ -478,17 +557,24 @@ module riscv_core_ooo
         .trap_vector(tc_vector)
     );
 
+    // A store write beat is accepted by the memory subsystem this cycle. The
+    // devices snoop ACCEPTED stores only: a write beat held while the port is
+    // not ready stays presented for several cycles and must produce exactly
+    // one device side effect.
+    logic dmem_store_fire;
+    assign dmem_store_fire = dmem_req_valid && dmem_req_write && dmem_req_ready;
+
     // Minimal CLINT: snoops committed stores for mtimecmp / msip.
     clint Clint (
         .clk,
         .rst_l,
-        .store_en(data_store_mask != 4'b0),
-        .store_waddr(data_addr),
-        .store_wdata(data_store),
-        .store_mask(data_store_mask),
+        .store_en(dmem_store_fire),
+        .store_waddr(dmem_req_addr),
+        .store_wdata(dmem_req_wdata),
+        .store_mask(dmem_req_wmask),
         // Look up against the returned-load address so a CLINT hit lines up with
         // the load result the LSQ consumes (loads complete with latency).
-        .load_addr(data_load_addr),
+        .load_addr(dmem_resp_addr),
         .load_hit(clint_load_hit),
         .load_data(clint_load_data),
         .irq_m_timer(irq_mtimer),
@@ -510,12 +596,12 @@ module riscv_core_ooo
         .clk,
         .rst_l,
         .src_irq(plic_src),
-        .store_en(data_store_mask != 4'b0),
-        .store_waddr(data_addr),
-        .store_wdata(data_store),
-        .store_mask(data_store_mask),
-        .load_addr(data_load_addr),
-        .load_en(data_load_valid),
+        .store_en(dmem_store_fire),
+        .store_waddr(dmem_req_addr),
+        .store_wdata(dmem_req_wdata),
+        .store_mask(dmem_req_wmask),
+        .load_addr(dmem_resp_addr),
+        .load_en(dmem_resp_valid),
         .load_off(dev_load_off),
         .load_hit(plic_load_hit),
         .load_data(plic_load_data),
@@ -529,12 +615,12 @@ module riscv_core_ooo
     uart Uart (
         .clk,
         .rst_l,
-        .store_en(data_store_mask != 4'b0),
-        .store_waddr(data_addr),
-        .store_wdata(data_store),
-        .store_mask(data_store_mask),
-        .load_addr(data_load_addr),
-        .load_en(data_load_valid),
+        .store_en(dmem_store_fire),
+        .store_waddr(dmem_req_addr),
+        .store_wdata(dmem_req_wdata),
+        .store_mask(dmem_req_wmask),
+        .load_addr(dmem_resp_addr),
+        .load_en(dmem_resp_valid),
         .load_off(dev_load_off),
         .load_hit(uart_load_hit),
         .load_data(uart_load_data),
@@ -693,13 +779,13 @@ module riscv_core_ooo
         .mstatus_mxr(mstatus_mxr),
         .adue(csr_menvcfg_adue),
         .req_noncanonical(ptw_for_data ? data_noncanon : fetch_noncanon),
-        .mem_req(),
-        .mem_we(ptw_we),
+        .mem_req(ptw_mem_req),
+        .mem_we(ptw_mem_we),
         .mem_is_write(ptw_mem_is_write),
         .mem_addr(ptw_mem_addr),
-        .mem_wdata(ptw_wdata),
-        .mem_ack(1'b1),
-        .mem_rdata(ptw_rdata),
+        .mem_wdata(ptw_mem_wdata),
+        .mem_ack(ptw_mem_ack),
+        .mem_rdata(ptw_mem_rdata),
         .pte_pmp_fault(ptw_pte_pmp_fault),
         .busy(ptw_busy),
         .done(ptw_done),
@@ -732,7 +818,7 @@ module riscv_core_ooo
     assign ptw_ctx_data  =
         (ptw_walk_vpn  == mem_req_vaddr[RISCV_Priv::VM_VPN_W+11:12]) &&
         (ptw_walk_priv == priv_data) && (ptw_walk_satp == satp_ppn);
-    assign ptw_addr = ptw_mem_addr[XLEN-1:ADDR_SHIFT];
+    assign ptw_mem_addr_w = ptw_mem_addr[XLEN-1:ADDR_SHIFT];
 
     // PMP on the implicit PTE access. Per the priv spec these accesses are checked
     // as Supervisor (reads need R, A/D writes need W); a violation aborts the walk
@@ -832,32 +918,12 @@ module riscv_core_ooo
                            : RISCV_Priv::EXC_LOAD_PAGE_FAULT) :
             (mem_req_store ? RISCV_Priv::EXC_STORE_ACCESS
                            : RISCV_Priv::EXC_LOAD_ACCESS);
-    // The LSQ matches a returning load against its head entry by address. The
-    // memory read port has a DMEMORY_READ_DELAY-deep latency, so the value that
-    // returns this cycle belongs to the request issued that many cycles ago.
-    // The non-paging branch matches on data_addr_P, which is exactly that
-    // pipelined request address -- so a load only accepts the data for its own
-    // request. The paging branch must do the same in virtual-address space, so
-    // pipeline the request VA word by the identical latency. (Using the live
-    // mem_req_vaddr here is a bug: it always equals the current head, so the
-    // head accepts the first valid response in the pipe -- which can be a
-    // stale, still-draining response from a previous load to a different
-    // address. That silently corrupts the loaded value, e.g. a saved register
-    // restored from the kernel stack under Sv39 page churn.)
-    localparam int DMEM_RD_DELAY = RISCV_UArch::DMEMORY_READ_DELAY;
-    logic [MEMORY_ADDR_WIDTH-1:0] mem_req_vaddr_word_pipe_q [DMEM_RD_DELAY];
-    always_ff @(posedge clk or negedge rst_l) begin
-        if (!rst_l) begin
-            for (int i = 0; i < DMEM_RD_DELAY; i++)
-                mem_req_vaddr_word_pipe_q[i] <= '0;
-        end else begin
-            mem_req_vaddr_word_pipe_q[0] <= mem_req_vaddr[XLEN-1:ADDR_SHIFT];
-            for (int i = 1; i < DMEM_RD_DELAY; i++)
-                mem_req_vaddr_word_pipe_q[i] <= mem_req_vaddr_word_pipe_q[i-1];
-        end
-    end
-    assign lsq_data_load_addr = paging_data
-        ? mem_req_vaddr_word_pipe_q[DMEM_RD_DELAY-1] : data_load_addr;
+    // A returning load no longer needs address matching against the head: the
+    // LSQ allows exactly one load outstanding at the data port and tracks it
+    // (mem_inflight / mem_inflight_kill in load_store_queue.sv), so a response
+    // belongs to that single request by construction, for any memory latency.
+    // This replaces the old DMEMORY_READ_DELAY-deep VA match pipe, which baked
+    // the fixed magic-memory latency into the core.
 
     // --- Resolve the fetch physical address + stall during a fetch walk ---
     logic        fetch_from_ptw, ptw_fetch_done;
@@ -1160,15 +1226,14 @@ module riscv_core_ooo
         .reset_mask,
         .abort_mask,
         .flush(trap_take),
-        .data_load_valid,
-        // A load that hits the memory-mapped CLINT returns the CLINT register
-        // value instead of the (out-of-window) DRAM result.
+        .data_load_valid(dmem_resp_valid),
+        // A load that hits a memory-mapped device (decoded against the echoed
+        // response address) returns the device register value instead of the
+        // (out-of-window) DRAM result.
         .data_load(clint_load_hit ? clint_load_data :
                    plic_load_hit  ? plic_load_data  :
-                   uart_load_hit  ? uart_load_data  : data_load[0]),
-        // Under paging the queue matches loads on the (virtual) head address; the
-        // physical address is applied only at the memory port below.
-        .data_load_addr(lsq_data_load_addr),
+                   uart_load_hit  ? uart_load_data  : dmem_resp_data),
+        .dmem_req_ready(dmem_req_ready),
         .commit_store,
         .commit_store_id,
         .paging_data(paging_data),
@@ -1239,6 +1304,7 @@ module riscv_core_ooo
         .commit_valid(active_commit_valid),
         .commit_packet(active_commit_packet),
         .store_port_busy(lsq_store_port_busy),
+        .store_port_ready(dmem_req_ready),
         .retire_valid,
         .free_valid(commit_free_valid),
         .free_prd(commit_free_prd),
@@ -1739,10 +1805,19 @@ module riscv_core_ooo
         if (irq_drain_q && irq_pending_now && active_empty &&
                 !commit_take_trap && !commit_take_ret) begin
             commit_take_int = 1'b1;
-            commit_int_epc  = lane_valid[0]         ? decode_lanes[0].pc :
-                              fetch_valid_pipe_q[1] ? fetch_pc_pipe_q[1] :
-                              fetch_valid_pipe_q[0] ? fetch_pc_pipe_q[0] :
-                                                      pc_q;
+            // epc = the oldest unexecuted instruction in the frozen frontend:
+            // the presented group (decode is oldest), then the second buffered
+            // group, then any still-outstanding fetch (oldest-first), then
+            // pc_q if the frontend is completely empty.
+            commit_int_epc  =
+                lane_valid[0] ? decode_lanes[0].pc :
+                fgrp_valid    ? fgrp_pc :
+                (fbuf_cnt_q == 2'd2) ? fbuf_q[1].pc :
+                (fmeta_q[fmeta_rd_q].valid && !fmeta_q[fmeta_rd_q].kill) ?
+                    fmeta_q[fmeta_rd_q].pc :
+                (fmeta_q[~fmeta_rd_q].valid && !fmeta_q[~fmeta_rd_q].kill) ?
+                    fmeta_q[~fmeta_rd_q].pc :
+                pc_q;
         end
 
         // Drain FSM: enter on a pending interrupt, leave once it is taken (or it
@@ -1763,25 +1838,22 @@ module riscv_core_ooo
         if (wfi_wait_set) wfi_wait_next = 1'b1;
         if (wfi_wake || trap_take || halted_q) wfi_wait_next = 1'b0;
 
-        data_load_en = mem_data_load_en;
-        // Apply Sv32 translation at the memory port: the LSQ works in virtual
-        // addresses; the physical word address is computed by the MMU above.
-        // The second beat of a split store is the exception: the LSQ already
-        // drives the captured physical word address, so bypass the (stale,
-        // head-VA based) translation mux.
-        data_addr = (paging_data && !lsq_store_second_beat) ? data_pa[XLEN-1:ADDR_SHIFT]
-                                                            : mem_data_addr;
-        data_store = mem_data_store;
-        data_store_mask = mem_data_store_mask;
+        // Drive the data port request. Apply Sv32 translation at the memory
+        // port: the LSQ works in virtual addresses; the physical word address
+        // is computed by the MMU above. The store write beats are the
+        // exception: the LSQ already drives the captured physical word
+        // address, so bypass the (stale, head-VA based) translation mux.
+        dmem_req_valid = mem_data_load_en || (mem_data_store_mask != '0);
+        dmem_req_write = (mem_data_store_mask != '0);
+        dmem_req_addr = (paging_data && !lsq_store_second_beat) ? data_pa[XLEN-1:ADDR_SHIFT]
+                                                                : mem_data_addr;
+        dmem_req_wdata = mem_data_store;
+        dmem_req_wmask = mem_data_store_mask;
 
         pc_next = pc_q;
-        fetch_pc_pipe_next = fetch_pc_pipe_q;
-        fetch_valid_pipe_next = fetch_valid_pipe_q;
-        // The fault pipe shifts only in the sequential-fetch case below; in the
-        // flush cases it holds, but is always masked by fetch_valid_pipe at the
-        // FetchDecode input, so a held-stale fault never pairs with a valid PC.
-        fetch_fault_lane_pipe_next = fetch_fault_lane_pipe_q;
-        fetch_fault_cause_pipe_next = fetch_fault_cause_pipe_q;
+        fetch_flush = 1'b0;
+        fetch_consume = 1'b0;
+        fetch_issue = 1'b0;
         // Synchronous exceptions now redirect to a trap handler instead of
         // halting the core (see commit-time trap detection above). precise_halt
         // (ecall a0=10/11) remains the simulation's clean stop condition.
@@ -1820,37 +1892,53 @@ module riscv_core_ooo
         end
 
         if (redirect_valid) begin
+            // Branch recovery: every outstanding/buffered fetch is wrong-path.
             pc_next = redirect_pc;
-            fetch_pc_pipe_next = '0;
-            fetch_valid_pipe_next = '0;
-        end else if (!frontend_stall && !halted_q) begin
-            if (ras_redirect_valid) begin
-                pc_next = ras_redirect_pc;
-                fetch_pc_pipe_next = '0;
-                fetch_valid_pipe_next = '0;
-            end else if (predictor_redirect_valid) begin
-                pc_next = predictor_redirect_pc;
-                fetch_pc_pipe_next = '0;
-                fetch_valid_pipe_next = '0;
-            end else if (dispatched_unpredicted_control) begin
-                fetch_pc_pipe_next = '0;
-                fetch_valid_pipe_next = '0;
-            end else if (fetch_valid_pipe_q[1] && (dispatch_count < valid_count)) begin
-                pc_next = decode_lanes[2'(dispatch_count)].pc;
-                fetch_pc_pipe_next = '0;
-                fetch_valid_pipe_next = '0;
-            end else begin
+            fetch_flush = 1'b1;
+        end else begin
+            // Group consumption and dispatch-time prediction redirects. Gated
+            // on !dispatch_stall (zero lanes dispatch under a stall, so the
+            // presented group must be held and re-presented). Deliberately NOT
+            // gated on fetch_xlate_stall: consumption is an explicit event
+            // here, so a group that fully dispatches while pc_q's translation
+            // is still walking leaves the buffer and cannot dispatch twice
+            // (the old frozen-pipe scheme would re-present it).
+            if (!dispatch_stall && !halted_q) begin
+                if (ras_redirect_valid) begin
+                    pc_next = ras_redirect_pc;
+                    fetch_flush = 1'b1;
+                end else if (predictor_redirect_valid) begin
+                    pc_next = predictor_redirect_pc;
+                    fetch_flush = 1'b1;
+                end else if (dispatched_unpredicted_control) begin
+                    // Unpredicted JAL/JALR dispatched: younger fetches are
+                    // dead; pc holds until the control transfer resolves.
+                    fetch_flush = 1'b1;
+                end else if (fgrp_valid && (dispatch_count < valid_count)) begin
+                    // Partial dispatch: discard the group and refetch from the
+                    // first undispatched instruction.
+                    pc_next = decode_lanes[2'(dispatch_count)].pc;
+                    fetch_flush = 1'b1;
+                    fetch_consume = 1'b1;
+                end else if (fgrp_valid) begin
+                    // Fully dispatched (or no decodable lanes): pop it.
+                    fetch_consume = 1'b1;
+                end
+            end
+            // Fetch issue: one 16-byte block per cycle while the frontend is
+            // unstalled, translation for pc_q is resolved (fetch_xlate_stall
+            // is part of frontend_stall), and there is space for the response
+            // (outstanding requests + buffered groups bounded by FETCH_DEPTH,
+            // crediting a group consumed this very cycle -- without that
+            // credit, back-to-back streaming would stall one cycle in three).
+            // A same-cycle commit redirect (fence.i/sfence/satp/trap, applied
+            // below) suppresses the request via fetch_fire's !fetch_flush.
+            if (!frontend_stall && !halted_q && rst_l && !fetch_flush &&
+                    ifetch_req_ready &&
+                    (({1'b0, fmeta_cnt_q} + {1'b0, fbuf_cnt_q}
+                      - {2'b0, fetch_consume}) < 3'(FETCH_DEPTH))) begin
+                fetch_issue = 1'b1;
                 pc_next = sequential_next_pc;
-                fetch_pc_pipe_next[0] = pc_q;
-                fetch_pc_pipe_next[1] = fetch_pc_pipe_q[0];
-                fetch_valid_pipe_next[0] = rst_l;
-                fetch_valid_pipe_next[1] = fetch_valid_pipe_q[0];
-                // Capture the fetch fault for pc_q alongside it, shifting in
-                // lockstep with the PC/valid pipe so it stays aligned to decode.
-                fetch_fault_lane_pipe_next[0] = fetch_fault_lane;
-                fetch_fault_lane_pipe_next[1] = fetch_fault_lane_pipe_q[0];
-                fetch_fault_cause_pipe_next[0] = fetch_fault_cause;
-                fetch_fault_cause_pipe_next[1] = fetch_fault_cause_pipe_q[0];
             end
         end
 
@@ -1891,8 +1979,7 @@ module riscv_core_ooo
                 if ((active_commit_packet[i].instr[6:0] == RISCV_ISA::OP_MISC_MEM) &&
                         (active_commit_packet[i].instr[14:12] == 3'b001)) begin
                     pc_next = active_commit_packet[i].pc + 32'd4;
-                    fetch_pc_pipe_next = '0;
-                    fetch_valid_pipe_next = '0;
+                    fetch_flush = 1'b1;
                 end
                 // SFENCE.VMA: flush both TLBs (modeled as a full flush) and
                 // refetch the next instruction so younger fetches re-translate
@@ -1904,8 +1991,7 @@ module riscv_core_ooo
                         !commit_take_trap) begin
                     tlb_flush = 1'b1;
                     pc_next = active_commit_packet[i].pc + 32'd4;
-                    fetch_pc_pipe_next = '0;
-                    fetch_valid_pipe_next = '0;
+                    fetch_flush = 1'b1;
                 end
                 // A satp write switches address space; flush both TLBs and
                 // refetch pc+4 so younger fetches re-translate, without needing a
@@ -1916,8 +2002,7 @@ module riscv_core_ooo
                         !active_commit_packet[i].exception && !commit_take_trap) begin
                     tlb_flush = 1'b1;
                     pc_next = active_commit_packet[i].pc + 32'd4;
-                    fetch_pc_pipe_next = '0;
-                    fetch_valid_pipe_next = '0;
+                    fetch_flush = 1'b1;
                 end
             end
         end
@@ -1929,18 +2014,98 @@ module riscv_core_ooo
             (commit_ret_from_s ? csr_sepc : csr_mepc) : tc_vector;
         if (commit_take_trap || commit_take_int || commit_take_ret) begin
             pc_next = trap_redirect_pc;
-            fetch_pc_pipe_next = '0;
-            fetch_valid_pipe_next = '0;
+            fetch_flush = 1'b1;
         end
+    end
+
+    // ---- Fetch-side next-state (metadata FIFO + group buffer) ----
+    // Driven by the strobes computed above: a response pops its metadata and
+    // (if live) lands in the group buffer or is presented by bypass; a consume
+    // pops the presented group; an issued fetch appends metadata; a flush
+    // kills every outstanding request and empties the buffer.
+    always_comb begin
+        logic [1:0] bcnt;
+        logic       bypass_consumed;
+        fmeta_next = fmeta_q;
+        fmeta_rd_next = fmeta_rd_q;
+        fmeta_wr_next = fmeta_wr_q;
+        fmeta_cnt_next = fmeta_cnt_q;
+        fbuf_next = fbuf_q;
+        bcnt = fbuf_cnt_q;
+
+        // 1. Response arrival pops the oldest metadata entry.
+        if (fresp_take) begin
+            fmeta_next[fmeta_rd_q].valid = 1'b0;
+            fmeta_rd_next = ~fmeta_rd_q;
+            fmeta_cnt_next = fmeta_cnt_q - 2'd1;
+        end
+
+        // 2. Consume the presented group: pop the buffer head, or absorb the
+        //    bypassed response without ever buffering it.
+        bypass_consumed = 1'b0;
+        if (fetch_consume) begin
+            if (fbuf_cnt_q != 2'd0) begin
+                fbuf_next[0] = fbuf_q[1];
+                fbuf_next[1] = '0;
+                bcnt = bcnt - 2'd1;
+            end else begin
+                bypass_consumed = 1'b1;
+            end
+        end
+
+        // 3. A live, unconsumed response lands in the buffer.
+        if (fresp_live && !bypass_consumed) begin
+            fbuf_next[bcnt[0]].valid = 1'b1;
+            fbuf_next[bcnt[0]].pc = fmeta_head.pc;
+            fbuf_next[bcnt[0]].data = ifetch_resp_data;
+            fbuf_next[bcnt[0]].excpt = ifetch_resp_excpt;
+            fbuf_next[bcnt[0]].fault_lane = fmeta_head.fault_lane;
+            fbuf_next[bcnt[0]].fault_cause = fmeta_head.fault_cause;
+            bcnt = bcnt + 2'd1;
+        end
+
+        // 4. An issued fetch appends metadata (fetch_fire excludes same-cycle
+        //    flushes, so a fresh entry is never created just to be killed).
+        if (fetch_fire) begin
+            fmeta_next[fmeta_wr_q].valid = 1'b1;
+            fmeta_next[fmeta_wr_q].kill = 1'b0;
+            fmeta_next[fmeta_wr_q].pc = pc_q;
+            fmeta_next[fmeta_wr_q].fault_lane = fetch_fault_lane;
+            fmeta_next[fmeta_wr_q].fault_cause = fetch_fault_cause;
+            fmeta_wr_next = ~fmeta_wr_q;
+            fmeta_cnt_next = fmeta_cnt_next + 2'd1;
+        end
+
+        // 5. Flush: mark every still-outstanding request killed (its response
+        //    is discarded on arrival) and empty the group buffer.
+        if (fetch_flush) begin
+            for (int i = 0; i < FETCH_DEPTH; i += 1) begin
+                if (fmeta_next[i].valid) begin
+                    fmeta_next[i].kill = 1'b1;
+                end
+            end
+            for (int i = 0; i < 2; i += 1) begin
+                fbuf_next[i] = '0;
+            end
+            bcnt = 2'd0;
+        end
+
+        fbuf_cnt_next = bcnt;
     end
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             pc_q <= USER_TEXT_START;
-            fetch_pc_pipe_q <= '0;
-            fetch_valid_pipe_q <= '0;
-            fetch_fault_lane_pipe_q <= '0;
-            fetch_fault_cause_pipe_q <= '0;
+            for (int i = 0; i < FETCH_DEPTH; i += 1) begin
+                fmeta_q[i] <= '0;
+            end
+            fmeta_rd_q <= 1'b0;
+            fmeta_wr_q <= 1'b0;
+            fmeta_cnt_q <= '0;
+            for (int i = 0; i < 2; i += 1) begin
+                fbuf_q[i] <= '0;
+            end
+            fbuf_cnt_q <= '0;
             halted_q <= 1'b0;
             terminal_pending_q <= 1'b0;
             control_pending_q <= 1'b0;
@@ -1971,10 +2136,12 @@ module riscv_core_ooo
             arch_free_head_q <= '0;
         end else begin
             pc_q <= pc_next;
-            fetch_pc_pipe_q <= fetch_pc_pipe_next;
-            fetch_valid_pipe_q <= fetch_valid_pipe_next;
-            fetch_fault_lane_pipe_q <= fetch_fault_lane_pipe_next;
-            fetch_fault_cause_pipe_q <= fetch_fault_cause_pipe_next;
+            fmeta_q <= fmeta_next;
+            fmeta_rd_q <= fmeta_rd_next;
+            fmeta_wr_q <= fmeta_wr_next;
+            fmeta_cnt_q <= fmeta_cnt_next;
+            fbuf_q <= fbuf_next;
+            fbuf_cnt_q <= fbuf_cnt_next;
             halted_q <= halted_next;
             terminal_pending_q <= terminal_pending_next;
             control_pending_q <= control_pending_next;
@@ -2071,10 +2238,10 @@ module riscv_core_ooo
             if (frontend_stall || dispatched_unpredicted_control) begin
                 perf_frontend_stall_cycles = perf_frontend_stall_cycles + 64'd1;
             end
-            if (data_load_en) begin
+            if (dmem_req_valid && !dmem_req_write && dmem_req_ready) begin
                 perf_total_data_reads = perf_total_data_reads + 64'd1;
             end
-            if (data_store_mask != 4'b0) begin
+            if (dmem_req_valid && dmem_req_write && dmem_req_ready) begin
                 perf_total_data_writes = perf_total_data_writes + 64'd1;
             end
 
@@ -2253,8 +2420,8 @@ module riscv_core_ooo
                 $display("[%0d] PG pc=%h pgD=%b mrq=%b mva=%h dh=%b du=%b ptwB=%b D=%b F=%b xs=%b xf=%b dle=%b da=%h",
                     dbg_cyc, pc_q, paging_data, mem_req_valid,
                     mem_req_vaddr, dtlb_hit, dtlb_usable, ptw_busy, ptw_done,
-                    ptw_fault, lsq_xlate_stall, lsq_xlate_fault, data_load_en,
-                    data_addr);
+                    ptw_fault, lsq_xlate_stall, lsq_xlate_fault, mem_data_load_en,
+                    dmem_req_addr);
         end
     end
 `endif

@@ -22,9 +22,17 @@ module load_store_queue
     // Full pipeline flush on a precise trap / interrupt / trap-return: discard
     // every queued memory op (all are younger than the trapping instruction).
     input  logic                 flush,
+    // Data-port load response (delivered by the memory subsystem after an
+    // arbitrary >= 1 cycle latency; device reads are muxed into data_load by
+    // the core). The queue has at most one load outstanding, so a response
+    // always belongs to the single in-flight request (mem_inflight below);
+    // no address matching is needed.
     input  logic                 data_load_valid,
     input  logic [XLEN-1:0]      data_load,
-    input  logic [MEMORY_ADDR_WIDTH-1:0] data_load_addr,
+    // The memory subsystem can accept a data request (load issue or store
+    // write beat) this cycle. Registered upstream; never depends on the
+    // request being presented.
+    input  logic                 dmem_req_ready,
     input  logic                 commit_store,
     input  active_id_t           commit_store_id,
     // Sv32 data-side translation (driven by the core's MMU). When paging_data is
@@ -112,6 +120,13 @@ module load_store_queue
     logic [MEMORY_ADDR_WIDTH-1:0] double_store_addr_q, double_store_addr_next;
     logic [XLEN-1:0] double_store_data_q, double_store_data_next;
     logic [XLEN_BYTES-1:0]  double_store_mask_q, double_store_mask_next;
+    // One load may be outstanding at the memory port. mem_inflight tracks it;
+    // mem_inflight_kill marks an outstanding response whose requesting entry
+    // was squashed (branch abort / trap flush) so the response is discarded on
+    // arrival instead of being delivered to an unrelated newer head. No new
+    // load issues until the stale response drains (mem_inflight stays set).
+    logic mem_inflight_q, mem_inflight_next;
+    logic mem_inflight_kill_q, mem_inflight_kill_next;
     // High while the head store is probing its high-word translation (cross-word
     // store / FP double). Steers mem_req_vaddr up one word so the second page is
     // translated and verified before either word is written (store atomicity).
@@ -157,6 +172,16 @@ module load_store_queue
         double_store_data_next = '0;
         double_store_mask_next = '0;
         store_probe_hi_next = 1'b0;
+        mem_inflight_next = mem_inflight_q;
+        mem_inflight_kill_next = mem_inflight_kill_q;
+
+        // A delivered response frees the single outstanding-load slot whether
+        // it is consumed (match block below) or discarded as stale (killed /
+        // squashed entry -- the match conditions then simply fail).
+        if (data_load_valid) begin
+            mem_inflight_next = 1'b0;
+            mem_inflight_kill_next = 1'b0;
+        end
 
         if (double_store_pending_q) begin
             data_addr = double_store_addr_q;
@@ -165,6 +190,14 @@ module load_store_queue
             // data_addr already holds the captured physical word address; tell
             // the core port to use it directly (skip the head-VA translation).
             store_second_beat = 1'b1;
+            // Hold the (fire-and-forget) second beat until the memory port
+            // accepts it.
+            if (!dmem_req_ready) begin
+                double_store_pending_next = 1'b1;
+                double_store_addr_next = double_store_addr_q;
+                double_store_data_next = double_store_data_q;
+                double_store_mask_next = double_store_mask_q;
+            end
         end
 
         for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
@@ -199,6 +232,17 @@ module load_store_queue
                     end
                 end
             end
+        end
+
+        // The single in-flight load is always owned by the registered head
+        // entry (the head cannot advance past an issued, incomplete load). If
+        // a branch abort squashes that entry while its response is still
+        // outstanding, mark the response stale so it is discarded on arrival.
+        // (A response arriving in the same cycle already freed the slot above
+        // and fails the match conditions against the squashed entry.)
+        if (mem_inflight_q && !data_load_valid &&
+                ((entries_q[head_q].entry.branch_mask & abort_mask) != '0)) begin
+            mem_inflight_kill_next = 1'b1;
         end
 
         // Re-derive the byte-offset-dependent store fields for plain stores
@@ -336,13 +380,15 @@ module load_store_queue
 
         if (head_xlate_ok && !double_store_pending_q && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memRead &&
-                entries_next[head_next].entry.src1_ready && !entries_next[head_next].issued_load) begin
+                entries_next[head_next].entry.src1_ready && !entries_next[head_next].issued_load &&
+                !mem_inflight_q && dmem_req_ready) begin
             data_load_en = 1'b1;
             data_addr = entries_next[head_next].addr[XLEN-1:ADDR_SHIFT];
             // Capture the PA for an AMO's write-back beat (same address it read);
             // harmless for a pure load.
             entries_next[head_next].store_lo_pa = xlate_pa;
             entries_next[head_next].issued_load = 1'b1;
+            mem_inflight_next = 1'b1;
         end
 
         // Pure-store completion / cross-word probe. A single-word store marks
@@ -397,7 +443,7 @@ module load_store_queue
                 entries_next[head_next].entry.ctrl.memRead &&
                 entries_next[head_next].issued_load && data_load_valid &&
                 !entries_next[head_next].load_complete &&
-                (data_load_addr == entries_next[head_next].addr[XLEN-1:ADDR_SHIFT])) begin
+                mem_inflight_q && !mem_inflight_kill_q) begin
             load_writeback.valid = 1'b1;
             load_writeback.active_id = entries_next[head_next].entry.active_id;
             load_writeback.prd = entries_next[head_next].entry.prd;
@@ -604,9 +650,16 @@ module load_store_queue
         end
 
         // Precise-trap flush: every queued op is younger than the trapping
-        // instruction, so discard them all. Suppress any memory/writeback
-        // effects driven above this cycle. The LR reservation is committed
-        // architectural state and is intentionally preserved.
+        // instruction, so discard them all. Suppress any speculative
+        // memory/writeback effects driven above this cycle. The LR reservation
+        // is committed architectural state and is intentionally preserved.
+        //
+        // Store WRITES driven this cycle are NOT suppressed: they belong to
+        // stores that already committed (a pending/held second beat from an
+        // earlier commit, or a store retiring in the same commit group as --
+        // and architecturally older than -- the trapping instruction), so the
+        // write outputs and any scheduled/held second-beat drain state are
+        // left exactly as driven above.
         if (flush) begin
             for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
                 entries_next[i] = '0;
@@ -617,22 +670,12 @@ module load_store_queue
             data_load_en = 1'b0;
             load_writeback = '0;
             store_probe_hi_next = 1'b0;
-            // A pending second store beat belongs to an already-committed store
-            // (its first word is in memory and the high page was proven
-            // fault-free), so it must still be written this cycle even though
-            // the trap squashes everything younger. The write was already driven
-            // at the top of this block; leave those outputs intact and just let
-            // the one-shot pending flag clear.
-            if (!double_store_pending_q) begin
-                data_addr = '0;
-                data_store = '0;
-                data_store_mask = '0;
-                store_second_beat = 1'b0;
-            end
-            double_store_pending_next = 1'b0;
-            double_store_addr_next = '0;
-            double_store_data_next = '0;
-            double_store_mask_next = '0;
+            // A load issue suppressed by this flush (data_load_en cleared
+            // above) must not leave a phantom in-flight slot; a load that was
+            // already outstanding before this cycle stays outstanding and its
+            // eventual response is discarded as stale.
+            mem_inflight_next = mem_inflight_q && !data_load_valid;
+            mem_inflight_kill_next = mem_inflight_q && !data_load_valid;
         end
     end
 
@@ -784,6 +827,8 @@ module load_store_queue
             double_store_data_q <= '0;
             double_store_mask_q <= '0;
             store_probe_hi_q <= 1'b0;
+            mem_inflight_q <= 1'b0;
+            mem_inflight_kill_q <= 1'b0;
             for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
                 entries_q[i] <= '0;
             end
@@ -798,6 +843,8 @@ module load_store_queue
             double_store_data_q <= double_store_data_next;
             double_store_mask_q <= double_store_mask_next;
             store_probe_hi_q <= store_probe_hi_next;
+            mem_inflight_q <= mem_inflight_next;
+            mem_inflight_kill_q <= mem_inflight_kill_next;
             entries_q <= entries_next;
         end
     end

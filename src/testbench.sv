@@ -66,22 +66,13 @@ module top;
     // Internal variables
     int cycle_count;
 
-    // Processor and memory interface signals
-    logic clk, rst_l, instr_mem_excpt_M, instr_mem_excpt_P;
-    logic data_mem_excpt_M, data_mem_excpt_P;
-    logic data_load_en, halted;
-    logic instr_stall, data_stall;
+    // Signals shared by both core wirings (and consumed by the monitors
+    // below): the OOO arm aliases them from its handshaked interface so the
+    // HTIF / signature / PC tracking logic stays common.
+    logic clk, rst_l, halted;
     logic [XLEN_BYTES-1:0] data_store_mask;
-    logic [MEMORY_ADDR_WIDTH-1:0] instr_addr, data_addr, data_addr_P;
+    logic [MEMORY_ADDR_WIDTH-1:0] instr_addr, data_addr;
     logic [XLEN-1:0] data_store, pc;
-    logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] mem_data_load_M, mem_data_load_P;
-    logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr_M, instr_P;
-    logic data_valid_P;
-
-    // MMU page-table-walk port (core <-> memory)
-    logic [MEMORY_ADDR_WIDTH-1:0] ptw_addr;
-    logic                         ptw_we;
-    logic [XLEN-1:0]              ptw_wdata, ptw_rdata;
 
     // Handle resetting the processor when simulation begins
     initial begin
@@ -92,6 +83,146 @@ module top;
 
     // The global clock for the design
     clock #(.HALF_PERIOD(CLOCK_HALF_PERIOD)) Clock (.clk);
+
+`ifdef OOO_4WIDE
+    // ------------------------------------------------------------------
+    // OOO wiring: the core speaks the handshaked memory boundary served by
+    // niigo_memsys (passthrough configuration), which in turn drives the
+    // same main_memory model. The legacy delay buffers are subsumed by the
+    // memsys response pipes.
+    // ------------------------------------------------------------------
+    logic                          ifetch_req_valid, ifetch_req_ready;
+    logic [MEMORY_ADDR_WIDTH-1:0]  ifetch_req_addr;
+    logic                          ifetch_resp_valid, ifetch_resp_excpt;
+    logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ifetch_resp_data;
+    logic                          dmem_req_valid, dmem_req_ready, dmem_req_write;
+    logic [MEMORY_ADDR_WIDTH-1:0]  dmem_req_addr;
+    logic [XLEN-1:0]               dmem_req_wdata;
+    logic [XLEN_BYTES-1:0]         dmem_req_wmask;
+    logic                          dmem_resp_valid;
+    logic [MEMORY_ADDR_WIDTH-1:0]  dmem_resp_addr;
+    logic [XLEN-1:0]               dmem_resp_data;
+    logic                          ptw_mem_req, ptw_mem_we, ptw_mem_ack;
+    logic [MEMORY_ADDR_WIDTH-1:0]  ptw_mem_addr_w;
+    logic [XLEN-1:0]               ptw_mem_wdata, ptw_mem_rdata;
+    logic                          ms_d_load_en;
+    logic [XLEN_BYTES-1:0]         ms_d_store_mask;
+    logic [MEMORY_ADDR_WIDTH-1:0]  ms_d_addr, ms_i_addr, ms_ptw_addr;
+    logic [XLEN-1:0]               ms_d_store_data, ms_ptw_wdata, ms_ptw_rdata;
+    logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ms_d_load_data, ms_i_load_data;
+    logic                          ms_d_excpt, ms_i_excpt, ms_ptw_we;
+
+    // Monitor aliases: an accepted store write beat exactly corresponds to
+    // the legacy single-cycle store drive, so the HTIF tohost monitor keeps
+    // its one-shot semantics.
+    assign instr_addr = ifetch_req_addr;
+    assign data_addr  = dmem_req_addr;
+    assign data_store = dmem_req_wdata;
+    assign data_store_mask = (dmem_req_valid && dmem_req_write && dmem_req_ready)
+        ? dmem_req_wmask : '0;
+
+    riscv_core RISCV_Core (
+        .clk             (clk),
+        .rst_l           (rst_l),
+        .ifetch_req_valid(ifetch_req_valid),
+        .ifetch_req_ready(ifetch_req_ready),
+        .ifetch_req_addr (ifetch_req_addr),
+        .ifetch_resp_valid(ifetch_resp_valid),
+        .ifetch_resp_data(ifetch_resp_data),
+        .ifetch_resp_excpt(ifetch_resp_excpt),
+        .dmem_req_valid  (dmem_req_valid),
+        .dmem_req_ready  (dmem_req_ready),
+        .dmem_req_write  (dmem_req_write),
+        .dmem_req_addr   (dmem_req_addr),
+        .dmem_req_wdata  (dmem_req_wdata),
+        .dmem_req_wmask  (dmem_req_wmask),
+        .dmem_resp_valid (dmem_resp_valid),
+        .dmem_resp_addr  (dmem_resp_addr),
+        .dmem_resp_data  (dmem_resp_data),
+        .ptw_mem_req     (ptw_mem_req),
+        .ptw_mem_we      (ptw_mem_we),
+        .ptw_mem_addr_w  (ptw_mem_addr_w),
+        .ptw_mem_wdata   (ptw_mem_wdata),
+        .ptw_mem_ack     (ptw_mem_ack),
+        .ptw_mem_rdata   (ptw_mem_rdata),
+        .halted          (halted)
+    );
+
+    niigo_memsys MemSys (
+        .clk              (clk),
+        .rst_l            (rst_l),
+        .ifetch_req_valid (ifetch_req_valid),
+        .ifetch_req_ready (ifetch_req_ready),
+        .ifetch_req_addr  (ifetch_req_addr),
+        .ifetch_resp_valid(ifetch_resp_valid),
+        .ifetch_resp_data (ifetch_resp_data),
+        .ifetch_resp_excpt(ifetch_resp_excpt),
+        .dmem_req_valid   (dmem_req_valid),
+        .dmem_req_ready   (dmem_req_ready),
+        .dmem_req_write   (dmem_req_write),
+        .dmem_req_addr    (dmem_req_addr),
+        .dmem_req_wdata   (dmem_req_wdata),
+        .dmem_req_wmask   (dmem_req_wmask),
+        .dmem_resp_valid  (dmem_resp_valid),
+        .dmem_resp_addr   (dmem_resp_addr),
+        .dmem_resp_data   (dmem_resp_data),
+        .ptw_req_valid    (ptw_mem_req),
+        .ptw_req_we       (ptw_mem_we),
+        .ptw_req_addr     (ptw_mem_addr_w),
+        .ptw_req_wdata    (ptw_mem_wdata),
+        .ptw_req_ack      (ptw_mem_ack),
+        .ptw_resp_rdata   (ptw_mem_rdata),
+        .mem_d_load_en    (ms_d_load_en),
+        .mem_d_store_mask (ms_d_store_mask),
+        .mem_d_addr       (ms_d_addr),
+        .mem_d_store_data (ms_d_store_data),
+        .mem_d_load_data  (ms_d_load_data),
+        .mem_d_excpt      (ms_d_excpt),
+        .mem_i_addr       (ms_i_addr),
+        .mem_i_load_data  (ms_i_load_data),
+        .mem_i_excpt      (ms_i_excpt),
+        .mem_ptw_addr     (ms_ptw_addr),
+        .mem_ptw_we       (ms_ptw_we),
+        .mem_ptw_wdata    (ms_ptw_wdata),
+        .mem_ptw_rdata    (ms_ptw_rdata)
+    );
+
+    // The main memory for the processor
+    main_memory #(
+        .NUM_PORTS    (MEMORY_NUM_PORTS),
+        .LOAD_WORDS   (MEMORY_READ_WIDTH),
+        .WORD_BYTES   (XLEN_BYTES),
+        .ADDR_WIDTH   (MEMORY_ADDR_WIDTH),
+        .SEGMENT_WORDS(SEGMENT_WORDS)
+    ) Memory (
+        .clk,
+        .rst_l,
+        .load_ens   ({ms_d_load_en, 1'b1}),
+        .store_masks({ms_d_store_mask, {XLEN_BYTES{1'b0}}}),
+        .addrs      ({ms_d_addr, ms_i_addr}),
+        .store_data ({ms_d_store_data, {XLEN{1'bx}}}),
+        .mem_excpts ({ms_d_excpt, ms_i_excpt}),
+        .load_data  ({ms_d_load_data, ms_i_load_data}),
+        .ptw_addr   (ms_ptw_addr),
+        .ptw_we     (ms_ptw_we),
+        .ptw_wdata  (ms_ptw_wdata),
+        .ptw_rdata  (ms_ptw_rdata)
+    );
+
+`else /* !OOO_4WIDE: legacy fixed-latency Lab 4 wiring */
+    logic instr_mem_excpt_M, instr_mem_excpt_P;
+    logic data_mem_excpt_M, data_mem_excpt_P;
+    logic data_load_en;
+    logic instr_stall, data_stall;
+    logic [MEMORY_ADDR_WIDTH-1:0] data_addr_P;
+    logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] mem_data_load_M, mem_data_load_P;
+    logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr_M, instr_P;
+    logic data_valid_P;
+
+    // MMU page-table-walk port (core <-> memory)
+    logic [MEMORY_ADDR_WIDTH-1:0] ptw_addr;
+    logic                         ptw_we;
+    logic [XLEN-1:0]              ptw_wdata, ptw_rdata;
 
     // The Phase 1 core uses the Lab 4 memory handshake unconditionally.
     riscv_core RISCV_Core (
@@ -163,6 +294,7 @@ module top;
         .ptw_wdata  (ptw_wdata),
         .ptw_rdata  (ptw_rdata)
     );
+`endif /* OOO_4WIDE */
 
     // Keep a count of the cycles that have passed, and the current PC value.
     // instr_addr is a memory-word address (byte addr >> log2(XLEN_BYTES)), so
