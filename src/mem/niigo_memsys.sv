@@ -219,47 +219,8 @@ module niigo_memsys
         .ev_access(l1i_ev_access),
         .ev_miss(l1i_ev_miss)
     );
-
-    // NMI arbiter: index 0 reserved for the L1D path (C2), index 1 = L1I.
-    nmi_req_t  arb_m_req  [2];
-    logic      arb_m_ready[2];
-    nmi_resp_t arb_m_resp [2];
-    nmi_req_t  arb_d_req;
-    logic      arb_d_ready;
-    nmi_resp_t arb_d_resp;
-
-    assign arb_m_req[0] = '0;          // L1D path attaches here in C2
-    assign arb_m_req[1] = l1i_nmi_req;
-    assign l1i_nmi_ready = arb_m_ready[1];
-    assign l1i_nmi_resp  = arb_m_resp[1];
-
-    nmi_arbiter #(.N_MASTERS(2)) Arb (
-        .clk, .rst_l,
-        .m_req(arb_m_req), .m_ready(arb_m_ready), .m_resp(arb_m_resp),
-        .d_req(arb_d_req), .d_ready(arb_d_ready), .d_resp(arb_d_resp)
-    );
-
-    // Sim adapter: NMI -> main_memory I-read port (reads only in C1).
-    logic                          adp_wr_en;
-    logic [MEMORY_ADDR_WIDTH-1:0]  adp_wr_addr;
-    logic [XLEN-1:0]               adp_wr_data;
-    logic [XLEN_BYTES-1:0]         adp_wr_mask;
-
-    nmi_mem_adapter Adapter (
-        .clk, .rst_l,
-        .nmi_req(arb_d_req), .nmi_req_ready(arb_d_ready), .nmi_resp(arb_d_resp),
-        .mem_rd_addr(mem_i_addr),
-        .mem_rd_data(mem_i_load_data),
-        .mem_rd_excpt(mem_i_excpt),
-        .mem_wr_en(adp_wr_en), .mem_wr_addr(adp_wr_addr),
-        .mem_wr_data(adp_wr_data), .mem_wr_mask(adp_wr_mask),
-        .fz_en(fz_en), .fz_seed(fz_seed), .fz_min(fz_min), .fz_max(fz_max)
-    );
-
-    // The adapter's write port is unused on the I side (port 0 is read-only).
-    logic unused_l1i_wr;
-    assign unused_l1i_wr = adp_wr_en | (|adp_wr_addr) | (|adp_wr_data) | (|adp_wr_mask)
-        | l1i_ev_access | l1i_ev_miss;
+    // The NMI arbiter + sim adapter that the L1I (and, at L1D=1, the L1D) refill
+    // through live in the shared backend block below.
 `else
     // ------------------------------------------------------------------
     // Instruction port (L1=0): combinational read at the request address in
@@ -317,6 +278,7 @@ module niigo_memsys
     end
 `endif /* L1_CACHES */
 
+`ifndef L1D_CACHE
     // ------------------------------------------------------------------
     // Data port: loads sample memory in the acceptance cycle and ride the
     // same kind of in-order response queue (with the request word address
@@ -422,5 +384,178 @@ module niigo_memsys
     assign dcache_flush_done = dcache_flush_req;
     logic unused_dmem_dev;
     assign unused_dmem_dev = dmem_req_device;
+`endif /* !L1D_CACHE */
+
+`ifdef L1D_CACHE
+    // ==================================================================
+    // Phase C2 data side: write-back L1D + PTW-through-L1D + device bypass.
+    //
+    //   - Cacheable dmem ops (LSQ) and PTW PTE accesses are muxed (LSQ
+    //     priority) onto the single L1D requester; the L1D refills/writes back
+    //     64 B lines over the NMI bus.
+    //   - Device dmem ops (CLINT/PLIC/UART) bypass the cache: a load gets a
+    //     dummy response (the core overrides it with the device register value)
+    //     and a store is accepted (the core's devices snoop the accepted store);
+    //     neither touches main_memory.
+    //   - The L1D writeback flush (fence.i + halt) drains all dirty lines.
+    // ------------------------------------------------------------------
+
+    // ---- device-bypass response generator (1 outstanding; the LSQ serialises) ----
+    logic                          dev_pend_q;
+    logic [MEMORY_ADDR_WIDTH-1:0]  dev_addr_q;
+    logic [63:0]                   dev_due_q;
+    logic                          dev_ready, dev_load_fire, dev_resp_valid;
+    assign dev_ready     = !dev_pend_q && (!fz_en || drdy_rand);
+    assign dev_load_fire = dmem_req_valid && dmem_req_device && dev_ready && !dmem_req_write;
+    assign dev_resp_valid = dev_pend_q && (cyc_q >= dev_due_q);
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin
+            dev_pend_q <= 1'b0;
+            dev_addr_q <= '0;
+            dev_due_q  <= '0;
+        end else begin
+            if (dev_load_fire) begin
+                dev_pend_q <= 1'b1;
+                dev_addr_q <= dmem_req_addr;
+                dev_due_q  <= cyc_q + 64'(fz_en ? lcg_range(dlat_lcg, fz_min, fz_max)
+                                               : D_RESP_DELAY);
+                if (fz_en) dlat_lcg <= lcg_next(dlat_lcg);
+            end else if (dev_resp_valid) begin
+                dev_pend_q <= 1'b0;
+            end
+        end
+    end
+
+    // ---- L1D front arbiter: cacheable dmem (priority) vs PTW ----
+    logic                          l1d_req_valid, l1d_req_ready, l1d_req_write;
+    logic [MEMORY_ADDR_WIDTH-1:0]  l1d_req_waddr;
+    logic [XLEN-1:0]               l1d_req_wdata;
+    logic [XLEN_BYTES-1:0]         l1d_req_wmask;
+    logic                          l1d_resp_valid, l1d_wr_accept;
+    logic [XLEN-1:0]               l1d_resp_data;
+    logic [MEMORY_ADDR_WIDTH-1:0]  l1d_resp_addr;
+
+    logic present_dmem, present_ptw;
+    logic owner_ptw_q;        // owner of the in-flight L1D op (0 = dmem, 1 = PTW)
+    assign present_dmem = dmem_req_valid && !dmem_req_device;
+    assign present_ptw  = !present_dmem && ptw_req_valid;
+
+    assign l1d_req_valid = present_dmem || present_ptw;
+    assign l1d_req_write = present_dmem ? dmem_req_write : ptw_req_we;
+    assign l1d_req_waddr = present_dmem ? dmem_req_addr  : ptw_req_addr;
+    assign l1d_req_wdata = present_dmem ? dmem_req_wdata : ptw_req_wdata;
+    assign l1d_req_wmask = present_dmem ? dmem_req_wmask : {XLEN_BYTES{1'b1}};
+
+    logic l1d_req_fire;
+    assign l1d_req_fire = l1d_req_valid && l1d_req_ready;
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l)            owner_ptw_q <= 1'b0;
+        else if (l1d_req_fire) owner_ptw_q <= present_ptw;
+    end
+
+    nmi_req_t  l1d_nmi_req;
+    logic      l1d_nmi_ready;
+    nmi_resp_t l1d_nmi_resp;
+    logic      l1d_ev_access, l1d_ev_miss, l1d_ev_wb;
+
+    l1_dcache L1D (
+        .clk, .rst_l,
+        .req_valid(l1d_req_valid), .req_ready(l1d_req_ready),
+        .req_write(l1d_req_write), .req_waddr(l1d_req_waddr),
+        .req_wdata(l1d_req_wdata), .req_wmask(l1d_req_wmask),
+        .resp_valid(l1d_resp_valid), .resp_data(l1d_resp_data),
+        .resp_addr(l1d_resp_addr), .wr_accept(l1d_wr_accept),
+        .flush_req(dcache_flush_req), .flush_done(dcache_flush_done),
+        .nmi_req(l1d_nmi_req), .nmi_req_ready(l1d_nmi_ready), .nmi_resp(l1d_nmi_resp),
+        .ev_access(l1d_ev_access), .ev_miss(l1d_ev_miss), .ev_wb(l1d_ev_wb)
+    );
+
+    // dmem ready: gate on BOTH the device path and the L1D being free, rather
+    // than selecting on dmem_req_device. The LSQ gates its request address on
+    // dmem_req_ready, so selecting the ready by dmem_req_device (which is derived
+    // from that address) would form a combinational cycle. Requiring both free
+    // is loss-free here: the LSQ keeps one D-access outstanding, so whichever
+    // path the previous op used is already idle by the time the next op issues.
+    assign dmem_req_ready = dev_ready && l1d_req_ready;
+    // dmem response: device dummy (core overrides data) or L1D load.
+    assign dmem_resp_valid = dev_resp_valid || (l1d_resp_valid && !owner_ptw_q);
+    assign dmem_resp_addr  = dev_resp_valid ? dev_addr_q : l1d_resp_addr;
+    assign dmem_resp_data  = dev_resp_valid ? '0 : l1d_resp_data;
+
+    // PTW ack: acked when its L1D op completes -- a read on the load response,
+    // a write (A/D update) on the store-accept pulse. Both come from the L1D's
+    // registered state and the registered owner, so there is no combinational
+    // path from ack back into the walker's level-held request (which would form
+    // a cycle if the ack were derived from the live request presentation).
+    assign ptw_req_ack    = owner_ptw_q && (l1d_resp_valid || l1d_wr_accept);
+    assign ptw_resp_rdata = l1d_resp_data;
+
+    // The PTW main_memory port is retired (PTW now flows through the L1D).
+    assign mem_ptw_addr  = '0;
+    assign mem_ptw_we    = 1'b0;
+    assign mem_ptw_wdata = '0;
+    logic unused_c2;
+    assign unused_c2 = (|mem_ptw_rdata) | mem_d_excpt |
+        l1d_ev_access | l1d_ev_miss | l1d_ev_wb;
+`endif /* L1D_CACHE */
+
+`ifdef L1_CACHES
+    // ==================================================================
+    // Shared NMI backend: arbiter (L1D priority over L1I) + sim adapter onto
+    // main_memory (reads on the I port, writes on the D port).
+    // ------------------------------------------------------------------
+    nmi_req_t  arb_m_req  [2];
+    logic      arb_m_ready[2];
+    nmi_resp_t arb_m_resp [2];
+    nmi_req_t  arb_d_req;
+    logic      arb_d_ready;
+    nmi_resp_t arb_d_resp;
+
+`ifdef L1D_CACHE
+    assign arb_m_req[0]  = l1d_nmi_req;
+    assign l1d_nmi_ready = arb_m_ready[0];
+    assign l1d_nmi_resp  = arb_m_resp[0];
+`else
+    assign arb_m_req[0] = '0;          // L1D attaches here at L1D=1
+`endif
+    assign arb_m_req[1]  = l1i_nmi_req;
+    assign l1i_nmi_ready = arb_m_ready[1];
+    assign l1i_nmi_resp  = arb_m_resp[1];
+
+    nmi_arbiter #(.N_MASTERS(2)) Arb (
+        .clk, .rst_l,
+        .m_req(arb_m_req), .m_ready(arb_m_ready), .m_resp(arb_m_resp),
+        .d_req(arb_d_req), .d_ready(arb_d_ready), .d_resp(arb_d_resp)
+    );
+
+    logic                          adp_wr_en;
+    logic [MEMORY_ADDR_WIDTH-1:0]  adp_wr_addr;
+    logic [XLEN-1:0]               adp_wr_data;
+    logic [XLEN_BYTES-1:0]         adp_wr_mask;
+
+    nmi_mem_adapter Adapter (
+        .clk, .rst_l,
+        .nmi_req(arb_d_req), .nmi_req_ready(arb_d_ready), .nmi_resp(arb_d_resp),
+        .mem_rd_addr(mem_i_addr),
+        .mem_rd_data(mem_i_load_data),
+        .mem_rd_excpt(mem_i_excpt),
+        .mem_wr_en(adp_wr_en), .mem_wr_addr(adp_wr_addr),
+        .mem_wr_data(adp_wr_data), .mem_wr_mask(adp_wr_mask),
+        .fz_en(fz_en), .fz_seed(fz_seed), .fz_min(fz_min), .fz_max(fz_max)
+    );
+
+`ifdef L1D_CACHE
+    // Line writes drive main_memory's D write port (port 1).
+    assign mem_d_addr       = adp_wr_addr;
+    assign mem_d_store_mask = adp_wr_en ? adp_wr_mask : '0;
+    assign mem_d_store_data = adp_wr_data;
+    assign mem_d_load_en    = 1'b0;
+`else
+    // C1: the adapter writes nothing (the D passthrough owns the D port).
+    logic unused_l1i_wr;
+    assign unused_l1i_wr = adp_wr_en | (|adp_wr_addr) | (|adp_wr_data) |
+        (|adp_wr_mask) | l1i_ev_access | l1i_ev_miss;
+`endif
+`endif /* L1_CACHES */
 
 endmodule: niigo_memsys

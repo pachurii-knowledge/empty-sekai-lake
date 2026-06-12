@@ -2238,6 +2238,10 @@ module riscv_core_ooo
             serial_pending_q <= serial_pending_next;
             irq_drain_q <= irq_drain_next;
             wfi_wait_q <= wfi_wait_next;
+`ifdef L1D_CACHE
+            fencei_pending_q <= fencei_pending_next;
+            fencei_pc_q <= fencei_pc_next;
+`endif
             abort_mask_q <= abort_mask;
             ras_count_q <= ras_count_next;
             for (int i = 0; i < RAS_DEPTH; i += 1) begin

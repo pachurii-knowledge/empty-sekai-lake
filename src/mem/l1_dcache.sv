@@ -429,6 +429,30 @@ module l1_dcache
         end
     end
 
+`ifdef AGENT_DEBUG
+    always_ff @(posedge clk) begin
+        if (rst_l) begin
+            if ((state_q == S_IDLE) && req_fire)
+                $display("[L1D] accept %s waddr=%08h idx=%0d tag=%05h woff=%0d wmask=%0h wdata=%016h",
+                    req_write ? "ST" : "LD", req_waddr, l1_index(req_waddr),
+                    l1_tag(req_waddr), l1_word_off(req_waddr), req_wmask, req_wdata);
+            if (serve_hit)
+                $display("[L1D] HIT way=%0d %s resp=%016h", hit_way,
+                    op_write_q ? "ST" : "LD", resp_data);
+            if (serve_miss)
+                $display("[L1D] MISS idx=%0d tag=%05h victim=%0d vld=%b drt=%b",
+                    op_idx, op_tag, victim, valid_q[op_idx][victim], dirty_q[op_idx][victim]);
+            if ((state_q == S_WB_REQ) && nmi_req_ready)
+                $display("[L1D] WB   waddr=%08h line=%0128h", wb_addr_q, wb_line_q);
+            if ((state_q == S_FILL_WAIT) && nmi_resp.valid)
+                $display("[L1D] FILL line=%0128h", nmi_resp.rdata);
+            if (state_q == S_INSTALL)
+                $display("[L1D] INST way=%0d drt=%b resp=%016h line=%0128h",
+                    fill_way_q, op_write_q, resp_data, install_line);
+        end
+    end
+`endif
+
 endmodule : l1_dcache
 
 `default_nettype wire
