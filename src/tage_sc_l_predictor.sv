@@ -29,11 +29,24 @@ module tage_sc_l_predictor
     typedef logic [1:0] direction_counter_t;
     typedef logic [1:0] useful_counter_t;
 
+    // FPGA-friendly storage: each tagged bank is a SEPARATE 1D array (a 3D
+    // `[3][ENTRIES]` array + a variable bank index forces the whole table to
+    // flip-flops; per-bank 1D arrays with a single write port each infer RAM).
+    // No array-wide reset under SYNTHESIS (RAM powers up to 0, which is the reset
+    // value for tags/useful/sc; counters/base just warm up from 0 vs 2'b01 -- a
+    // self-correcting, best-effort difference). Simulation keeps the deterministic
+    // reset and is bit-identical (the read/update logic is unchanged).
     direction_counter_t base_table [ENTRIES];
-    direction_counter_t tage_counter [3][ENTRIES];
-    useful_counter_t tage_useful [3][ENTRIES];
-    logic [TAG_BITS-1:0] tage_tag [3][ENTRIES];
-    logic signed [5:0] sc_bias [SC_ENTRIES];
+    direction_counter_t tage_counter_0 [ENTRIES];
+    direction_counter_t tage_counter_1 [ENTRIES];
+    direction_counter_t tage_counter_2 [ENTRIES];
+    useful_counter_t    tage_useful_0  [ENTRIES];
+    useful_counter_t    tage_useful_1  [ENTRIES];
+    useful_counter_t    tage_useful_2  [ENTRIES];
+    logic [TAG_BITS-1:0] tage_tag_0 [ENTRIES];
+    logic [TAG_BITS-1:0] tage_tag_1 [ENTRIES];
+    logic [TAG_BITS-1:0] tage_tag_2 [ENTRIES];
+    logic signed [5:0]   sc_bias [SC_ENTRIES];
 
     logic [INDEX_BITS-1:0] base_index;
     logic [INDEX_BITS-1:0] idx [3];
@@ -47,6 +60,27 @@ module tage_sc_l_predictor
     logic signed [5:0] sc_threshold;
     logic sc_taken;
     logic sc_override;
+
+    // Saturating counter updates as pure functions (RAM-friendly: a function
+    // returns the next value for a non-blocking write, unlike an inout task).
+    function automatic direction_counter_t cnt_upd(input direction_counter_t c,
+            input logic taken);
+        if (taken && (c != 2'b11))       cnt_upd = c + 2'b01;
+        else if (!taken && (c != 2'b00)) cnt_upd = c - 2'b01;
+        else                             cnt_upd = c;
+    endfunction
+    function automatic useful_counter_t use_upd(input useful_counter_t u,
+            input logic correct);
+        if (correct && (u != 2'b11))       use_upd = u + 2'b01;
+        else if (!correct && (u != 2'b00)) use_upd = u - 2'b01;
+        else                               use_upd = u;
+    endfunction
+    function automatic logic signed [5:0] sc_upd(input logic signed [5:0] b,
+            input logic taken);
+        if (taken && (b != 6'sd31))        sc_upd = b + 6'sd1;
+        else if (!taken && (b != -6'sd32)) sc_upd = b - 6'sd1;
+        else                               sc_upd = b;
+    endfunction
 
     always_comb begin
         base_index = lookup_pc[INDEX_BITS+1:2];
@@ -71,20 +105,20 @@ module tage_sc_l_predictor
             lookup_pc[2*TAG_BITS+1:TAG_BITS+2] ^
             history[3*TAG_BITS-1:2*TAG_BITS];
 
+        // Per-bank reads (constant bank index -> RAM read port).
         pred[0] = base_table[base_index][1];
-        for (int i = 0; i < 3; i += 1) begin
-            hit[i] = tage_tag[i][idx[i]] == tag[i];
-            pred[i + 1] = tage_counter[i][idx[i]][1];
-        end
+        hit[0] = tage_tag_0[idx[0]] == tag[0];  pred[1] = tage_counter_0[idx[0]][1];
+        hit[1] = tage_tag_1[idx[1]] == tag[1];  pred[2] = tage_counter_1[idx[1]][1];
+        hit[2] = tage_tag_2[idx[2]] == tag[2];  pred[3] = tage_counter_2[idx[2]][1];
 
         provider = 2'd0;
-        if (hit[0] && tage_useful[0][idx[0]] != 2'b00) begin
+        if (hit[0] && tage_useful_0[idx[0]] != 2'b00) begin
             provider = 2'd1;
         end
-        if (hit[1] && tage_useful[1][idx[1]] != 2'b00) begin
+        if (hit[1] && tage_useful_1[idx[1]] != 2'b00) begin
             provider = 2'd2;
         end
-        if (hit[2] && tage_useful[2][idx[2]] != 2'b00) begin
+        if (hit[2] && tage_useful_2[idx[2]] != 2'b00) begin
             provider = 2'd3;
         end
 
@@ -123,97 +157,86 @@ module tage_sc_l_predictor
         prediction_info.sc_history = 10'(history[SC_INDEX_BITS-1:0]);
     end
 
-    always_ff @(posedge clk or negedge rst_l) begin
+    // SC update index (combinational, used by the write below).
+    logic [SC_INDEX_BITS-1:0] sc_wr_index;
+    assign sc_wr_index = update_pc[SC_INDEX_BITS+1:2] ^
+                         update_info.sc_history[SC_INDEX_BITS-1:0];
+    logic upd_correct;
+    assign upd_correct = (update_info.predicted_taken == update_taken);
+    logic do_alloc;
+    assign do_alloc = update_valid && update_info.valid &&
+                      (update_info.predicted_taken != update_taken);
+
+    always_ff @(posedge clk
+`ifndef SYNTHESIS
+            or negedge rst_l
+`endif
+        ) begin
+`ifndef SYNTHESIS
         if (!rst_l) begin
             for (int i = 0; i < ENTRIES; i += 1) begin
                 base_table[i] <= 2'b01;
-                for (int t = 0; t < 3; t += 1) begin
-                    tage_counter[t][i] <= 2'b01;
-                    tage_useful[t][i] <= 2'b00;
-                    tage_tag[t][i] <= '0;
-                end
+                tage_counter_0[i] <= 2'b01; tage_counter_1[i] <= 2'b01; tage_counter_2[i] <= 2'b01;
+                tage_useful_0[i] <= 2'b00;  tage_useful_1[i] <= 2'b00;  tage_useful_2[i] <= 2'b00;
+                tage_tag_0[i] <= '0;        tage_tag_1[i] <= '0;        tage_tag_2[i] <= '0;
             end
             for (int i = 0; i < SC_ENTRIES; i += 1) begin
                 sc_bias[i] <= '0;
             end
-        end else if (update_valid && update_info.valid) begin
-            if (update_info.provider == 2'd0) begin
-                update_counter(base_table[update_info.base_index], update_taken);
+        end else
+`endif
+        if (update_valid && update_info.valid) begin
+            // Counter/useful update of the provider bank (each bank's element is
+            // written here XOR by allocate below -- allocate always targets a bank
+            // strictly longer than the provider -- so each array keeps one write
+            // port at one address). base = provider 0.
+            if (update_info.provider == 2'd0)
+                base_table[update_info.base_index] <=
+                    cnt_upd(base_table[update_info.base_index], update_taken);
+            if (update_info.provider == 2'd1) begin
+                tage_counter_0[update_info.index0] <=
+                    cnt_upd(tage_counter_0[update_info.index0], update_taken);
+                tage_useful_0[update_info.index0] <=
+                    use_upd(tage_useful_0[update_info.index0], upd_correct);
             end
-            unique case (update_info.provider)
-                2'd3: begin
-                    update_counter(tage_counter[2][update_info.index2], update_taken);
-                    update_useful(tage_useful[2][update_info.index2],
-                        update_info.predicted_taken == update_taken);
-                end
-                2'd2: begin
-                    update_counter(tage_counter[1][update_info.index1], update_taken);
-                    update_useful(tage_useful[1][update_info.index1],
-                        update_info.predicted_taken == update_taken);
-                end
-                2'd1: begin
-                    update_counter(tage_counter[0][update_info.index0], update_taken);
-                    update_useful(tage_useful[0][update_info.index0],
-                        update_info.predicted_taken == update_taken);
-                end
-                default: begin
-                end
-            endcase
+            if (update_info.provider == 2'd2) begin
+                tage_counter_1[update_info.index1] <=
+                    cnt_upd(tage_counter_1[update_info.index1], update_taken);
+                tage_useful_1[update_info.index1] <=
+                    use_upd(tage_useful_1[update_info.index1], upd_correct);
+            end
+            if (update_info.provider == 2'd3) begin
+                tage_counter_2[update_info.index2] <=
+                    cnt_upd(tage_counter_2[update_info.index2], update_taken);
+                tage_useful_2[update_info.index2] <=
+                    use_upd(tage_useful_2[update_info.index2], upd_correct);
+            end
 
-            if (update_info.predicted_taken != update_taken) begin
-                allocate_entry(update_info, update_taken);
+            // Allocate a new entry on a misprediction, in the first free (useful==0)
+            // bank strictly longer than the provider.
+            if (do_alloc) begin
+                if (update_info.provider < 2'd1 &&
+                        tage_useful_0[update_info.index0] == 2'b00) begin
+                    tage_tag_0[update_info.index0]     <= update_info.tag0;
+                    tage_counter_0[update_info.index0] <= update_taken ? 2'b10 : 2'b01;
+                    tage_useful_0[update_info.index0]  <= 2'b01;
+                end else if (update_info.provider < 2'd2 &&
+                        tage_useful_1[update_info.index1] == 2'b00) begin
+                    tage_tag_1[update_info.index1]     <= update_info.tag1;
+                    tage_counter_1[update_info.index1] <= update_taken ? 2'b10 : 2'b01;
+                    tage_useful_1[update_info.index1]  <= 2'b01;
+                end else if (update_info.provider < 2'd3 &&
+                        tage_useful_2[update_info.index2] == 2'b00) begin
+                    tage_tag_2[update_info.index2]     <= update_info.tag2;
+                    tage_counter_2[update_info.index2] <= update_taken ? 2'b10 : 2'b01;
+                    tage_useful_2[update_info.index2]  <= 2'b01;
+                end
             end
-            update_sc(update_pc, update_info.sc_history[SC_INDEX_BITS-1:0],
-                update_taken);
+
+            sc_bias[sc_wr_index] <= sc_upd(sc_bias[sc_wr_index], update_taken);
         end
     end
 
-    task automatic update_counter(inout direction_counter_t counter,
-            input logic taken);
-        if (taken && (counter != 2'b11)) begin
-            counter = counter + 2'b01;
-        end else if (!taken && (counter != 2'b00)) begin
-            counter = counter - 2'b01;
-        end
-    endtask
-
-    task automatic update_useful(inout useful_counter_t useful,
-            input logic correct);
-        if (correct && (useful != 2'b11)) begin
-            useful = useful + 2'b01;
-        end else if (!correct && (useful != 2'b00)) begin
-            useful = useful - 2'b01;
-        end
-    endtask
-
-    task automatic allocate_entry(input predictor_info_t info,
-            input logic taken);
-        if (info.provider < 2'd1 && tage_useful[0][info.index0] == 2'b00) begin
-            tage_tag[0][info.index0] = info.tag0;
-            tage_counter[0][info.index0] = taken ? 2'b10 : 2'b01;
-            tage_useful[0][info.index0] = 2'b01;
-        end else if (info.provider < 2'd2 &&
-                tage_useful[1][info.index1] == 2'b00) begin
-            tage_tag[1][info.index1] = info.tag1;
-            tage_counter[1][info.index1] = taken ? 2'b10 : 2'b01;
-            tage_useful[1][info.index1] = 2'b01;
-        end else if (info.provider < 2'd3 &&
-                tage_useful[2][info.index2] == 2'b00) begin
-            tage_tag[2][info.index2] = info.tag2;
-            tage_counter[2][info.index2] = taken ? 2'b10 : 2'b01;
-            tage_useful[2][info.index2] = 2'b01;
-        end
-    endtask
-
-    task automatic update_sc(input logic [31:0] pc,
-            input logic [SC_INDEX_BITS-1:0] sc_hist, input logic taken);
-        logic [SC_INDEX_BITS-1:0] update_index;
-        update_index = pc[SC_INDEX_BITS+1:2] ^ sc_hist;
-        if (taken && (sc_bias[update_index] != 6'sd31)) begin
-            sc_bias[update_index] = sc_bias[update_index] + 6'sd1;
-        end else if (!taken && (sc_bias[update_index] != -6'sd32)) begin
-            sc_bias[update_index] = sc_bias[update_index] - 6'sd1;
-        end
-    endtask
-
 endmodule: tage_sc_l_predictor
+
+`default_nettype wire

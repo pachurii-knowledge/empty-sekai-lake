@@ -26,19 +26,41 @@ module ittage_predictor
     typedef logic [1:0] confidence_counter_t;
     typedef logic [1:0] useful_counter_t;
 
+    // Per-bank 1D arrays (see tage_sc_l_predictor) so the tables infer RAM rather
+    // than flip-flops; no array-wide reset under SYNTHESIS (RAM powers up to 0 =
+    // the reset value). history_q is written in the update branch, so it also
+    // powers up to 0. Simulation keeps the deterministic reset (bit-identical).
     logic [HISTORY_BITS-1:0] history_q;
     logic [XLEN-1:0] base_target [ENTRIES];
-    logic base_valid [ENTRIES];
-    logic [XLEN-1:0] tage_target [3][ENTRIES];
-    confidence_counter_t tage_confidence [3][ENTRIES];
-    useful_counter_t tage_useful [3][ENTRIES];
-    logic [TAG_BITS-1:0] tage_tag [3][ENTRIES];
+    logic            base_valid  [ENTRIES];
+    logic [XLEN-1:0] tage_target_0 [ENTRIES];
+    logic [XLEN-1:0] tage_target_1 [ENTRIES];
+    logic [XLEN-1:0] tage_target_2 [ENTRIES];
+    confidence_counter_t tage_confidence_0 [ENTRIES];
+    confidence_counter_t tage_confidence_1 [ENTRIES];
+    confidence_counter_t tage_confidence_2 [ENTRIES];
+    useful_counter_t tage_useful_0 [ENTRIES];
+    useful_counter_t tage_useful_1 [ENTRIES];
+    useful_counter_t tage_useful_2 [ENTRIES];
+    logic [TAG_BITS-1:0] tage_tag_0 [ENTRIES];
+    logic [TAG_BITS-1:0] tage_tag_1 [ENTRIES];
+    logic [TAG_BITS-1:0] tage_tag_2 [ENTRIES];
 
     logic [INDEX_BITS-1:0] base_index;
     logic [INDEX_BITS-1:0] idx [3];
     logic [TAG_BITS-1:0] tag [3];
     logic hit [3];
     logic [1:0] provider;
+
+    function automatic confidence_counter_t conf_inc(input confidence_counter_t c);
+        conf_inc = (c != 2'b11) ? (c + 2'b01) : c;
+    endfunction
+    function automatic confidence_counter_t conf_dec(input confidence_counter_t c);
+        conf_dec = (c != 2'b00) ? (c - 2'b01) : c;
+    endfunction
+    function automatic useful_counter_t use_inc(input useful_counter_t u);
+        use_inc = (u != 2'b11) ? (u + 2'b01) : u;
+    endfunction
 
     always_comb begin
         base_index = lookup_pc[INDEX_BITS+1:2];
@@ -55,10 +77,9 @@ module ittage_predictor
             history_q[TAG_BITS-1:0] ^ history_q[2*TAG_BITS-1:TAG_BITS] ^
             history_q[3*TAG_BITS-1:2*TAG_BITS];
 
-        for (int i = 0; i < 3; i += 1) begin
-            hit[i] = (tage_tag[i][idx[i]] == tag[i]) &&
-                (tage_confidence[i][idx[i]] != 2'b00);
-        end
+        hit[0] = (tage_tag_0[idx[0]] == tag[0]) && (tage_confidence_0[idx[0]] != 2'b00);
+        hit[1] = (tage_tag_1[idx[1]] == tag[1]) && (tage_confidence_1[idx[1]] != 2'b00);
+        hit[2] = (tage_tag_2[idx[2]] == tag[2]) && (tage_confidence_2[idx[2]] != 2'b00);
 
         provider = 2'd0;
         if (hit[0]) begin
@@ -74,9 +95,9 @@ module ittage_predictor
         prediction_valid = lookup_valid &&
             ((provider != 2'd0) || base_valid[base_index]);
         unique case (provider)
-            2'd3: prediction_target = tage_target[2][idx[2]];
-            2'd2: prediction_target = tage_target[1][idx[1]];
-            2'd1: prediction_target = tage_target[0][idx[0]];
+            2'd3: prediction_target = tage_target_2[idx[2]];
+            2'd2: prediction_target = tage_target_1[idx[1]];
+            2'd1: prediction_target = tage_target_0[idx[0]];
             default: prediction_target = base_target[base_index];
         endcase
 
@@ -95,115 +116,91 @@ module ittage_predictor
         prediction_info.tag2 = tag[2];
     end
 
-    always_ff @(posedge clk or negedge rst_l) begin
+    // Update was "correct" (provider's target matched) -> increment; else train
+    // (decrement the provider, allocate a longer bank).
+    logic tgt_match;
+    assign tgt_match = update_info.predicted_target_valid &&
+                       (update_info.predicted_target == update_target);
+
+    always_ff @(posedge clk
+`ifndef SYNTHESIS
+            or negedge rst_l
+`endif
+        ) begin
+`ifndef SYNTHESIS
         if (!rst_l) begin
             history_q <= '0;
             for (int i = 0; i < ENTRIES; i += 1) begin
-                base_target[i] <= '0;
-                base_valid[i] <= 1'b0;
-                for (int t = 0; t < 3; t += 1) begin
-                    tage_target[t][i] <= '0;
-                    tage_confidence[t][i] <= 2'b00;
-                    tage_useful[t][i] <= 2'b00;
-                    tage_tag[t][i] <= '0;
+                base_target[i] <= '0; base_valid[i] <= 1'b0;
+                tage_target_0[i] <= '0; tage_target_1[i] <= '0; tage_target_2[i] <= '0;
+                tage_confidence_0[i] <= 2'b00; tage_confidence_1[i] <= 2'b00; tage_confidence_2[i] <= 2'b00;
+                tage_useful_0[i] <= 2'b00; tage_useful_1[i] <= 2'b00; tage_useful_2[i] <= 2'b00;
+                tage_tag_0[i] <= '0; tage_tag_1[i] <= '0; tage_tag_2[i] <= '0;
+            end
+        end else
+`endif
+        if (update_valid && update_info.valid) begin
+            base_target[update_info.base_index] <= update_target;
+            base_valid[update_info.base_index]  <= 1'b1;
+
+            // Provider-bank confidence/useful: increment on a target match, else
+            // decrement the confidence (the train path). Each bank's element is
+            // written here XOR by allocate below (allocate targets a bank strictly
+            // longer than the provider) -> one write port per array at one index.
+            if (update_info.provider == 2'd1) begin
+                if (tgt_match) begin
+                    tage_confidence_0[update_info.index0] <= conf_inc(tage_confidence_0[update_info.index0]);
+                    tage_useful_0[update_info.index0]     <= use_inc(tage_useful_0[update_info.index0]);
+                end else begin
+                    tage_confidence_0[update_info.index0] <= conf_dec(tage_confidence_0[update_info.index0]);
                 end
             end
-        end else if (update_valid && update_info.valid) begin
-            base_target[update_info.base_index] <= update_target;
-            base_valid[update_info.base_index] <= 1'b1;
-
-            if (update_info.predicted_target_valid &&
-                    (update_info.predicted_target == update_target)) begin
-                increment_provider(update_info);
-            end else begin
-                train_target(update_info, update_target);
+            if (update_info.provider == 2'd2) begin
+                if (tgt_match) begin
+                    tage_confidence_1[update_info.index1] <= conf_inc(tage_confidence_1[update_info.index1]);
+                    tage_useful_1[update_info.index1]     <= use_inc(tage_useful_1[update_info.index1]);
+                end else begin
+                    tage_confidence_1[update_info.index1] <= conf_dec(tage_confidence_1[update_info.index1]);
+                end
             end
+            if (update_info.provider == 2'd3) begin
+                if (tgt_match) begin
+                    tage_confidence_2[update_info.index2] <= conf_inc(tage_confidence_2[update_info.index2]);
+                    tage_useful_2[update_info.index2]     <= use_inc(tage_useful_2[update_info.index2]);
+                end else begin
+                    tage_confidence_2[update_info.index2] <= conf_dec(tage_confidence_2[update_info.index2]);
+                end
+            end
+
+            // Train (mispredicted target): allocate in the first free (useful==0)
+            // bank strictly longer than the provider.
+            if (!tgt_match) begin
+                if (update_info.provider < 2'd1 &&
+                        tage_useful_0[update_info.index0] == 2'b00) begin
+                    tage_tag_0[update_info.index0]        <= update_info.tag0;
+                    tage_target_0[update_info.index0]     <= update_target;
+                    tage_confidence_0[update_info.index0] <= 2'b01;
+                    tage_useful_0[update_info.index0]     <= 2'b01;
+                end else if (update_info.provider < 2'd2 &&
+                        tage_useful_1[update_info.index1] == 2'b00) begin
+                    tage_tag_1[update_info.index1]        <= update_info.tag1;
+                    tage_target_1[update_info.index1]     <= update_target;
+                    tage_confidence_1[update_info.index1] <= 2'b01;
+                    tage_useful_1[update_info.index1]     <= 2'b01;
+                end else if (update_info.provider < 2'd3 &&
+                        tage_useful_2[update_info.index2] == 2'b00) begin
+                    tage_tag_2[update_info.index2]        <= update_info.tag2;
+                    tage_target_2[update_info.index2]     <= update_target;
+                    tage_confidence_2[update_info.index2] <= 2'b01;
+                    tage_useful_2[update_info.index2]     <= 2'b01;
+                end
+            end
+
             history_q <= {history_q[HISTORY_BITS-2:0],
                 ^update_target[11:2] ^ update_info.base_index[0]};
         end
     end
 
-    task automatic increment_provider(input predictor_info_t info);
-        unique case (info.provider)
-            2'd3: begin
-                if (tage_confidence[2][info.index2] != 2'b11) begin
-                    tage_confidence[2][info.index2] =
-                        tage_confidence[2][info.index2] + 2'b01;
-                end
-                if (tage_useful[2][info.index2] != 2'b11) begin
-                    tage_useful[2][info.index2] =
-                        tage_useful[2][info.index2] + 2'b01;
-                end
-            end
-            2'd2: begin
-                if (tage_confidence[1][info.index1] != 2'b11) begin
-                    tage_confidence[1][info.index1] =
-                        tage_confidence[1][info.index1] + 2'b01;
-                end
-                if (tage_useful[1][info.index1] != 2'b11) begin
-                    tage_useful[1][info.index1] =
-                        tage_useful[1][info.index1] + 2'b01;
-                end
-            end
-            2'd1: begin
-                if (tage_confidence[0][info.index0] != 2'b11) begin
-                    tage_confidence[0][info.index0] =
-                        tage_confidence[0][info.index0] + 2'b01;
-                end
-                if (tage_useful[0][info.index0] != 2'b11) begin
-                    tage_useful[0][info.index0] =
-                        tage_useful[0][info.index0] + 2'b01;
-                end
-            end
-            default: begin
-            end
-        endcase
-    endtask
-
-    task automatic train_target(input predictor_info_t info,
-            input logic [XLEN-1:0] target);
-        if (info.provider != 2'd0) begin
-            decrement_provider(info);
-        end
-
-        if (info.provider < 2'd1 && tage_useful[0][info.index0] == 2'b00) begin
-            allocate_entry(0, info.index0, info.tag0, target);
-        end else if (info.provider < 2'd2 &&
-                tage_useful[1][info.index1] == 2'b00) begin
-            allocate_entry(1, info.index1, info.tag1, target);
-        end else if (info.provider < 2'd3 &&
-                tage_useful[2][info.index2] == 2'b00) begin
-            allocate_entry(2, info.index2, info.tag2, target);
-        end
-    endtask
-
-    task automatic decrement_provider(input predictor_info_t info);
-        unique case (info.provider)
-            2'd3: if (tage_confidence[2][info.index2] != 2'b00) begin
-                tage_confidence[2][info.index2] =
-                    tage_confidence[2][info.index2] - 2'b01;
-            end
-            2'd2: if (tage_confidence[1][info.index1] != 2'b00) begin
-                tage_confidence[1][info.index1] =
-                    tage_confidence[1][info.index1] - 2'b01;
-            end
-            2'd1: if (tage_confidence[0][info.index0] != 2'b00) begin
-                tage_confidence[0][info.index0] =
-                    tage_confidence[0][info.index0] - 2'b01;
-            end
-            default: begin
-            end
-        endcase
-    endtask
-
-    task automatic allocate_entry(input int table_id,
-            input logic [INDEX_BITS-1:0] index,
-            input logic [TAG_BITS-1:0] entry_tag,
-            input logic [XLEN-1:0] target);
-        tage_tag[table_id][index] = entry_tag;
-        tage_target[table_id][index] = target;
-        tage_confidence[table_id][index] = 2'b01;
-        tage_useful[table_id][index] = 2'b01;
-    endtask
-
 endmodule: ittage_predictor
+
+`default_nettype wire
