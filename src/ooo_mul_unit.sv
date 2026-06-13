@@ -23,8 +23,24 @@ module ooo_mul_unit
 
     localparam int MUL_LATENCY = 3;
 
+    // Metadata pipeline (active_id/prd/branch_mask/...); pipe_q[MUL_LATENCY-1].data
+    // holds the finalized result. The DATAPATH (the signed 64x64 multiply) is now
+    // spread across the three stages instead of being computed combinationally in
+    // stage 0 -- that single-cycle multiply (hand-written wallace_product + sign
+    // fixups, fed by the abort->writeback->operand network) was the FB2b worst
+    // path (abort_mask -> MulUnit/pipe_q[0][data], ~906 logic levels). Latency is
+    // unchanged (still MUL_LATENCY cycles), so there is no IPC cost.
     logic [MUL_LATENCY-1:0] valid_q;
     writeback_packet_t pipe_q [MUL_LATENCY];
+    // Stage 0 -> 1: operand magnitudes + product sign + op (registered).
+    logic [XLEN-1:0]   s0_lhs_mag_q, s0_rhs_mag_q;
+    logic              s0_neg_q;
+    alu_op_t           s0_op_q;
+    // Stage 1 -> 2: |lhs|*|rhs| (DSP-inferred from `*`) + sign + op (registered).
+    logic [2*XLEN-1:0] s1_prod_mag_q;
+    logic              s1_neg_q;
+    alu_op_t           s1_op_q;
+
     logic advance;
     logic output_aborted;
 
@@ -45,24 +61,46 @@ module ooo_mul_unit
             for (int i = 0; i < MUL_LATENCY; i += 1) begin
                 pipe_q[i] <= '0;
             end
+            s0_lhs_mag_q <= '0;
+            s0_rhs_mag_q <= '0;
+            s0_neg_q     <= 1'b0;
+            s0_op_q      <= ALU_MUL;
+            s1_prod_mag_q <= '0;
+            s1_neg_q      <= 1'b0;
+            s1_op_q       <= ALU_MUL;
         end else if (flush) begin
             valid_q <= '0;
         end else if (advance) begin
-            for (int i = MUL_LATENCY - 1; i > 0; i -= 1) begin
-                valid_q[i] <= valid_q[i - 1] &&
-                    ((pipe_q[i - 1].branch_mask & abort_mask) == '0);
-                pipe_q[i] <= pipe_q[i - 1];
-            end
+            // Stage 2 <- Stage 1: restore the product sign and select the result
+            // half/width, registered into pipe_q[last].data (shallow output).
+            pipe_q[MUL_LATENCY-1] <= pipe_q[MUL_LATENCY-2];
+            pipe_q[MUL_LATENCY-1].data <=
+                mul_select(s1_op_q, s1_neg_q, s1_prod_mag_q);
+            valid_q[MUL_LATENCY-1] <= valid_q[MUL_LATENCY-2] &&
+                ((pipe_q[MUL_LATENCY-2].branch_mask & abort_mask) == '0);
+            // Stage 1 <- Stage 0: magnitude multiply (zero-extended operands -> a
+            // 2*XLEN unsigned product; Vivado infers a pipelined DSP cascade).
+            pipe_q[1] <= pipe_q[0];
+            s1_prod_mag_q <= {{XLEN{1'b0}}, s0_lhs_mag_q} *
+                             {{XLEN{1'b0}}, s0_rhs_mag_q};
+            s1_neg_q <= s0_neg_q;
+            s1_op_q  <= s0_op_q;
+            valid_q[1] <= valid_q[0] &&
+                ((pipe_q[0].branch_mask & abort_mask) == '0);
+            // Stage 0 <- issue: capture operand magnitudes + product sign.
+            pipe_q[0] <= meta_for(issue_entry);
+            s0_lhs_mag_q <= operand_mag(issue_entry.ctrl.alu_op, rs1_data, 1'b1);
+            s0_rhs_mag_q <= operand_mag(issue_entry.ctrl.alu_op, rs2_data, 1'b0);
+            s0_neg_q     <= product_negative(issue_entry.ctrl.alu_op,
+                                             rs1_data, rs2_data);
+            s0_op_q      <= issue_entry.ctrl.alu_op;
             valid_q[0] <= issue_valid &&
                 ((issue_entry.branch_mask & abort_mask) == '0);
-            pipe_q[0] <= packet_for(issue_entry, rs1_data, rs2_data);
         end
     end
 
-    function automatic writeback_packet_t packet_for(input issue_entry_t entry,
-            input logic [XLEN-1:0] lhs, input logic [XLEN-1:0] rhs);
+    function automatic writeback_packet_t meta_for(input issue_entry_t entry);
         writeback_packet_t packet;
-        logic [2*XLEN-1:0] product;
         packet = '0;
         packet.valid = 1'b1;
         packet.active_id = entry.active_id;
@@ -71,74 +109,44 @@ module ooo_mul_unit
         packet.prd = entry.prd;
         packet.has_dest = entry.has_dest;
         packet.branch_mask = entry.branch_mask;
-        product = signed_product_for(entry.ctrl.alu_op, lhs, rhs);
-        unique case (entry.ctrl.alu_op)
-            ALU_MUL:  packet.data = product[XLEN-1:0];
-            // MULW: the low 32 product bits depend only on the low 32 operand
-            // bits, so the full-width product needs no operand truncation.
-            ALU_MULW: packet.data = XLEN'($signed(product[31:0]));
-            default:  packet.data = product[2*XLEN-1:XLEN];
-        endcase
         return packet;
     endfunction
 
-    function automatic logic [2*XLEN-1:0] signed_product_for(input alu_op_t op,
+    // Per-operand signedness for each MUL form (matches the prior wallace path):
+    // MUL/MULH/MULW sign both operands; MULHSU signs only the lhs; MULHU neither.
+    function automatic logic [XLEN-1:0] operand_mag(input alu_op_t op,
+            input logic [XLEN-1:0] val, input logic is_lhs);
+        logic is_signed;
+        if (is_lhs) begin
+            is_signed = (op == ALU_MUL) || (op == ALU_MULH) ||
+                (op == ALU_MULHSU) || (op == ALU_MULW);
+        end else begin
+            is_signed = (op == ALU_MUL) || (op == ALU_MULH) || (op == ALU_MULW);
+        end
+        operand_mag = (is_signed && val[XLEN-1]) ? (~val + 1'b1) : val;
+    endfunction
+
+    function automatic logic product_negative(input alu_op_t op,
             input logic [XLEN-1:0] lhs, input logic [XLEN-1:0] rhs);
         logic lhs_signed;
         logic rhs_signed;
-        logic product_negative;
-        logic [XLEN-1:0] lhs_mag;
-        logic [XLEN-1:0] rhs_mag;
-        logic [2*XLEN-1:0] product_mag;
         lhs_signed = (op == ALU_MUL) || (op == ALU_MULH) ||
             (op == ALU_MULHSU) || (op == ALU_MULW);
         rhs_signed = (op == ALU_MUL) || (op == ALU_MULH) || (op == ALU_MULW);
         product_negative = (lhs_signed && lhs[XLEN-1]) ^
             (rhs_signed && rhs[XLEN-1]);
-        lhs_mag = (lhs_signed && lhs[XLEN-1]) ? (~lhs + 1'b1) : lhs;
-        rhs_mag = (rhs_signed && rhs[XLEN-1]) ? (~rhs + 1'b1) : rhs;
-        product_mag = wallace_product(lhs_mag, rhs_mag);
-        signed_product_for = product_negative ? (~product_mag + 1'b1) :
-            product_mag;
     endfunction
 
-    function automatic logic [2*XLEN-1:0] wallace_product(
-            input logic [XLEN-1:0] lhs, input logic [XLEN-1:0] rhs);
-        logic [2*XLEN-1:0] rows [XLEN];
-        logic [2*XLEN-1:0] sum_row;
-        logic [2*XLEN-1:0] carry_row;
-        int row_count;
-        int out_idx;
-        for (int i = 0; i < XLEN; i += 1) begin
-            rows[i] = rhs[i] ? ({{XLEN{1'b0}}, lhs} << i) : '0;
-        end
-        row_count = XLEN;
-        while (row_count > 2) begin
-            out_idx = 0;
-            for (int i = 0; i < row_count; i += 3) begin
-                if ((i + 2) < row_count) begin
-                    sum_row = rows[i] ^ rows[i + 1] ^ rows[i + 2];
-                    carry_row = ((rows[i] & rows[i + 1]) |
-                        (rows[i] & rows[i + 2]) |
-                        (rows[i + 1] & rows[i + 2])) << 1;
-                    rows[out_idx] = sum_row;
-                    rows[out_idx + 1] = carry_row;
-                    out_idx += 2;
-                end else begin
-                    rows[out_idx] = rows[i];
-                    out_idx += 1;
-                    if ((i + 1) < row_count) begin
-                        rows[out_idx] = rows[i + 1];
-                        out_idx += 1;
-                    end
-                end
-            end
-            for (int i = out_idx; i < XLEN; i += 1) begin
-                rows[i] = '0;
-            end
-            row_count = out_idx;
-        end
-        wallace_product = rows[0] + rows[1];
+    function automatic logic [XLEN-1:0] mul_select(input alu_op_t op,
+            input logic neg, input logic [2*XLEN-1:0] prod_mag);
+        logic [2*XLEN-1:0] product;
+        product = neg ? (~prod_mag + 1'b1) : prod_mag;
+        unique case (op)
+            ALU_MUL:  mul_select = product[XLEN-1:0];
+            // MULW: low 32 product bits, sign-extended to XLEN.
+            ALU_MULW: mul_select = XLEN'($signed(product[31:0]));
+            default:  mul_select = product[2*XLEN-1:XLEN];   // MULH/MULHSU/MULHU
+        endcase
     endfunction
 
 endmodule: ooo_mul_unit
