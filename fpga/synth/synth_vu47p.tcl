@@ -35,5 +35,13 @@ report_timing_summary -setup -max_paths 1
 if {[catch {place_design} e]} { puts "PLACE_FAIL: $e" }
 puts "==== POST-PLACE WNS ===="
 report_timing_summary -setup -max_paths 1
+
+# Emit/refresh the placed reference checkpoint for the fast incremental loop
+# (synth_vu47p_incr.tcl reads it back with read_checkpoint -incremental). This
+# fresh run is the source-of-truth WNS; the incremental runs anchor to this DCP.
+if {[info exists ::env(REF_OUT)]} {
+  write_checkpoint -force $::env(REF_OUT)
+  puts "REF_WRITTEN: $::env(REF_OUT)"
+}
 puts "VU47P_DONE"
 exit 0
