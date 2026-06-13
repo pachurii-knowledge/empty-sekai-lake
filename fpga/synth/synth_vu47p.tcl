@@ -32,7 +32,13 @@ if {[catch {opt_design} e]} { puts "OPT_FAIL: $e" }
 puts "==== POST-OPT WNS ===="
 report_timing_summary -setup -max_paths 1
 
-if {[catch {place_design} e]} { puts "PLACE_FAIL: $e" }
+# -directive Quick: fast, timing-driven enough to rank the critical paths but
+# skips the aggressive post-place physical synthesis (LUT-break/rewire) that the
+# default directive spends ~30 min on trying to rescue paths that are physically
+# unmeetable while we are still tens of ns from closure. Good for relative WNS
+# deltas in the flatten loop; do one default-directive + route_design run for the
+# true number once a change lands near 0.
+if {[catch {place_design -directive Quick} e]} { puts "PLACE_FAIL: $e" }
 puts "==== POST-PLACE WNS ===="
 report_timing_summary -setup -max_paths 1
 
