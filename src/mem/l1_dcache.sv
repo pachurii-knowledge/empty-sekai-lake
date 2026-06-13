@@ -45,6 +45,16 @@ module l1_dcache
     input  logic                          flush_req,
     output logic                          flush_done,
 
+    // ---- C4a coherence probe (clean-before-refill) ----
+    // niigo_memsys asserts probe_valid (level) with the line word address an
+    // L1I refill is about to fetch. If this cache holds that line dirty, it is
+    // written back here first; probe_clean then rises and the memsys releases
+    // the held I-refill so it reads the now-current line from memory. A probe
+    // miss / clean hit raises probe_clean immediately. The line stays valid.
+    input  logic                          probe_valid,
+    input  logic [MEMORY_ADDR_WIDTH-1:0]  probe_waddr,
+    output logic                          probe_clean,
+
     // ---- NMI master ----
     output nmi_req_t                      nmi_req,
     input  logic                          nmi_req_ready,
@@ -77,6 +87,9 @@ module l1_dcache
 
     l1_tag_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .TAG_BITS(L1_TAG_BITS)) Tags (
         .clk, .ren(tag_ren), .ridx(tag_ridx), .rtag(tag_rdata),
+        // 2nd read port unused here: the L1D probe (C4a) reuses the main read
+        // port in S_PROBE_LOOK, so the snoop port is tied off (optimized away).
+        .ren2(1'b0), .ridx2('0), .rtag2(),
         .wen(tag_wen), .widx(tag_widx), .wway(tag_wway), .wtag(tag_wtag)
     );
     l1_data_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .LINE_BITS(LB)) Data (
@@ -108,7 +121,8 @@ module l1_dcache
 
     typedef enum logic [3:0] {
         S_IDLE, S_LOOKUP, S_WB_REQ, S_WB_WAIT, S_FILL_REQ, S_FILL_WAIT, S_INSTALL,
-        S_FLUSH_READ, S_FLUSH_SCAN, S_FLUSH_WB_REQ, S_FLUSH_WB_WAIT, S_FLUSH_DONE
+        S_FLUSH_READ, S_FLUSH_SCAN, S_FLUSH_WB_REQ, S_FLUSH_WB_WAIT, S_FLUSH_DONE,
+        S_PROBE_LOOK, S_PROBE_WB_REQ, S_PROBE_WB_WAIT
     } state_e;
     state_e state_q, state_n;
 
@@ -118,6 +132,15 @@ module l1_dcache
     logic [MEMORY_ADDR_WIDTH-1:0] wb_addr_q, wb_addr_n;
     logic [L1_INDEX_BITS-1:0]  flush_set_q, flush_set_n;
     logic [L1_WAY_BITS-1:0]    flush_way_q, flush_way_n;
+
+    // ---------------- C4a probe state ----------------
+    logic [L1_INDEX_BITS-1:0]  pidx_q, pidx_n;
+    logic [L1_TAG_BITS-1:0]    ptag_q, ptag_n;
+    logic [L1_WAY_BITS-1:0]    pway_q, pway_n;
+    logic                      probe_done_q, probe_done_n;  // this probe resolved
+    logic                      probe_start;                 // begin a probe in S_IDLE
+    assign probe_start = probe_valid && !probe_done_q && !flush_req;
+    assign probe_clean = probe_done_q;
 
     // ---------------- hit detection ----------------
     logic [L1_WAYS-1:0]     hit_oh;
@@ -129,6 +152,23 @@ module l1_dcache
         any_hit = |hit_oh;
         hit_way = '0;
         for (int w = 0; w < L1_WAYS; w += 1) if (hit_oh[w]) hit_way = L1_WAY_BITS'(w);
+    end
+
+    // ---------------- C4a probe hit detection (S_PROBE_LOOK) ----------------
+    // Reuses the main tag/data read port: S_IDLE presents the probe index, the
+    // result lands in S_PROBE_LOOK. A dirty hit is written back; the line stays
+    // valid-clean. Probes only run from S_IDLE, so they never clash with a live
+    // load/store op (req acceptance is blocked while a probe is pending).
+    logic [L1_WAYS-1:0]     probe_hit_oh;
+    logic                   probe_any_hit, probe_dirty;
+    logic [L1_WAY_BITS-1:0] probe_hit_way;
+    always_comb begin
+        for (int w = 0; w < L1_WAYS; w += 1)
+            probe_hit_oh[w] = valid_q[pidx_q][w] && (tag_rdata[w] == ptag_q);
+        probe_any_hit = |probe_hit_oh;
+        probe_hit_way = '0;
+        for (int w = 0; w < L1_WAYS; w += 1) if (probe_hit_oh[w]) probe_hit_way = L1_WAY_BITS'(w);
+        probe_dirty = probe_any_hit && dirty_q[pidx_q][probe_hit_way];
     end
 
     // ---------------- PLRU ----------------
@@ -161,7 +201,8 @@ module l1_dcache
 
     // ---------------- control ----------------
     logic req_fire, serve_hit, serve_miss, store_hit;
-    assign req_ready = (state_q == S_IDLE) && !flush_req;
+    // A pending probe takes priority over a new request in S_IDLE.
+    assign req_ready = (state_q == S_IDLE) && !flush_req && !probe_start;
     assign req_fire  = req_valid && req_ready;
     assign serve_hit  = (state_q == S_LOOKUP) && op_valid_q &&  any_hit;
     assign serve_miss = (state_q == S_LOOKUP) && op_valid_q && !any_hit;
@@ -184,7 +225,8 @@ module l1_dcache
     assign ev_access = serve_hit || serve_miss;
     assign ev_miss   = serve_miss;
     assign ev_wb     = (state_q == S_WB_REQ && nmi_req_ready) ||
-                       (state_q == S_FLUSH_WB_REQ && nmi_req_ready);
+                       (state_q == S_FLUSH_WB_REQ && nmi_req_ready) ||
+                       (state_q == S_PROBE_WB_REQ && nmi_req_ready);
 
     assign flush_done = (state_q == S_FLUSH_DONE);
 
@@ -192,7 +234,7 @@ module l1_dcache
     always_comb begin
         nmi_req = '0;
         unique case (state_q)
-            S_WB_REQ, S_FLUSH_WB_REQ: begin
+            S_WB_REQ, S_FLUSH_WB_REQ, S_PROBE_WB_REQ: begin
                 nmi_req.valid = 1'b1;
                 nmi_req.op    = NMI_WR_LINE;
                 nmi_req.waddr = wb_addr_q;
@@ -213,7 +255,11 @@ module l1_dcache
     always_comb begin
         tag_ren = 1'b0; tag_ridx = op_idx;
         dat_ren = 1'b0; dat_ridx = op_idx;
-        if ((state_q == S_IDLE) && req_fire) begin
+        if ((state_q == S_IDLE) && probe_start) begin
+            // Probe lookup has priority over a new request (req_ready is low).
+            tag_ren = 1'b1; tag_ridx = l1_index(probe_waddr);
+            dat_ren = 1'b1; dat_ridx = l1_index(probe_waddr);
+        end else if ((state_q == S_IDLE) && req_fire) begin
             tag_ren = 1'b1; tag_ridx = l1_index(req_waddr);
             dat_ren = 1'b1; dat_ridx = l1_index(req_waddr);
         end else if (state_q == S_FLUSH_READ) begin
@@ -268,15 +314,41 @@ module l1_dcache
         wb_addr_n     = wb_addr_q;
         flush_set_n   = flush_set_q;
         flush_way_n   = flush_way_q;
+        pidx_n        = pidx_q;
+        ptag_n        = ptag_q;
+        pway_n        = pway_q;
+        probe_done_n  = probe_done_q;
 
         unique case (state_q)
             S_IDLE: begin
                 if (flush_req) begin
                     flush_set_n = '0;
                     state_n     = S_FLUSH_READ;
+                end else if (probe_start) begin
+                    // Snoop the line the held I-refill wants (read presented above).
+                    pidx_n  = l1_index(probe_waddr);
+                    ptag_n  = l1_tag(probe_waddr);
+                    state_n = S_PROBE_LOOK;
                 end else if (req_fire) begin
                     state_n = S_LOOKUP;
                 end
+            end
+
+            S_PROBE_LOOK: begin
+                if (probe_dirty) begin
+                    wb_line_n = dat_rdata[probe_hit_way];
+                    wb_addr_n = line_addr(tag_rdata[probe_hit_way], pidx_q);
+                    pway_n    = probe_hit_way;
+                    state_n   = S_PROBE_WB_REQ;
+                end else begin
+                    probe_done_n = 1'b1;   // miss / clean hit: nothing to drain
+                    state_n      = S_IDLE;
+                end
+            end
+            S_PROBE_WB_REQ:  if (nmi_req_ready)  state_n = S_PROBE_WB_WAIT;
+            S_PROBE_WB_WAIT: if (nmi_resp.valid) begin
+                probe_done_n = 1'b1;       // dirty line now in memory; refill may go
+                state_n      = S_IDLE;
             end
 
             S_LOOKUP: begin
@@ -341,6 +413,10 @@ module l1_dcache
 
             default: state_n = S_IDLE;
         endcase
+
+        // The probe handshake resolved-flag clears once memsys drops probe_valid
+        // (i.e. the I-refill it gated has been released). One probe per refill.
+        if (!probe_valid) probe_done_n = 1'b0;
     end
 
     // op latch.
@@ -383,6 +459,10 @@ module l1_dcache
         if (state_q == S_FLUSH_WB_WAIT && nmi_resp.valid) begin
             dirty_n[flush_set_q][flush_way_q] = 1'b0;
         end
+        // C4a: a probe writeback leaves the line valid-clean.
+        if (state_q == S_PROBE_WB_WAIT && nmi_resp.valid) begin
+            dirty_n[pidx_q][pway_q] = 1'b0;
+        end
     end
 
     always_ff @(posedge clk or negedge rst_l) begin
@@ -399,6 +479,10 @@ module l1_dcache
             wb_addr_q     <= '0;
             flush_set_q   <= '0;
             flush_way_q   <= '0;
+            pidx_q        <= '0;
+            ptag_q        <= '0;
+            pway_q        <= '0;
+            probe_done_q  <= 1'b0;
             gen_q         <= '0;
             for (int s = 0; s < L1_SETS; s += 1) begin
                 valid_q[s] <= '0;
@@ -418,8 +502,12 @@ module l1_dcache
             wb_addr_q     <= wb_addr_n;
             flush_set_q   <= flush_set_n;
             flush_way_q   <= flush_way_n;
+            pidx_q        <= pidx_n;
+            ptag_q        <= ptag_n;
+            pway_q        <= pway_n;
+            probe_done_q  <= probe_done_n;
             if ((state_q == S_WB_REQ || state_q == S_FILL_REQ ||
-                 state_q == S_FLUSH_WB_REQ) && nmi_req_ready)
+                 state_q == S_FLUSH_WB_REQ || state_q == S_PROBE_WB_REQ) && nmi_req_ready)
                 gen_q <= gen_q + 2'd1;
             for (int s = 0; s < L1_SETS; s += 1) begin
                 valid_q[s] <= valid_n[s];
@@ -449,6 +537,12 @@ module l1_dcache
             if (state_q == S_INSTALL)
                 $display("[L1D] INST way=%0d drt=%b resp=%016h line=%0128h",
                     fill_way_q, op_write_q, resp_data, install_line);
+            if (state_q == S_PROBE_LOOK)
+                $display("[L1D] PROBE waddr=%08h idx=%0d tag=%05h hit=%b dirty=%b",
+                    {ptag_q, pidx_q, {LINE_WORD_BITS{1'b0}}}, pidx_q, ptag_q,
+                    probe_any_hit, probe_dirty);
+            if ((state_q == S_PROBE_WB_REQ) && nmi_req_ready)
+                $display("[L1D] PROBE-WB waddr=%08h line=%0128h", wb_addr_q, wb_line_q);
         end
     end
 `endif

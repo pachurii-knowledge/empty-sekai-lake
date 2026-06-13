@@ -212,17 +212,35 @@ module niigo_memsys
     nmi_resp_t l1i_nmi_resp;
     logic      l1i_ev_access, l1i_ev_miss;
 
+    // C4b: committed-store snoop into the L1I (source assigned from the store
+    // path below: the L1D store at L1D=1, the passthrough store at L1=1-only).
+    logic                          l1i_snoop_valid;
+    logic [MEMORY_ADDR_WIDTH-1:0]  l1i_snoop_waddr;
+
     l1_icache L1I (
         .clk, .rst_l,
         .ifetch_req_valid, .ifetch_req_ready, .ifetch_req_addr,
         .ifetch_resp_valid, .ifetch_resp_data, .ifetch_resp_excpt,
         .inval_all(ifetch_inval),
+        .snoop_valid(l1i_snoop_valid), .snoop_waddr(l1i_snoop_waddr),
         .nmi_req(l1i_nmi_req),
         .nmi_req_ready(l1i_nmi_ready),
         .nmi_resp(l1i_nmi_resp),
         .ev_access(l1i_ev_access),
         .ev_miss(l1i_ev_miss)
     );
+
+    // Snoop source: a committed D-store's line invalidates any L1I copy. At
+    // L1D=1 it is the store accepted into the L1D; at L1=1-only it is the
+    // passthrough store (which writes memory directly, so the producer side is
+    // automatic and only this consumer-side invalidate is needed).
+`ifdef L1D_CACHE
+    assign l1i_snoop_valid = present_dmem && dmem_req_write && l1d_req_fire;
+    assign l1i_snoop_waddr = l1d_req_waddr;
+`else
+    assign l1i_snoop_valid = dmem_store_fire;
+    assign l1i_snoop_waddr = dmem_req_addr;
+`endif
     // The NMI arbiter + sim adapter that the L1I (and, at L1D=1, the L1D) refill
     // through live in the shared backend block below.
 `else
@@ -462,6 +480,13 @@ module niigo_memsys
     nmi_resp_t l1d_nmi_resp;
     logic      l1d_ev_access, l1d_ev_miss, l1d_ev_wb;
 
+    // C4a: probe the L1D for the line an L1I refill is about to fetch. The probe
+    // is the L1I's pending RD_LINE address; probe_clean gates the refill below.
+    logic                          l1d_probe_valid, l1d_probe_clean;
+    logic [MEMORY_ADDR_WIDTH-1:0]  l1d_probe_waddr;
+    assign l1d_probe_valid = l1i_nmi_req.valid && (l1i_nmi_req.op == NMI_RD_LINE);
+    assign l1d_probe_waddr = l1i_nmi_req.waddr;
+
     l1_dcache L1D (
         .clk, .rst_l,
         .req_valid(l1d_req_valid), .req_ready(l1d_req_ready),
@@ -470,6 +495,8 @@ module niigo_memsys
         .resp_valid(l1d_resp_valid), .resp_data(l1d_resp_data),
         .resp_addr(l1d_resp_addr), .wr_accept(l1d_wr_accept),
         .flush_req(dcache_flush_req), .flush_done(dcache_flush_done),
+        .probe_valid(l1d_probe_valid), .probe_waddr(l1d_probe_waddr),
+        .probe_clean(l1d_probe_clean),
         .nmi_req(l1d_nmi_req), .nmi_req_ready(l1d_nmi_ready), .nmi_resp(l1d_nmi_resp),
         .ev_access(l1d_ev_access), .ev_miss(l1d_ev_miss), .ev_wb(l1d_ev_wb)
     );
@@ -518,11 +545,18 @@ module niigo_memsys
     assign arb_m_req[0]  = l1d_nmi_req;
     assign l1d_nmi_ready = arb_m_ready[0];
     assign l1d_nmi_resp  = arb_m_resp[0];
+    // C4a: hold the L1I refill out of the arbiter until the L1D probe reports
+    // the line clean (any dirty copy written back). Registered-derived on both
+    // sides (L1I state, L1D probe_done) -- no combinational path.
+    logic l1i_refill_gate;
+    assign l1i_refill_gate = l1d_probe_valid && !l1d_probe_clean;
+    assign arb_m_req[1]  = l1i_refill_gate ? '0 : l1i_nmi_req;
+    assign l1i_nmi_ready = l1i_refill_gate ? 1'b0 : arb_m_ready[1];
 `else
     assign arb_m_req[0] = '0;          // L1D attaches here at L1D=1
-`endif
     assign arb_m_req[1]  = l1i_nmi_req;
     assign l1i_nmi_ready = arb_m_ready[1];
+`endif
     assign l1i_nmi_resp  = arb_m_resp[1];
 
     nmi_arbiter #(.N_MASTERS(2)) Arb (

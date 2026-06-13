@@ -37,6 +37,12 @@ module l1_icache
     // ---- fence.i / flush: flash-invalidate all lines (single-cycle pulse) ----
     input  logic                                    inval_all,
 
+    // ---- C4b coherence snoop: a committed D-store to snoop_waddr invalidates
+    //      any L1I copy of that line (single-cycle pulse; word address). Uses
+    //      the tag array's 2nd read port, so it never stalls the fetch port. ----
+    input  logic                                    snoop_valid,
+    input  logic [MEMORY_ADDR_WIDTH-1:0]            snoop_waddr,
+
     // ---- NMI master ----
     output nmi_req_t                                nmi_req,
     input  logic                                    nmi_req_ready,
@@ -53,6 +59,10 @@ module l1_icache
     logic [L1_WAY_BITS-1:0]         tag_wway;
     logic [L1_TAG_BITS-1:0]         tag_wtag;
     logic [L1_WAYS-1:0][L1_TAG_BITS-1:0] tag_rdata;
+    // 2nd tag read port (C4b snoop).
+    logic                           tag_ren2;
+    logic [L1_INDEX_BITS-1:0]       tag_ridx2;
+    logic [L1_WAYS-1:0][L1_TAG_BITS-1:0] tag_rdata2;
 
     logic                           dat_ren, dat_wen;
     logic [L1_INDEX_BITS-1:0]       dat_ridx, dat_widx;
@@ -63,6 +73,7 @@ module l1_icache
 
     l1_tag_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .TAG_BITS(L1_TAG_BITS)) Tags (
         .clk, .ren(tag_ren), .ridx(tag_ridx), .rtag(tag_rdata),
+        .ren2(tag_ren2), .ridx2(tag_ridx2), .rtag2(tag_rdata2),
         .wen(tag_wen), .widx(tag_widx), .wway(tag_wway), .wtag(tag_wtag)
     );
     l1_data_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .LINE_BITS(LINE_BITS)) Data (
@@ -95,6 +106,32 @@ module l1_icache
     logic [LINE_BITS-1:0] refill_line_q, refill_line_n;
     logic                 refill_err_q,  refill_err_n;
     logic                 miss_inval_q,  miss_inval_n;  // inval seen mid-refill
+
+    // ---------------- C4b snoop pipeline (2 stages, always-running) ----------
+    // Stage 1 (this cycle): present the snoop index to the 2nd tag read port.
+    // Stage 2 (next cycle): compare the registered tag and clear the matching
+    // valid bit. Decoupled from the fetch read port, so it never bubbles fetch.
+    logic                      snp_v_q,   snp_v_n;
+    logic [L1_INDEX_BITS-1:0]  snp_idx_q, snp_idx_n;
+    logic [L1_TAG_BITS-1:0]    snp_tag_q, snp_tag_n;
+    assign tag_ren2  = snoop_valid;
+    assign tag_ridx2 = l1_index(snoop_waddr);
+    assign snp_v_n   = snoop_valid;
+    assign snp_idx_n = l1_index(snoop_waddr);
+    assign snp_tag_n = l1_tag(snoop_waddr);
+
+    // Stage 2 hit detection against the registered (port-2) tags.
+    logic [L1_WAYS-1:0] snp_hit_oh;
+    logic               snp_hit_refill;  // snoop targets the line being refilled
+    always_comb begin
+        for (int w = 0; w < L1_WAYS; w += 1)
+            snp_hit_oh[w] = snp_v_q && valid_q[snp_idx_q][w] &&
+                            (tag_rdata2[w] == snp_tag_q);
+        // A store to the line currently in refill makes the pending install
+        // stale (it may predate the store) -> drop it, just like inval_all.
+        snp_hit_refill = snp_v_q && (state_q != S_SERVE) &&
+                         (snp_idx_q == p_idx) && (snp_tag_q == p_tag);
+    end
 
     // ---------------- hit detection (stage 2) ----------------
     logic [L1_WAYS-1:0]     hit_way_oh;
@@ -266,8 +303,9 @@ module l1_icache
 
         // A fence.i / flush during a refill must drop the install (the line may
         // predate the store the fence.i orders); the request then re-misses and
-        // re-reads memory.
+        // re-reads memory. A C4b snoop to the in-refill line does the same.
         if (inval_all && (state_q != S_SERVE)) miss_inval_n = 1'b1;
+        if (snp_hit_refill)                    miss_inval_n = 1'b1;
     end
 
     // valid-bit next state (flash invalidate + install set).
@@ -278,6 +316,9 @@ module l1_icache
             ((state_q == S_INSTALL) && miss_inval_q)) begin
             for (int s = 0; s < L1_SETS; s += 1) valid_n[s] = '0;
         end
+        // C4b snoop: clear any way whose tag matches a committed-store line.
+        for (int w = 0; w < L1_WAYS; w += 1)
+            if (snp_hit_oh[w]) valid_n[snp_idx_q][w] = 1'b0;
         // Install sets the victim way valid (overrides a same-cycle clear only
         // when this is a clean install).
         if ((state_q == S_INSTALL) && !miss_inval_q) begin
@@ -293,6 +334,9 @@ module l1_icache
             refill_line_q <= '0;
             refill_err_q  <= 1'b0;
             miss_inval_q  <= 1'b0;
+            snp_v_q       <= 1'b0;
+            snp_idx_q     <= '0;
+            snp_tag_q     <= '0;
             gen_q         <= '0;
             for (int s = 0; s < L1_SETS; s += 1) begin
                 valid_q[s] <= '0;
@@ -305,6 +349,9 @@ module l1_icache
             refill_line_q <= refill_line_n;
             refill_err_q  <= refill_err_n;
             miss_inval_q  <= miss_inval_n;
+            snp_v_q       <= snp_v_n;
+            snp_idx_q     <= snp_idx_n;
+            snp_tag_q     <= snp_tag_n;
             if (state_q == S_MISS_REQ && nmi_req_ready) gen_q <= gen_q + 2'd1;
             for (int s = 0; s < L1_SETS; s += 1) valid_q[s] <= valid_n[s];
             if (plru_upd_en) plru_q[p_idx] <= plru_next;
