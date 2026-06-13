@@ -5,6 +5,7 @@ references/
 scripts/__pycache__/
 plans/
 OVERNIGHT_BUGLOG.md
+aws-fpga/
 vivado.jou
 vivado.log
 vivado.str
