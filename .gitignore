@@ -19,3 +19,6 @@ vivado.xpr.bak.bak.bak.bak.bak
 .Xil/
 vivado*.log
 vivado*.jou
+# Vivado GUI scratch (clock report + congestion dumps written to CWD)
+clockInfo.txt
+cong/
