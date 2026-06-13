@@ -16,11 +16,11 @@
 module pmp_checker
     import RISCV_Priv::*;
 (
-    input  logic [MXLEN-1:0]  paddr,            // byte physical address
-    input  logic [1:0]        access,           // 0 = fetch, 1 = load, 2 = store
-    input  priv_mode_t        priv,
-    input  logic [31:0]       pmpcfg [4],
-    input  logic [MXLEN-1:0]  pmpaddr [16],
+    input wire logic [MXLEN-1:0]  paddr,            // byte physical address
+    input wire logic [1:0]        access,           // 0 = fetch, 1 = load, 2 = store
+    input wire priv_mode_t        priv,
+    input wire logic [31:0]       pmpcfg [4],
+    input wire logic [MXLEN-1:0]  pmpaddr [16],
     output logic              fault
 );
 

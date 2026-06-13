@@ -42,25 +42,25 @@ module plic
     parameter logic [31:0] BASE = 32'h0C00_0000,
     parameter int          NSOURCES = 31           // sources 1..NSOURCES (<= 31)
 ) (
-    input  logic        clk,
-    input  logic        rst_l,
+    input wire logic        clk,
+    input wire logic        rst_l,
 
     // Level interrupt lines from devices (index 0 unused; source 0 is reserved).
-    input  logic [NSOURCES:0] src_irq,
+    input wire logic [NSOURCES:0] src_irq,
 
     // Committed data store snoop (memory-word address space)
-    input  logic        store_en,
-    input  logic [MEMORY_ADDR_WIDTH-1:0] store_waddr,
-    input  logic [XLEN-1:0] store_wdata,
-    input  logic [XLEN_BYTES-1:0] store_mask,
+    input wire logic        store_en,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] store_waddr,
+    input wire logic [XLEN-1:0] store_wdata,
+    input wire logic [XLEN_BYTES-1:0] store_mask,
 
     // Combinational load query; load_en marks the cycle the load result is
     // actually consumed (so a claim's side effect is not taken speculatively).
     // load_off is the consuming access's byte offset within the memory word,
     // for read-side-effect gating (which 32-bit register was read).
-    input  logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
-    input  logic        load_en,
-    input  logic [$clog2(XLEN_BYTES)-1:0] load_off,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
+    input wire logic        load_en,
+    input wire logic [$clog2(XLEN_BYTES)-1:0] load_off,
     output logic        load_hit,
     output logic [XLEN-1:0] load_data,
 

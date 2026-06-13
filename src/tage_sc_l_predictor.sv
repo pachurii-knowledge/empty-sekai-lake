@@ -10,17 +10,17 @@ module tage_sc_l_predictor
     parameter int HISTORY_BITS = 30,
     parameter int SC_INDEX_BITS = 8
 ) (
-    input  logic            clk,
-    input  logic            rst_l,
-    input  logic            lookup_valid,
-    input  logic [XLEN-1:0] lookup_pc,
-    input  logic [HISTORY_BITS-1:0] history,
+    input wire logic            clk,
+    input wire logic            rst_l,
+    input wire logic            lookup_valid,
+    input wire logic [XLEN-1:0] lookup_pc,
+    input wire logic [HISTORY_BITS-1:0] history,
     output logic            prediction,
     output predictor_info_t prediction_info,
-    input  logic            update_valid,
-    input  logic [XLEN-1:0] update_pc,
-    input  logic            update_taken,
-    input  predictor_info_t update_info
+    input wire logic            update_valid,
+    input wire logic [XLEN-1:0] update_pc,
+    input wire logic            update_taken,
+    input wire predictor_info_t update_info
 );
 
     localparam int ENTRIES = 1 << INDEX_BITS;

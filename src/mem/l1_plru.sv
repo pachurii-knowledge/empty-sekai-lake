@@ -18,11 +18,11 @@
 module l1_plru #(
     parameter int WAYS = 4
 ) (
-    input  logic [2:0]               state,        // current tree bits
-    input  logic [WAYS-1:0]          valid,        // per-way valid mask
+    input wire logic [2:0]               state,        // current tree bits
+    input wire logic [WAYS-1:0]          valid,        // per-way valid mask
     output logic [$clog2(WAYS)-1:0]  victim,
-    input  logic                     update_en,
-    input  logic [$clog2(WAYS)-1:0]  access_way,
+    input wire logic                     update_en,
+    input wire logic [$clog2(WAYS)-1:0]  access_way,
     output logic [2:0]               next_state
 );
 

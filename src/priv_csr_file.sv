@@ -19,56 +19,56 @@
 module priv_csr_file
     import RISCV_Priv::*;
 (
-    input  logic        clk,
-    input  logic        rst_l,
+    input wire logic        clk,
+    input wire logic        rst_l,
 
     // Retirement / counters
-    input  logic        retire,            // an instruction retired this cycle
-    input  logic [63:0] mtime,             // CLINT time for the TIME CSR
+    input wire logic        retire,            // an instruction retired this cycle
+    input wire logic [63:0] mtime,             // CLINT time for the TIME CSR
 
     // CSR read port (combinational). Port 0 is used by the scalar core; the
     // out-of-order core additionally uses port 1 for its second ALU issue slot.
-    input  logic [11:0] read_addr,
+    input wire logic [11:0] read_addr,
     output logic [MXLEN-1:0] read_data,
     output logic        read_illegal,
-    input  logic [11:0] read_addr1,
+    input wire logic [11:0] read_addr1,
     output logic [MXLEN-1:0] read_data1,
     output logic        read_illegal1,
 
     // CSR write port (applied at retire of a CSR instruction)
-    input  logic        write_valid,
-    input  logic [11:0] write_addr,
-    input  logic [MXLEN-1:0] write_data,
+    input wire logic        write_valid,
+    input wire logic [11:0] write_addr,
+    input wire logic [MXLEN-1:0] write_data,
 
     // Accrued FP flags (from FP units)
-    input  logic        fp_fflags_valid,
-    input  logic [4:0]  fp_fflags,
+    input wire logic        fp_fflags_valid,
+    input wire logic [4:0]  fp_fflags,
     output logic [2:0]  frm_value,
 
     // Cache event pulses driving mhpmcounter3-5 (phase C3): L1I miss / L1D miss
     // / L1D writeback. Left unconnected (-> 0) on scalar / L1=0 builds, so those
     // counters read zero exactly as before.
-    input  logic        cache_ev_l1i_miss,
-    input  logic        cache_ev_l1d_miss,
-    input  logic        cache_ev_l1d_wb,
+    input wire logic        cache_ev_l1i_miss,
+    input wire logic        cache_ev_l1d_miss,
+    input wire logic        cache_ev_l1d_wb,
 
     // Hardware interrupt sources
-    input  logic        irq_m_timer,
-    input  logic        irq_m_software,
-    input  logic        irq_m_external,
-    input  logic        irq_s_external,
+    input wire logic        irq_m_timer,
+    input wire logic        irq_m_software,
+    input wire logic        irq_m_external,
+    input wire logic        irq_s_external,
 
     // Trap entry (from trap_controller)
-    input  logic        trap_valid,
-    input  logic        trap_is_interrupt,
-    input  logic [4:0]  trap_cause,
-    input  logic [MXLEN-1:0] trap_epc,
-    input  logic [MXLEN-1:0] trap_tval,
-    input  priv_mode_t  trap_target_priv,
+    input wire logic        trap_valid,
+    input wire logic        trap_is_interrupt,
+    input wire logic [4:0]  trap_cause,
+    input wire logic [MXLEN-1:0] trap_epc,
+    input wire logic [MXLEN-1:0] trap_tval,
+    input wire priv_mode_t  trap_target_priv,
 
     // Trap return
-    input  logic        ret_valid,
-    input  logic        ret_from_s,        // 1 = SRET, 0 = MRET
+    input wire logic        ret_valid,
+    input wire logic        ret_from_s,        // 1 = SRET, 0 = MRET
 
     // Architectural state exposed to the rest of the core / trap_controller
     output priv_mode_t  priv,

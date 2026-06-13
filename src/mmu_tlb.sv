@@ -22,28 +22,28 @@ module mmu_tlb
 #(
     parameter int ENTRIES = 16
 ) (
-    input  logic        clk,
-    input  logic        rst_l,
+    input wire logic        clk,
+    input wire logic        rst_l,
 
     // Lookup (combinational)
-    input  logic        lookup_en,
-    input  logic [VM_VPN_W-1:0] lookup_vpn,
-    input  logic [VM_ASID_W-1:0] lookup_asid,
+    input wire logic        lookup_en,
+    input wire logic [VM_VPN_W-1:0] lookup_vpn,
+    input wire logic [VM_ASID_W-1:0] lookup_asid,
     output logic        hit,
     output logic [VM_PPN_W-1:0] hit_ppn,
     output logic [7:0]  hit_perm,      // {D,A,G,U,X,W,R,V}
     output logic [1:0]  hit_level,     // leaf level (0 = base page)
 
     // Fill (synchronous)
-    input  logic        fill_en,
-    input  logic [VM_VPN_W-1:0] fill_vpn,
-    input  logic [VM_ASID_W-1:0] fill_asid,
-    input  logic [VM_PPN_W-1:0] fill_ppn,
-    input  logic [7:0]  fill_perm,
-    input  logic [1:0]  fill_level,
+    input wire logic        fill_en,
+    input wire logic [VM_VPN_W-1:0] fill_vpn,
+    input wire logic [VM_ASID_W-1:0] fill_asid,
+    input wire logic [VM_PPN_W-1:0] fill_ppn,
+    input wire logic [7:0]  fill_perm,
+    input wire logic [1:0]  fill_level,
 
     // Flush (synchronous) - full flush
-    input  logic        flush_en
+    input wire logic        flush_en
 );
 
     logic              valid_q [ENTRIES];

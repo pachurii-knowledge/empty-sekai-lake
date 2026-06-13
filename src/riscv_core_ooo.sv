@@ -11,31 +11,31 @@ module riscv_core_ooo
     import RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
 (
-    input  logic             clk, rst_l,
+    input wire logic             clk, rst_l,
 
     // Instruction-fetch port: one 16-byte block per request, handshaked.
     // Responses arrive in request order after an arbitrary >= 1 cycle
     // latency; the core associates them with requests by arrival order.
     output logic             ifetch_req_valid,
-    input  logic             ifetch_req_ready,
+    input wire logic             ifetch_req_ready,
     output logic [MEMORY_ADDR_WIDTH-1:0] ifetch_req_addr,
-    input  logic             ifetch_resp_valid,
-    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ifetch_resp_data,
-    input  logic             ifetch_resp_excpt,
+    input wire logic             ifetch_resp_valid,
+    input wire logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ifetch_resp_data,
+    input wire logic             ifetch_resp_excpt,
 
     // Data port: one word-granular load or store per request, handshaked.
     // Load responses arrive in order after an arbitrary >= 1 cycle latency
     // (the request word address is echoed for the device decode at
     // delivery); accepted stores are fire-and-forget.
     output logic             dmem_req_valid,
-    input  logic             dmem_req_ready,
+    input wire logic             dmem_req_ready,
     output logic             dmem_req_write,
     output logic [MEMORY_ADDR_WIDTH-1:0] dmem_req_addr,
     output logic [XLEN-1:0]  dmem_req_wdata,
     output logic [XLEN_BYTES-1:0]        dmem_req_wmask,
-    input  logic             dmem_resp_valid,
-    input  logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
-    input  logic [XLEN-1:0]  dmem_resp_data,
+    input wire logic             dmem_resp_valid,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
+    input wire logic [XLEN-1:0]  dmem_resp_data,
 
     // MMU page-table-walk port: the walker's level req/ack word port (PTE
     // reads + A/D writebacks); rdata is valid in the ack cycle.
@@ -43,8 +43,8 @@ module riscv_core_ooo
     output logic             ptw_mem_we,
     output logic [MEMORY_ADDR_WIDTH-1:0] ptw_mem_addr_w,
     output logic [XLEN-1:0]  ptw_mem_wdata,
-    input  logic             ptw_mem_ack,
-    input  logic [XLEN-1:0]  ptw_mem_rdata,
+    input wire logic             ptw_mem_ack,
+    input wire logic [XLEN-1:0]  ptw_mem_rdata,
 
     // fence.i: flash-invalidate the L1I (consumed by niigo_memsys at L1=1;
     // ignored by the L1=0 passthrough). Pulsed when a fence.i retires.
@@ -57,11 +57,11 @@ module riscv_core_ooo
     // fence.i and holds the frontend until dcache_flush_done (memsys writes back
     // all dirty L1D lines). Under L1=0/C1 the memsys completes it immediately.
     output logic             dcache_flush_req,
-    input  logic             dcache_flush_done,
+    input wire logic             dcache_flush_done,
     // Cache event pulses from the memsys for mhpmcounter3-5 (phase C3).
-    input  logic             hpm_l1i_miss,
-    input  logic             hpm_l1d_miss,
-    input  logic             hpm_l1d_wb,
+    input wire logic             hpm_l1i_miss,
+    input wire logic             hpm_l1d_miss,
+    input wire logic             hpm_l1d_wb,
 
     output logic             halted
 );
@@ -1368,6 +1368,11 @@ module riscv_core_ooo
         .precise_exception
     );
 
+    // Shadow architectural register file: write-only (read addrs tied to 0, read
+    // data unused) -- it exists purely for the sim register-file dump. Excluded
+    // from synthesis (the lab register_file.sv carries a `string`-based dump that
+    // is not synthesizable, and the shadow state has no datapath function).
+`ifndef SYNTHESIS
     register_file #(.WAYS(OOO_WIDTH), .FORWARD(0)) ArchitecturalRF (
         .clk,
         .rst_l,
@@ -1380,6 +1385,10 @@ module riscv_core_ooo
         .rs1_data(arch_rs1_data),
         .rs2_data(arch_rs2_data)
     );
+`else
+    assign arch_rs1_data = '0;
+    assign arch_rs2_data = '0;
+`endif
 
     always_comb begin
         direct_lookup_valid = 1'b0;

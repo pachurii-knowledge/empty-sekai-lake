@@ -5,11 +5,11 @@
 module ooo_branch_recovery
     import OOO_Types::*;
 (
-    input  writeback_packet_t branch_writeback,
-    input  branch_mask_t      stack_reset_mask,
-    input  branch_mask_t      stack_abort_mask,
-    input  logic              stack_restore_valid,
-    input  logic [XLEN-1:0]   fetch_pc_plus4,
+    input wire writeback_packet_t branch_writeback,
+    input wire branch_mask_t      stack_reset_mask,
+    input wire branch_mask_t      stack_abort_mask,
+    input wire logic              stack_restore_valid,
+    input wire logic [XLEN-1:0]   fetch_pc_plus4,
     output logic              resolve_valid,
     output branch_id_t        resolve_id,
     output logic              resolve_mispredict,

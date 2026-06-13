@@ -38,8 +38,8 @@
  **/
 module mux
     #(parameter INPUTS=0, WIDTH=0)
-    (input  logic [INPUTS-1:0][WIDTH-1:0]   in,
-     input  logic [$clog2(INPUTS)-1:0]      sel,
+    (input wire logic [INPUTS-1:0][WIDTH-1:0]   in,
+     input wire logic [$clog2(INPUTS)-1:0]      sel,
      output logic [WIDTH-1:0]               out);
 
     assign out = in[sel];
@@ -64,8 +64,8 @@ endmodule: mux
  **/
 module adder
     #(parameter WIDTH=0)
-    (input  logic               cin,
-     input  logic [WIDTH-1:0]   A, B,
+    (input wire logic               cin,
+     input wire logic [WIDTH-1:0]   A, B,
      output logic               cout,
      output logic [WIDTH-1:0]   sum);
 
@@ -101,8 +101,8 @@ endmodule: adder
 module register
    #(parameter                      WIDTH=0,
      parameter logic [WIDTH-1:0]    RESET_VAL='b0)
-    (input  logic               clk, en, rst_l, clear,
-     input  logic [WIDTH-1:0]   D,
+    (input wire logic               clk, en, rst_l, clear,
+     input wire logic [WIDTH-1:0]   D,
      output logic [WIDTH-1:0]   Q);
 
      always_ff @(posedge clk, negedge rst_l) begin
@@ -118,8 +118,8 @@ endmodule:register
 
 
 module counter
-  (input logic clk, rst_l, clear,
-   input logic counter_en,
+  (input wire logic clk, rst_l, clear,
+   input wire logic counter_en,
    output logic [3:0] counter_value);
 
   always_ff @(posedge clk, negedge rst_l) begin

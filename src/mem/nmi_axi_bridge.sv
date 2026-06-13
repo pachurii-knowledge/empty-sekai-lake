@@ -21,17 +21,17 @@ module nmi_axi_bridge
     import RISCV_ISA::XLEN_BYTES;
     import NIIGO_Mem::*;
 (
-    input  logic clk,
-    input  logic rst_l,
+    input wire logic clk,
+    input wire logic rst_l,
 
     // ---- NMI slave ----
-    input  nmi_req_t  nmi_req,
+    input wire nmi_req_t  nmi_req,
     output logic      nmi_req_ready,
     output nmi_resp_t nmi_resp,
 
     // ---- AXI4 master: write address ----
     output logic                  axi_awvalid,
-    input  logic                  axi_awready,
+    input wire logic                  axi_awready,
     output logic [AXI_ADDR_W-1:0] axi_awaddr,
     output logic [AXI_ID_W-1:0]   axi_awid,
     output logic [7:0]            axi_awlen,
@@ -39,30 +39,30 @@ module nmi_axi_bridge
     output logic [1:0]            axi_awburst,
     // ---- write data ----
     output logic                  axi_wvalid,
-    input  logic                  axi_wready,
+    input wire logic                  axi_wready,
     output logic [AXI_DATA_W-1:0] axi_wdata,
     output logic [AXI_STRB_W-1:0] axi_wstrb,
     output logic                  axi_wlast,
     // ---- write response ----
-    input  logic                  axi_bvalid,
+    input wire logic                  axi_bvalid,
     output logic                  axi_bready,
-    input  logic [AXI_ID_W-1:0]   axi_bid,
-    input  logic [1:0]            axi_bresp,
+    input wire logic [AXI_ID_W-1:0]   axi_bid,
+    input wire logic [1:0]            axi_bresp,
     // ---- read address ----
     output logic                  axi_arvalid,
-    input  logic                  axi_arready,
+    input wire logic                  axi_arready,
     output logic [AXI_ADDR_W-1:0] axi_araddr,
     output logic [AXI_ID_W-1:0]   axi_arid,
     output logic [7:0]            axi_arlen,
     output logic [2:0]            axi_arsize,
     output logic [1:0]            axi_arburst,
     // ---- read data ----
-    input  logic                  axi_rvalid,
+    input wire logic                  axi_rvalid,
     output logic                  axi_rready,
-    input  logic [AXI_ID_W-1:0]   axi_rid,
-    input  logic [AXI_DATA_W-1:0] axi_rdata,
-    input  logic [1:0]            axi_rresp,
-    input  logic                  axi_rlast
+    input wire logic [AXI_ID_W-1:0]   axi_rid,
+    input wire logic [AXI_DATA_W-1:0] axi_rdata,
+    input wire logic [1:0]            axi_rresp,
+    input wire logic                  axi_rlast
 );
 
     localparam int SHIFT = $clog2(XLEN_BYTES);

@@ -5,18 +5,18 @@
 module int_issue_queue
     import OOO_Types::*;
 (
-    input  logic                 clk,
-    input  logic                 rst_l,
-    input  logic [OOO_WIDTH-1:0] insert_valid,
-    input  issue_entry_t         insert_entry [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0] wakeup_valid,
-    input  phys_reg_t            wakeup_prd [OOO_WIDTH],
-    input  logic [FU_ISSUE_PORTS-1:0] issue_ready,
-    input  branch_mask_t         reset_mask,
-    input  branch_mask_t         abort_mask,
+    input wire logic                 clk,
+    input wire logic                 rst_l,
+    input wire logic [OOO_WIDTH-1:0] insert_valid,
+    input wire issue_entry_t         insert_entry [OOO_WIDTH],
+    input wire logic [OOO_WIDTH-1:0] wakeup_valid,
+    input wire phys_reg_t            wakeup_prd [OOO_WIDTH],
+    input wire logic [FU_ISSUE_PORTS-1:0] issue_ready,
+    input wire branch_mask_t         reset_mask,
+    input wire branch_mask_t         abort_mask,
     // Full pipeline flush on a precise trap / interrupt / trap-return: discard
     // every queued instruction (all are younger than the trapping instruction).
-    input  logic                 flush,
+    input wire logic                 flush,
     output logic                 full,
     output logic [FU_ISSUE_PORTS-1:0] issue_valid,
     output issue_entry_t         issue_entry [FU_ISSUE_PORTS]

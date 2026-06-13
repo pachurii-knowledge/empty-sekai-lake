@@ -6,17 +6,17 @@
 module ooo_fetch_decode
     import OOO_Types::*;
 (
-    input  logic             rst_l,
-    input  logic             fetch_valid,
-    input  logic             instr_mem_excpt,
+    input wire logic             rst_l,
+    input wire logic             fetch_valid,
+    input wire logic             instr_mem_excpt,
     // Per-lane fetch page/access fault for the fetch group. Bit i corresponds to
     // decode lane i (PC = fetch_pc + 4*i). Translation/execute-permission faults
     // are page-granular (so they set lane 0 only), but PMP can differ per 4-byte
     // word within the 16-byte fetch block, so each lane is checked independently.
-    input  logic [OOO_WIDTH-1:0] fetch_fault_lane,
-    input  logic [4:0]       fetch_fault_cause,  // EXC_INSTR_PAGE_FAULT/ACCESS
-    input  logic [XLEN-1:0]  fetch_pc,
-    input  logic [3:0][31:0] instr,
+    input wire logic [OOO_WIDTH-1:0] fetch_fault_lane,
+    input wire logic [4:0]       fetch_fault_cause,  // EXC_INSTR_PAGE_FAULT/ACCESS
+    input wire logic [XLEN-1:0]  fetch_pc,
+    input wire logic [3:0][31:0] instr,
     output decode_lane_t     decode_lanes [OOO_WIDTH]
 );
 

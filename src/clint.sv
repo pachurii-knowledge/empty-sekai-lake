@@ -29,17 +29,17 @@ module clint
 #(
     parameter logic [31:0] BASE = 32'h0200_0000
 ) (
-    input  logic        clk,
-    input  logic        rst_l,
+    input wire logic        clk,
+    input wire logic        rst_l,
 
     // Data store snoop (memory-word address space: byte addr >> log2(XLEN_BYTES))
-    input  logic        store_en,
-    input  logic [MEMORY_ADDR_WIDTH-1:0] store_waddr,
-    input  logic [XLEN-1:0] store_wdata,
-    input  logic [XLEN_BYTES-1:0] store_mask,
+    input wire logic        store_en,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] store_waddr,
+    input wire logic [XLEN-1:0] store_wdata,
+    input wire logic [XLEN_BYTES-1:0] store_mask,
 
     // Combinational load query
-    input  logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
     output logic        load_hit,
     output logic [XLEN-1:0] load_data,
 

@@ -60,24 +60,24 @@ module niigo_memsys
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
     import NIIGO_Mem::*;
 (
-    input  logic clk,
-    input  logic rst_l,
+    input wire logic clk,
+    input wire logic rst_l,
 
     // ---- Core: instruction fetch port ----
-    input  logic                          ifetch_req_valid,
+    input wire logic                          ifetch_req_valid,
     output logic                          ifetch_req_ready,
-    input  logic [MEMORY_ADDR_WIDTH-1:0]  ifetch_req_addr,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0]  ifetch_req_addr,
     output logic                          ifetch_resp_valid,
     output logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ifetch_resp_data,
     output logic                          ifetch_resp_excpt,
     // fence.i / flush: flash-invalidate the L1I (ignored in the L1=0 build).
-    input  logic                          ifetch_inval,
+    input wire logic                          ifetch_inval,
     // Cacheable/device split for the data port (used at L1D=1; the device hole
     // bypasses the L1D). Ignored by the L1=0/C1 passthrough.
-    input  logic                          dmem_req_device,
+    input wire logic                          dmem_req_device,
     // L1D writeback flush handshake (fence.i + halt). At L1D=1 the L1D walks and
     // writes back all dirty lines; otherwise it completes immediately.
-    input  logic                          dcache_flush_req,
+    input wire logic                          dcache_flush_req,
     output logic                          dcache_flush_done,
     // Cache event pulses for mhpmcounter3-5 (phase C3). Zero in the L1=0 build.
     output logic                          hpm_l1i_miss,
@@ -85,21 +85,21 @@ module niigo_memsys
     output logic                          hpm_l1d_wb,
 
     // ---- Core: data port ----
-    input  logic                          dmem_req_valid,
+    input wire logic                          dmem_req_valid,
     output logic                          dmem_req_ready,
-    input  logic                          dmem_req_write,
-    input  logic [MEMORY_ADDR_WIDTH-1:0]  dmem_req_addr,
-    input  logic [XLEN-1:0]               dmem_req_wdata,
-    input  logic [XLEN_BYTES-1:0]         dmem_req_wmask,
+    input wire logic                          dmem_req_write,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0]  dmem_req_addr,
+    input wire logic [XLEN-1:0]               dmem_req_wdata,
+    input wire logic [XLEN_BYTES-1:0]         dmem_req_wmask,
     output logic                          dmem_resp_valid,
     output logic [MEMORY_ADDR_WIDTH-1:0]  dmem_resp_addr,
     output logic [XLEN-1:0]               dmem_resp_data,
 
     // ---- Core: page-table-walker port ----
-    input  logic                          ptw_req_valid,
-    input  logic                          ptw_req_we,
-    input  logic [MEMORY_ADDR_WIDTH-1:0]  ptw_req_addr,
-    input  logic [XLEN-1:0]               ptw_req_wdata,
+    input wire logic                          ptw_req_valid,
+    input wire logic                          ptw_req_we,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0]  ptw_req_addr,
+    input wire logic [XLEN-1:0]               ptw_req_wdata,
     output logic                          ptw_req_ack,
     output logic [XLEN-1:0]               ptw_resp_rdata,
 
@@ -108,15 +108,50 @@ module niigo_memsys
     output logic [XLEN_BYTES-1:0]         mem_d_store_mask,
     output logic [MEMORY_ADDR_WIDTH-1:0]  mem_d_addr,
     output logic [XLEN-1:0]               mem_d_store_data,
-    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] mem_d_load_data,
-    input  logic                          mem_d_excpt,
+    input wire logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] mem_d_load_data,
+    input wire logic                          mem_d_excpt,
     output logic [MEMORY_ADDR_WIDTH-1:0]  mem_i_addr,
-    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] mem_i_load_data,
-    input  logic                          mem_i_excpt,
+    input wire logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] mem_i_load_data,
+    input wire logic                          mem_i_excpt,
     output logic [MEMORY_ADDR_WIDTH-1:0]  mem_ptw_addr,
     output logic                          mem_ptw_we,
     output logic [XLEN-1:0]               mem_ptw_wdata,
-    input  logic [XLEN-1:0]               mem_ptw_rdata
+    input wire logic [XLEN-1:0]               mem_ptw_rdata
+`ifdef FPGA_BUILD
+    // ---- AXI4-512 master to external DRAM (FPGA build; requires AXI_MEMSYS).
+    //      The sim AXI shim/monitor are replaced by these exposed ports so a SoC
+    //      wrapper (niigo_soc) can drive the shell DRAM controller. ----
+    ,
+    output logic                      m_axi_awvalid,
+    input  wire logic                 m_axi_awready,
+    output logic [AXI_ADDR_W-1:0]     m_axi_awaddr,
+    output logic [AXI_ID_W-1:0]       m_axi_awid,
+    output logic [7:0]                m_axi_awlen,
+    output logic [2:0]                m_axi_awsize,
+    output logic [1:0]                m_axi_awburst,
+    output logic                      m_axi_wvalid,
+    input  wire logic                 m_axi_wready,
+    output logic [AXI_DATA_W-1:0]     m_axi_wdata,
+    output logic [AXI_STRB_W-1:0]     m_axi_wstrb,
+    output logic                      m_axi_wlast,
+    input  wire logic                 m_axi_bvalid,
+    output logic                      m_axi_bready,
+    input  wire logic [AXI_ID_W-1:0]  m_axi_bid,
+    input  wire logic [1:0]           m_axi_bresp,
+    output logic                      m_axi_arvalid,
+    input  wire logic                 m_axi_arready,
+    output logic [AXI_ADDR_W-1:0]     m_axi_araddr,
+    output logic [AXI_ID_W-1:0]       m_axi_arid,
+    output logic [7:0]                m_axi_arlen,
+    output logic [2:0]                m_axi_arsize,
+    output logic [1:0]                m_axi_arburst,
+    input  wire logic                 m_axi_rvalid,
+    output logic                      m_axi_rready,
+    input  wire logic [AXI_ID_W-1:0]  m_axi_rid,
+    input  wire logic [AXI_DATA_W-1:0] m_axi_rdata,
+    input  wire logic [1:0]           m_axi_rresp,
+    input  wire logic                 m_axi_rlast
+`endif
 );
 
     // Fixed response latencies for the default (non-fuzz) configuration
@@ -612,6 +647,31 @@ module niigo_memsys
         .axi_rdata(ax_rdata), .axi_rresp(ax_rresp), .axi_rlast(ax_rlast)
     );
 
+`ifdef FPGA_BUILD
+    // FPGA: expose the bridge's AXI master to the SoC boundary (external DRAM).
+    // No sim protocol monitor / shim; the sim main_memory ports are unused.
+    assign m_axi_awvalid = ax_awvalid;   assign ax_awready    = m_axi_awready;
+    assign m_axi_awaddr  = ax_awaddr;    assign m_axi_awid    = ax_awid;
+    assign m_axi_awlen   = ax_awlen;     assign m_axi_awsize  = ax_awsize;
+    assign m_axi_awburst = ax_awburst;
+    assign m_axi_wvalid  = ax_wvalid;    assign ax_wready     = m_axi_wready;
+    assign m_axi_wdata   = ax_wdata;     assign m_axi_wstrb   = ax_wstrb;
+    assign m_axi_wlast   = ax_wlast;
+    assign ax_bvalid     = m_axi_bvalid; assign m_axi_bready  = ax_bready;
+    assign ax_bid        = m_axi_bid;    assign ax_bresp      = m_axi_bresp;
+    assign m_axi_arvalid = ax_arvalid;   assign ax_arready    = m_axi_arready;
+    assign m_axi_araddr  = ax_araddr;    assign m_axi_arid    = ax_arid;
+    assign m_axi_arlen   = ax_arlen;     assign m_axi_arsize  = ax_arsize;
+    assign m_axi_arburst = ax_arburst;
+    assign ax_rvalid     = m_axi_rvalid; assign m_axi_rready  = ax_rready;
+    assign ax_rid        = m_axi_rid;    assign ax_rdata      = m_axi_rdata;
+    assign ax_rresp      = m_axi_rresp;  assign ax_rlast      = m_axi_rlast;
+    assign mem_i_addr    = '0;
+    assign adp_wr_en     = 1'b0;  assign adp_wr_addr = '0;
+    assign adp_wr_data   = '0;    assign adp_wr_mask = '0;
+    logic unused_fpga_in;
+    assign unused_fpga_in = mem_i_excpt | (|mem_i_load_data);
+`else
     axi_chk Chk (
         .clk, .rst_l,
         .axi_awvalid(ax_awvalid), .axi_awready(ax_awready), .axi_awaddr(ax_awaddr),
@@ -639,6 +699,7 @@ module niigo_memsys
         .mem_wr_data(adp_wr_data), .mem_wr_mask(adp_wr_mask)
     );
     logic unused_axi_excpt; assign unused_axi_excpt = mem_i_excpt;
+`endif
 `else
     nmi_mem_adapter Adapter (
         .clk, .rst_l,

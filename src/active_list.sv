@@ -5,34 +5,34 @@
 module active_list
     import OOO_Types::*;
 (
-    input  logic                  clk,
-    input  logic                  rst_l,
-    input  logic                  restore_valid,
-    input  active_id_t            restore_tail,
+    input wire logic                  clk,
+    input wire logic                  rst_l,
+    input wire logic                  restore_valid,
+    input wire active_id_t            restore_tail,
     // Full pipeline flush on a precise trap / interrupt / trap-return. Unlike a
     // branch restore (which rolls back to a checkpoint), this squashes every
     // entry still in flight behind the committing (trapping) instruction. The
     // trapping instruction itself still commits this cycle via the loop above;
     // `flush` then discards everything younger.
-    input  logic                  flush,
-    input  logic [OOO_WIDTH-1:0]  allocate_valid,
-    input  rename_packet_t        allocate_packet [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0]  writeback_valid,
-    input  active_id_t            writeback_id [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0][XLEN-1:0] writeback_data,
-    input  logic [OOO_WIDTH-1:0]  writeback_exception,
-    input  logic [OOO_WIDTH-1:0][4:0] writeback_exc_cause,
-    input  logic [OOO_WIDTH-1:0]  writeback_halted,
-    input  logic [OOO_WIDTH-1:0]  writeback_fp_write,
-    input  arch_reg_t             writeback_fp_rd [OOO_WIDTH],
-    input  fp_reg_data_t          writeback_fp_data [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0]  writeback_csr_write,
-    input  logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr,
-    input  logic [OOO_WIDTH-1:0][XLEN-1:0] writeback_csr_wdata,
-    input  logic [OOO_WIDTH-1:0]  writeback_fp_fflags_valid,
-    input  logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags,
-    input  branch_mask_t          reset_mask,
-    input  branch_mask_t          abort_mask,
+    input wire logic                  flush,
+    input wire logic [OOO_WIDTH-1:0]  allocate_valid,
+    input wire rename_packet_t        allocate_packet [OOO_WIDTH],
+    input wire logic [OOO_WIDTH-1:0]  writeback_valid,
+    input wire active_id_t            writeback_id [OOO_WIDTH],
+    input wire logic [OOO_WIDTH-1:0][XLEN-1:0] writeback_data,
+    input wire logic [OOO_WIDTH-1:0]  writeback_exception,
+    input wire logic [OOO_WIDTH-1:0][4:0] writeback_exc_cause,
+    input wire logic [OOO_WIDTH-1:0]  writeback_halted,
+    input wire logic [OOO_WIDTH-1:0]  writeback_fp_write,
+    input wire arch_reg_t             writeback_fp_rd [OOO_WIDTH],
+    input wire fp_reg_data_t          writeback_fp_data [OOO_WIDTH],
+    input wire logic [OOO_WIDTH-1:0]  writeback_csr_write,
+    input wire logic [OOO_WIDTH-1:0][11:0] writeback_csr_addr,
+    input wire logic [OOO_WIDTH-1:0][XLEN-1:0] writeback_csr_wdata,
+    input wire logic [OOO_WIDTH-1:0]  writeback_fp_fflags_valid,
+    input wire logic [OOO_WIDTH-1:0][4:0] writeback_fp_fflags,
+    input wire branch_mask_t          reset_mask,
+    input wire branch_mask_t          abort_mask,
     // Which presented commit lanes the commit unit actually retired this
     // cycle (a prefix of commit_valid). Only taken entries are popped; a
     // held lane -- e.g. a store whose write the memory port cannot accept
@@ -42,7 +42,7 @@ module active_list
     // for its commit_store pulse (a deadlock the N2 memory-latency fuzzer
     // exposed; unreachable before N1 because store_port_busy could never
     // coincide with a store at the ROB head under the fixed-latency port).
-    input  logic [OOO_WIDTH-1:0]  commit_taken,
+    input wire logic [OOO_WIDTH-1:0]  commit_taken,
     output logic                  full,
     output logic                  empty,
     output active_id_t            tail,

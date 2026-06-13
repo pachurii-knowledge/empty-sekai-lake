@@ -17,17 +17,17 @@ module l1_data_array #(
     parameter int WAYS      = 4,
     parameter int LINE_BITS = 512
 ) (
-    input  logic clk,
+    input wire logic clk,
     // Read port: registered output (sync read).
-    input  logic                         ren,
-    input  logic [$clog2(SETS)-1:0]      ridx,
+    input wire logic                         ren,
+    input wire logic [$clog2(SETS)-1:0]      ridx,
     output logic [WAYS-1:0][LINE_BITS-1:0] rdata,
     // Write port: one way, byte-masked.
-    input  logic                         wen,
-    input  logic [$clog2(SETS)-1:0]      widx,
-    input  logic [$clog2(WAYS)-1:0]      wway,
-    input  logic [LINE_BITS-1:0]         wdata,
-    input  logic [LINE_BITS/8-1:0]       wmask     // per-byte enable
+    input wire logic                         wen,
+    input wire logic [$clog2(SETS)-1:0]      widx,
+    input wire logic [$clog2(WAYS)-1:0]      wway,
+    input wire logic [LINE_BITS-1:0]         wdata,
+    input wire logic [LINE_BITS/8-1:0]       wmask     // per-byte enable
 );
 
     localparam int BYTES = LINE_BITS/8;

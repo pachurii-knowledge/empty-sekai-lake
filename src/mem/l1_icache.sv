@@ -23,30 +23,30 @@ module l1_icache
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
     import NIIGO_Mem::*;
 (
-    input  logic clk,
-    input  logic rst_l,
+    input wire logic clk,
+    input wire logic rst_l,
 
     // ---- Core instruction-fetch port (handshaked; combinational accept) ----
-    input  logic                                    ifetch_req_valid,
+    input wire logic                                    ifetch_req_valid,
     output logic                                    ifetch_req_ready,
-    input  logic [MEMORY_ADDR_WIDTH-1:0]            ifetch_req_addr,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0]            ifetch_req_addr,
     output logic                                    ifetch_resp_valid,
     output logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0]  ifetch_resp_data,
     output logic                                    ifetch_resp_excpt,
 
     // ---- fence.i / flush: flash-invalidate all lines (single-cycle pulse) ----
-    input  logic                                    inval_all,
+    input wire logic                                    inval_all,
 
     // ---- C4b coherence snoop: a committed D-store to snoop_waddr invalidates
     //      any L1I copy of that line (single-cycle pulse; word address). Uses
     //      the tag array's 2nd read port, so it never stalls the fetch port. ----
-    input  logic                                    snoop_valid,
-    input  logic [MEMORY_ADDR_WIDTH-1:0]            snoop_waddr,
+    input wire logic                                    snoop_valid,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0]            snoop_waddr,
 
     // ---- NMI master ----
     output nmi_req_t                                nmi_req,
-    input  logic                                    nmi_req_ready,
-    input  nmi_resp_t                               nmi_resp,
+    input wire logic                                    nmi_req_ready,
+    input wire nmi_resp_t                               nmi_resp,
 
     // ---- C3 observability (pulses; unused until C3 wires them) ----
     output logic                                    ev_access,

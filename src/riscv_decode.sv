@@ -53,8 +53,8 @@
  *                      instruction correctly.
  **/
 module riscv_decode
-    (input  logic           rst_l,
-     input  logic [31:0]    instr,
+    (input wire logic           rst_l,
+     input wire logic [31:0]    instr,
      output ctrl_signals_t  ctrl_signals);
 
     // Import all of the ISA types and enums (opcodes, functions codes, etc.)

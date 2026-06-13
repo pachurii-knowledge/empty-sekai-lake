@@ -19,18 +19,18 @@
 module trap_controller
     import RISCV_Priv::*;
 (
-    input  priv_mode_t  priv,
-    input  logic [MXLEN-1:0] mstatus,
-    input  logic [MXLEN-1:0] mie_csr,
-    input  logic [MXLEN-1:0] mip_csr,
-    input  logic [MXLEN-1:0] medeleg,
-    input  logic [MXLEN-1:0] mideleg,
-    input  logic [MXLEN-1:0] mtvec,
-    input  logic [MXLEN-1:0] stvec,
+    input wire priv_mode_t  priv,
+    input wire logic [MXLEN-1:0] mstatus,
+    input wire logic [MXLEN-1:0] mie_csr,
+    input wire logic [MXLEN-1:0] mip_csr,
+    input wire logic [MXLEN-1:0] medeleg,
+    input wire logic [MXLEN-1:0] mideleg,
+    input wire logic [MXLEN-1:0] mtvec,
+    input wire logic [MXLEN-1:0] stvec,
 
     // Synchronous exception request from the committing instruction
-    input  logic        exc_valid,
-    input  logic [4:0]  exc_cause,
+    input wire logic        exc_valid,
+    input wire logic [4:0]  exc_cause,
 
     output logic        trap_valid,
     output logic        trap_is_interrupt,

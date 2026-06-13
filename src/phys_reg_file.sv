@@ -12,13 +12,13 @@ module phys_reg_file
     parameter int READ_PORTS = OOO_WIDTH
 )
 (
-    input  logic                 clk,
-    input  logic                 rst_l,
-    input  phys_reg_t            rs1 [READ_PORTS],
-    input  phys_reg_t            rs2 [READ_PORTS],
-    input  logic [OOO_WIDTH-1:0] write_valid,
-    input  phys_reg_t            write_prd [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0][XLEN-1:0] write_data,
+    input wire logic                 clk,
+    input wire logic                 rst_l,
+    input wire phys_reg_t            rs1 [READ_PORTS],
+    input wire phys_reg_t            rs2 [READ_PORTS],
+    input wire logic [OOO_WIDTH-1:0] write_valid,
+    input wire phys_reg_t            write_prd [OOO_WIDTH],
+    input wire logic [OOO_WIDTH-1:0][XLEN-1:0] write_data,
     output logic [READ_PORTS-1:0][XLEN-1:0] rs1_data,
     output logic [READ_PORTS-1:0][XLEN-1:0] rs2_data
 );

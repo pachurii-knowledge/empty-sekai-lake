@@ -26,23 +26,23 @@ module l1_dcache
     import RISCV_UArch::MEMORY_ADDR_WIDTH;
     import NIIGO_Mem::*;
 (
-    input  logic clk,
-    input  logic rst_l,
+    input wire logic clk,
+    input wire logic rst_l,
 
     // ---- Unified D request (from the front arbiter) ----
-    input  logic                          req_valid,
+    input wire logic                          req_valid,
     output logic                          req_ready,
-    input  logic                          req_write,
-    input  logic [MEMORY_ADDR_WIDTH-1:0]  req_waddr,
-    input  logic [XLEN-1:0]               req_wdata,
-    input  logic [XLEN_BYTES-1:0]         req_wmask,
+    input wire logic                          req_write,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0]  req_waddr,
+    input wire logic [XLEN-1:0]               req_wdata,
+    input wire logic [XLEN_BYTES-1:0]         req_wmask,
     output logic                          resp_valid,    // load data this cycle
     output logic [XLEN-1:0]               resp_data,
     output logic [MEMORY_ADDR_WIDTH-1:0]  resp_addr,     // echo (word addr)
     output logic                          wr_accept,     // store accepted (PTW write ack)
 
     // ---- Flush: write back all dirty lines (fence.i + halt) ----
-    input  logic                          flush_req,
+    input wire logic                          flush_req,
     output logic                          flush_done,
 
     // ---- C4a coherence probe (clean-before-refill) ----
@@ -51,14 +51,14 @@ module l1_dcache
     // written back here first; probe_clean then rises and the memsys releases
     // the held I-refill so it reads the now-current line from memory. A probe
     // miss / clean hit raises probe_clean immediately. The line stays valid.
-    input  logic                          probe_valid,
-    input  logic [MEMORY_ADDR_WIDTH-1:0]  probe_waddr,
+    input wire logic                          probe_valid,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0]  probe_waddr,
     output logic                          probe_clean,
 
     // ---- NMI master ----
     output nmi_req_t                      nmi_req,
-    input  logic                          nmi_req_ready,
-    input  nmi_resp_t                     nmi_resp,
+    input wire logic                          nmi_req_ready,
+    input wire nmi_resp_t                     nmi_resp,
 
     // ---- C3 observability (pulses) ----
     output logic                          ev_access,

@@ -5,21 +5,21 @@
 module branch_stack
     import OOO_Types::*;
 (
-    input  logic                         clk,
-    input  logic                         rst_l,
-    input  logic                         allocate,
-    input  active_id_t                   active_tail_snapshot,
-    input  logic [$clog2(PHYS_REGS)-1:0] free_head_snapshot,
-    input  logic [$clog2(PHYS_REGS)-1:0] free_tail_snapshot,
-    input  logic [$clog2(PHYS_REGS+1)-1:0] free_count_snapshot,
-    input  phys_reg_t                    map_snapshot [32],
-    input  logic                         resolve,
-    input  branch_id_t                   resolve_id,
-    input  logic                         mispredict,
+    input wire logic                         clk,
+    input wire logic                         rst_l,
+    input wire logic                         allocate,
+    input wire active_id_t                   active_tail_snapshot,
+    input wire logic [$clog2(PHYS_REGS)-1:0] free_head_snapshot,
+    input wire logic [$clog2(PHYS_REGS)-1:0] free_tail_snapshot,
+    input wire logic [$clog2(PHYS_REGS+1)-1:0] free_count_snapshot,
+    input wire phys_reg_t                    map_snapshot [32],
+    input wire logic                         resolve,
+    input wire branch_id_t                   resolve_id,
+    input wire logic                         mispredict,
     // Precise-trap flush: clear all outstanding branch checkpoints (all are
     // younger than the trapping instruction). The architectural map/free state
     // is restored separately by the core's RRAT/committed-free-head rollback.
-    input  logic                         flush,
+    input wire logic                         flush,
     output logic                         full,
     output logic                         allocate_valid,
     output branch_id_t                   allocate_id,

@@ -44,21 +44,21 @@ module uart
 #(
     parameter logic [31:0] BASE = 32'h0D00_0000
 ) (
-    input  logic        clk,
-    input  logic        rst_l,
+    input wire logic        clk,
+    input wire logic        rst_l,
 
     // Data store snoop (memory-word address space)
-    input  logic        store_en,
-    input  logic [MEMORY_ADDR_WIDTH-1:0] store_waddr,
-    input  logic [XLEN-1:0] store_wdata,
-    input  logic [XLEN_BYTES-1:0] store_mask,
+    input wire logic        store_en,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] store_waddr,
+    input wire logic [XLEN-1:0] store_wdata,
+    input wire logic [XLEN_BYTES-1:0] store_mask,
 
     // Combinational load query; load_en marks the cycle the load is consumed
     // (so RBR/IIR read side effects are not taken speculatively). head_load_off
     // is the byte offset of the consuming load within the bus word.
-    input  logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
-    input  logic        load_en,
-    input  logic [$clog2(XLEN_BYTES)-1:0] load_off,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
+    input wire logic        load_en,
+    input wire logic [$clog2(XLEN_BYTES)-1:0] load_off,
     output logic        load_hit,
     output logic [XLEN-1:0] load_data,
 
@@ -88,9 +88,12 @@ module uart
     assign rx_int = rx_valid_q     & ier_q[0];
     assign tx_int = thre_pending_q & ier_q[1];
 
-    // RX injection from +uart_in=<string>
+    // RX injection from +uart_in=<string> (simulation only; the FPGA vUART
+    // drives RX through real serial logic -- FB1). `string` is not synthesizable.
+`ifndef SYNTHESIS
     string rx_str;
     int    rx_idx;
+`endif
 
     // Map a byte address to a register index 0..7, or 4'hF if out of range.
     function automatic logic [3:0] reg_index(input logic [31:0] baddr);
@@ -106,8 +109,10 @@ module uart
             ier_q <= 8'h0; fcr_q <= 8'h0; lcr_q <= 8'h0; mcr_q <= 8'h0;
             scr_q <= 8'h0; dll_q <= 8'h0; dlm_q <= 8'h0;
             rx_data_q <= 8'h0; rx_valid_q <= 1'b0; thre_pending_q <= 1'b0;
+`ifndef SYNTHESIS
             rx_idx <= 0;
             if (!$value$plusargs("uart_in=%s", rx_str)) rx_str = "";
+`endif
         end else begin
             // Register writes (committed stores), decoded per 32-bit subword.
             // The written byte is wsub[7:0] (a register is at a 4-byte-aligned
@@ -131,8 +136,10 @@ module uart
                                         rx_data_q  <= wsub[7:0];
                                         rx_valid_q <= 1'b1;
                                     end else begin
+`ifndef SYNTHESIS
                                         $write("%c", wsub[7:0]);
                                         $fflush();
+`endif
                                     end
                                     thre_pending_q <= 1'b1;  // TX empties at once
                                 end
@@ -168,12 +175,15 @@ module uart
             end
 
             // Deliver the next injected RX byte once the previous is consumed
-            // (not while looping back, which drives RBR itself).
+            // (not while looping back, which drives RBR itself). Simulation only;
+            // the FPGA vUART (FB1) injects RX through real serial logic.
+`ifndef SYNTHESIS
             if (!rx_valid_q && !mcr_q[4] && rx_idx < rx_str.len()) begin
                 rx_data_q  <= 8'(rx_str[rx_idx]);
                 rx_valid_q <= 1'b1;
                 rx_idx     <= rx_idx + 1;
             end
+`endif
         end
     end
 

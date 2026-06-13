@@ -5,14 +5,14 @@
 module busy_table
     import OOO_Types::*;
 (
-    input  logic                 clk,
-    input  logic                 rst_l,
-    input  logic [OOO_WIDTH-1:0] allocate_valid,
-    input  phys_reg_t            allocate_prd [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0] writeback_valid,
-    input  phys_reg_t            writeback_prd [OOO_WIDTH],
-    input  phys_reg_t            src1_prd [OOO_WIDTH],
-    input  phys_reg_t            src2_prd [OOO_WIDTH],
+    input wire logic                 clk,
+    input wire logic                 rst_l,
+    input wire logic [OOO_WIDTH-1:0] allocate_valid,
+    input wire phys_reg_t            allocate_prd [OOO_WIDTH],
+    input wire logic [OOO_WIDTH-1:0] writeback_valid,
+    input wire phys_reg_t            writeback_prd [OOO_WIDTH],
+    input wire phys_reg_t            src1_prd [OOO_WIDTH],
+    input wire phys_reg_t            src2_prd [OOO_WIDTH],
     output logic [OOO_WIDTH-1:0] src1_ready,
     output logic [OOO_WIDTH-1:0] src2_ready
 );

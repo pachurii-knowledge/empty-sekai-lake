@@ -17,6 +17,14 @@
 `ifndef INTERNAL_DEFINES_VH_
 `define INTERNAL_DEFINES_VH_
 
+// These shared control/ALU types live in a package (not at $unit scope) so that
+// other packages -- notably OOO_Types -- can reference them without tripping
+// Vivado's package-cannot-reference-$unit rule (Synth 8-10854). The trailing
+// `import Internal_Defines::*` re-exports them into $unit so the many modules
+// that `include` this header keep seeing the types unqualified, exactly as
+// before (the codebase already assumes a single shared compilation unit).
+package Internal_Defines;
+
 // 2nd operand immediate mode
 typedef enum logic [2:0] {
     IMM_I,
@@ -222,5 +230,11 @@ typedef struct packed {
     logic       fetch_fault;
     logic [4:0] fetch_fault_cause; // EXC_INSTR_PAGE_FAULT or EXC_INSTR_ACCESS
 } ctrl_signals_t;
+
+endpackage : Internal_Defines
+
+// Re-export into $unit for backward compatibility: modules that `include` this
+// header use the types unqualified (e.g. `alu_op_t`, `ctrl_signals_t`).
+import Internal_Defines::*;
 
 `endif /* INTERNAL_DEFINES_VH_ */

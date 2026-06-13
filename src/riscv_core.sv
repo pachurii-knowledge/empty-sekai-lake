@@ -21,38 +21,38 @@ module riscv_core
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
 `ifdef OOO_4WIDE
 (
-    input  logic             clk, rst_l,
+    input wire logic             clk, rst_l,
     // Instruction-fetch port (handshaked; see riscv_core_ooo)
     output logic             ifetch_req_valid,
-    input  logic             ifetch_req_ready,
+    input wire logic             ifetch_req_ready,
     output logic [MEMORY_ADDR_WIDTH-1:0] ifetch_req_addr,
-    input  logic             ifetch_resp_valid,
-    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ifetch_resp_data,
-    input  logic             ifetch_resp_excpt,
+    input wire logic             ifetch_resp_valid,
+    input wire logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] ifetch_resp_data,
+    input wire logic             ifetch_resp_excpt,
     // Data port (handshaked)
     output logic             dmem_req_valid,
-    input  logic             dmem_req_ready,
+    input wire logic             dmem_req_ready,
     output logic             dmem_req_write,
     output logic [MEMORY_ADDR_WIDTH-1:0] dmem_req_addr,
     output logic [XLEN-1:0]  dmem_req_wdata,
     output logic [XLEN_BYTES-1:0]        dmem_req_wmask,
-    input  logic             dmem_resp_valid,
-    input  logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
-    input  logic [XLEN-1:0]  dmem_resp_data,
+    input wire logic             dmem_resp_valid,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
+    input wire logic [XLEN-1:0]  dmem_resp_data,
     // Page-table-walk port (req/ack)
     output logic             ptw_mem_req,
     output logic             ptw_mem_we,
     output logic [MEMORY_ADDR_WIDTH-1:0] ptw_mem_addr_w,
     output logic [XLEN-1:0]  ptw_mem_wdata,
-    input  logic             ptw_mem_ack,
-    input  logic [XLEN-1:0]  ptw_mem_rdata,
+    input wire logic             ptw_mem_ack,
+    input wire logic [XLEN-1:0]  ptw_mem_rdata,
     output logic             ifetch_inval,
     output logic             dmem_req_device,
     output logic             dcache_flush_req,
-    input  logic             dcache_flush_done,
-    input  logic             hpm_l1i_miss,
-    input  logic             hpm_l1d_miss,
-    input  logic             hpm_l1d_wb,
+    input wire logic             dcache_flush_done,
+    input wire logic             hpm_l1i_miss,
+    input wire logic             hpm_l1d_miss,
+    input wire logic             hpm_l1d_wb,
     output logic             halted
 );
 
@@ -92,10 +92,10 @@ module riscv_core
 
 `else /* !OOO_4WIDE: legacy fixed-latency Lab 4 interface */
 (
-    input  logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
-    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr, data_load,
-    input  logic [MEMORY_ADDR_WIDTH-1:0] data_load_addr,
-    input  logic             data_load_valid,
+    input wire logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
+    input wire logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr, data_load,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] data_load_addr,
+    input wire logic             data_load_valid,
     output logic             data_load_en, halted,
     output logic [XLEN_BYTES-1:0]        data_store_mask,
     output logic [MEMORY_ADDR_WIDTH-1:0] instr_addr, data_addr,
@@ -105,7 +105,7 @@ module riscv_core
     output logic [MEMORY_ADDR_WIDTH-1:0] ptw_addr,
     output logic             ptw_we,
     output logic [XLEN-1:0]  ptw_wdata,
-    input  logic [XLEN-1:0]  ptw_rdata
+    input wire logic [XLEN-1:0]  ptw_rdata
 );
 
     generate

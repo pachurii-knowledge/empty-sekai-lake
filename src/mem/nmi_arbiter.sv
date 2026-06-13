@@ -22,18 +22,18 @@ module nmi_arbiter
 #(
     parameter int N_MASTERS = 2
 ) (
-    input  logic clk,
-    input  logic rst_l,
+    input wire logic clk,
+    input wire logic rst_l,
 
     // ---- Masters (index 0 highest priority) ----
-    input  nmi_req_t  m_req   [N_MASTERS],
+    input wire nmi_req_t  m_req   [N_MASTERS],
     output logic      m_ready [N_MASTERS],
     output nmi_resp_t m_resp  [N_MASTERS],
 
     // ---- Downstream NMI ----
     output nmi_req_t  d_req,
-    input  logic      d_ready,
-    input  nmi_resp_t d_resp
+    input wire logic      d_ready,
+    input wire nmi_resp_t d_resp
 );
 
     localparam int SEL_BITS = (N_MASTERS > 1) ? $clog2(N_MASTERS) : 1;

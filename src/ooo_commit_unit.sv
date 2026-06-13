@@ -5,14 +5,14 @@
 module ooo_commit_unit
     import OOO_Types::*;
 (
-    input  logic [OOO_WIDTH-1:0] commit_valid,
-    input  commit_packet_t       commit_packet [OOO_WIDTH],
-    input  logic                 store_port_busy,
+    input wire logic [OOO_WIDTH-1:0] commit_valid,
+    input wire commit_packet_t       commit_packet [OOO_WIDTH],
+    input wire logic                 store_port_busy,
     // The memory subsystem can accept the store's write beat this cycle. A
     // store may only retire when its write can be driven and accepted in the
     // same cycle (the LSQ entry is cleared at commit, so the write cannot be
     // replayed later).
-    input  logic                 store_port_ready,
+    input wire logic                 store_port_ready,
     output logic [OOO_WIDTH-1:0] retire_valid,
     output logic [OOO_WIDTH-1:0] free_valid,
     output phys_reg_t            free_prd [OOO_WIDTH],

@@ -16,10 +16,10 @@
 `default_nettype none
 
 module riscv_core_4wide (
-    input  logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
-    input  logic [3:0][31:0] instr, data_load,
-    input  logic [29:0]      data_load_addr,
-    input  logic             data_load_valid,
+    input wire logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
+    input wire logic [3:0][31:0] instr, data_load,
+    input wire logic [29:0]      data_load_addr,
+    input wire logic             data_load_valid,
     output logic             data_load_en, halted,
     output logic [ 3:0]      data_store_mask,
     output logic [29:0]      instr_addr, data_addr,
@@ -29,7 +29,7 @@ module riscv_core_4wide (
     output logic [29:0]      ptw_addr,
     output logic             ptw_we,
     output logic [31:0]      ptw_wdata,
-    input  logic [31:0]      ptw_rdata
+    input wire logic [31:0]      ptw_rdata
 );
 
     import RISCV_ABI::ECALL_ARG_HALT;

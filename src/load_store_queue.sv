@@ -8,46 +8,46 @@ module load_store_queue
     import RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_ADDR_WIDTH;
 (
-    input  logic                 clk,
-    input  logic                 rst_l,
-    input  logic [OOO_WIDTH-1:0] insert_valid,
-    input  issue_entry_t         insert_entry [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0][XLEN-1:0] insert_rs1_data,
-    input  logic [OOO_WIDTH-1:0][XLEN-1:0] insert_rs2_data,
-    input  logic [OOO_WIDTH-1:0] wakeup_valid,
-    input  phys_reg_t            wakeup_prd [OOO_WIDTH],
-    input  logic [OOO_WIDTH-1:0][XLEN-1:0] wakeup_data,
-    input  branch_mask_t         reset_mask,
-    input  branch_mask_t         abort_mask,
+    input wire logic                 clk,
+    input wire logic                 rst_l,
+    input wire logic [OOO_WIDTH-1:0] insert_valid,
+    input wire issue_entry_t         insert_entry [OOO_WIDTH],
+    input wire logic [OOO_WIDTH-1:0][XLEN-1:0] insert_rs1_data,
+    input wire logic [OOO_WIDTH-1:0][XLEN-1:0] insert_rs2_data,
+    input wire logic [OOO_WIDTH-1:0] wakeup_valid,
+    input wire phys_reg_t            wakeup_prd [OOO_WIDTH],
+    input wire logic [OOO_WIDTH-1:0][XLEN-1:0] wakeup_data,
+    input wire branch_mask_t         reset_mask,
+    input wire branch_mask_t         abort_mask,
     // Full pipeline flush on a precise trap / interrupt / trap-return: discard
     // every queued memory op (all are younger than the trapping instruction).
-    input  logic                 flush,
+    input wire logic                 flush,
     // Data-port load response (delivered by the memory subsystem after an
     // arbitrary >= 1 cycle latency; device reads are muxed into data_load by
     // the core). The queue has at most one load outstanding, so a response
     // always belongs to the single in-flight request (mem_inflight below);
     // no address matching is needed.
-    input  logic                 data_load_valid,
-    input  logic [XLEN-1:0]      data_load,
+    input wire logic                 data_load_valid,
+    input wire logic [XLEN-1:0]      data_load,
     // The memory subsystem can accept a data request (load issue or store
     // write beat) this cycle. Registered upstream; never depends on the
     // request being presented.
-    input  logic                 dmem_req_ready,
-    input  logic                 commit_store,
-    input  active_id_t           commit_store_id,
+    input wire logic                 dmem_req_ready,
+    input wire logic                 commit_store,
+    input wire active_id_t           commit_store_id,
     // Sv32 data-side translation (driven by the core's MMU). When paging_data is
     // low the queue behaves exactly as before (identity mapping). When high, the
     // head's virtual address is exposed for the DTLB lookup, and the core feeds
     // back whether the translation is still walking (xlate_stall) or faulted.
-    input  logic                 paging_data,
-    input  logic                 xlate_stall,
-    input  logic                 xlate_fault,
-    input  logic [4:0]           xlate_cause,
+    input wire logic                 paging_data,
+    input wire logic                 xlate_stall,
+    input wire logic                 xlate_fault,
+    input wire logic [4:0]           xlate_cause,
     // Resolved physical address for the current mem_req_vaddr (driven by the
     // core MMU). Captured during the high-word probe of a cross-word store so
     // the second (fire-and-forget) write beat can target the correct PA after
     // the entry has retired.
-    input  logic [XLEN-1:0]      xlate_pa,
+    input wire logic [XLEN-1:0]      xlate_pa,
     output logic                 mem_req_valid,
     output logic [XLEN-1:0]      mem_req_vaddr,
     output logic                 mem_req_store,

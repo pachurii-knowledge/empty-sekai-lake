@@ -5,19 +5,19 @@
 module ooo_mul_unit
     import OOO_Types::*;
 (
-    input  logic              clk,
-    input  logic              rst_l,
-    input  logic              issue_valid,
+    input wire logic              clk,
+    input wire logic              rst_l,
+    input wire logic              issue_valid,
     output logic              issue_ready,
-    input  issue_entry_t      issue_entry,
-    input  logic [XLEN-1:0]   rs1_data,
-    input  logic [XLEN-1:0]   rs2_data,
-    input  branch_mask_t      abort_mask,
+    input wire issue_entry_t      issue_entry,
+    input wire logic [XLEN-1:0]   rs1_data,
+    input wire logic [XLEN-1:0]   rs2_data,
+    input wire branch_mask_t      abort_mask,
     // Precise-trap full flush: squash every in-flight stage so no stale
     // writeback lands after the pipeline is reset (the active-list id this op
     // targets may be reused by a younger instruction next cycle).
-    input  logic              flush,
-    input  logic              writeback_ready,
+    input wire logic              flush,
+    input wire logic              writeback_ready,
     output writeback_packet_t writeback
 );
 

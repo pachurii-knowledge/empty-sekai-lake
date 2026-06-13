@@ -9,16 +9,16 @@ module ittage_predictor
     parameter int TAG_BITS = 10,
     parameter int HISTORY_BITS = 30
 ) (
-    input  logic            clk,
-    input  logic            rst_l,
-    input  logic            lookup_valid,
-    input  logic [XLEN-1:0] lookup_pc,
+    input wire logic            clk,
+    input wire logic            rst_l,
+    input wire logic            lookup_valid,
+    input wire logic [XLEN-1:0] lookup_pc,
     output logic            prediction_valid,
     output logic [XLEN-1:0] prediction_target,
     output predictor_info_t prediction_info,
-    input  logic            update_valid,
-    input  logic [XLEN-1:0] update_target,
-    input  predictor_info_t update_info
+    input wire logic            update_valid,
+    input wire logic [XLEN-1:0] update_target,
+    input wire predictor_info_t update_info
 );
 
     localparam int ENTRIES = 1 << INDEX_BITS;

@@ -92,10 +92,10 @@ module riscv_core_scalar
     import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_ADDR_WIDTH, RISCV_UArch::MEMORY_READ_WIDTH;
 (
-    input  logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
-    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr, data_load,
-    input  logic [MEMORY_ADDR_WIDTH-1:0]           data_load_addr,
-    input  logic             data_load_valid,
+    input wire logic             clk, rst_l, instr_mem_excpt, data_mem_excpt,
+    input wire logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] instr, data_load,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0]           data_load_addr,
+    input wire logic             data_load_valid,
     output logic             data_load_en, halted,
     output logic [XLEN_BYTES-1:0]        data_store_mask,
     output logic [MEMORY_ADDR_WIDTH-1:0] instr_addr, data_addr,
@@ -105,7 +105,7 @@ module riscv_core_scalar
     output logic [MEMORY_ADDR_WIDTH-1:0] ptw_addr,
     output logic             ptw_we,
     output logic [XLEN-1:0]  ptw_wdata,
-    input  logic [XLEN-1:0]  ptw_rdata
+    input wire logic [XLEN-1:0]  ptw_rdata
 );
 
     // Byte-address -> word-address shift for the word-granular memory bus
@@ -1351,9 +1351,9 @@ endmodule: riscv_core_scalar
 module riscv_alu
     import RISCV_ISA::XLEN;
 (
-    input  logic [XLEN-1:0] alu_src1,
-    input  logic [XLEN-1:0] alu_src2,
-    input  alu_op_t     alu_op,
+    input wire logic [XLEN-1:0] alu_src1,
+    input wire logic [XLEN-1:0] alu_src2,
+    input wire alu_op_t     alu_op,
     output logic [XLEN-1:0] alu_out
 );
 
@@ -1450,9 +1450,9 @@ endmodule
 
 // The forwarding unit for the RISC-V processor
 module riscv_forwarding_unit
-  (input  logic [4:0]  rs1_E, rs2_E, rd_E, 
-   input  logic        RegWrite_E, RegWrite_M1, RegWrite_W,
-   input  logic [4:0]  rd_M1, rd_W, 
+  (input wire logic [4:0]  rs1_E, rs2_E, rd_E, 
+   input wire logic        RegWrite_E, RegWrite_M1, RegWrite_W,
+   input wire logic [4:0]  rd_M1, rd_W, 
    output logic [1:0]  rs1_fwd_sel_E, rs2_fwd_sel_E);
 
   // Forwarding logic for rs1
@@ -1481,10 +1481,10 @@ endmodule: riscv_forwarding_unit
 
 // The ALU source selection unit for the RISC-V processor
 module alu_src2_sel_unit
-  (input  logic [4:0]  rs2_E, rd_E, 
-   input  logic        RegWrite_E, RegWrite_M1, RegWrite_W, 
-   input  ctrl_signals_t ctrl_signals_E,
-   input  logic [4:0]  rd_M1, rd_W, 
+  (input wire logic [4:0]  rs2_E, rd_E, 
+   input wire logic        RegWrite_E, RegWrite_M1, RegWrite_W, 
+   input wire ctrl_signals_t ctrl_signals_E,
+   input wire logic [4:0]  rd_M1, rd_W, 
    output logic [1:0]  alu_src2_sel_E);
 
   // logic for alu_src2_sel
@@ -1507,10 +1507,10 @@ endmodule: alu_src2_sel_unit
 // offset within the (XLEN-byte) memory word, and build the byte-enable mask.
 module riscv_store_unit
     import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
-    (input  logic        memWrite,
-     input  ldst_mode_t  ldst_mode,
-     input  logic [$clog2(XLEN_BYTES)-1:0] data_byte,
-     input  logic [XLEN-1:0] rs2_data,
+    (input wire logic        memWrite,
+     input wire ldst_mode_t  ldst_mode,
+     input wire logic [$clog2(XLEN_BYTES)-1:0] data_byte,
+     input wire logic [XLEN-1:0] rs2_data,
      output logic [XLEN_BYTES-1:0] data_store_mask,
      output logic [XLEN-1:0] data_store);
     logic [XLEN-1:0]       base_data;   // size's bytes in the low position
@@ -1533,9 +1533,9 @@ endmodule: riscv_store_unit
 // zero-extend to XLEN per the size.
 module riscv_load_unit
     import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
-    (input  logic [XLEN-1:0] data_load,
-     input  logic [$clog2(XLEN_BYTES)-1:0] data_byte,
-     input  ldst_mode_t     ldst_mode,
+    (input wire logic [XLEN-1:0] data_load,
+     input wire logic [$clog2(XLEN_BYTES)-1:0] data_byte,
+     input wire ldst_mode_t     ldst_mode,
      output logic [XLEN-1:0] ld_out);
     logic [XLEN-1:0] shifted;
     assign shifted = data_load >> {data_byte, 3'b0};
@@ -1558,9 +1558,9 @@ endmodule: riscv_load_unit
 // 2 bit hyseresis counter, taken should be 1 if the branch is actually taken, 
 // pred_taken is be 1 if the branch is predicted taken
 module hysteresis_counter
-  (input  logic        clk, rst_l,
-   input  logic        taken,
-   input  logic  [1:0] cur_state,
+  (input wire logic        clk, rst_l,
+   input wire logic        taken,
+   input wire logic  [1:0] cur_state,
    output logic  [1:0] pred_state);
 
   // always_comb begin
@@ -1582,8 +1582,8 @@ module hysteresis_counter
 endmodule: hysteresis_counter
 
 module data_stall_unit
-  (input logic clk, rst_l, 
-   input logic read_miss_M1, data_load_valid,
+  (input wire logic clk, rst_l, 
+   input wire logic read_miss_M1, data_load_valid,
    output logic mem_stall);
 
   logic mem_stall_internal;

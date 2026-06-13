@@ -5,15 +5,15 @@
 module ooo_alu_pipe
     import OOO_Types::*;
 (
-    input  logic             clk,
-    input  logic             rst_l,
-    input  logic             issue_valid,
-    input  issue_entry_t     issue_entry,
-    input  logic [XLEN-1:0]  rs1_data,
-    input  logic [XLEN-1:0]  rs2_data,
-    input  logic [XLEN-1:0]  csr_rdata,
-    input  logic             csr_illegal,
-    input  branch_mask_t     abort_mask,
+    input wire logic             clk,
+    input wire logic             rst_l,
+    input wire logic             issue_valid,
+    input wire issue_entry_t     issue_entry,
+    input wire logic [XLEN-1:0]  rs1_data,
+    input wire logic [XLEN-1:0]  rs2_data,
+    input wire logic [XLEN-1:0]  csr_rdata,
+    input wire logic             csr_illegal,
+    input wire branch_mask_t     abort_mask,
     output writeback_packet_t writeback
 );
 
@@ -26,7 +26,11 @@ module ooo_alu_pipe
      * M-mode SBI firmware normally; the run instead terminates via the console
      * watch / HTIF tohost. Default (no plusarg) preserves the test behaviour. */
     logic ecall_halt_en;
+`ifndef SYNTHESIS
     initial ecall_halt_en = !$test$plusargs("no_ecall_halt");
+`else
+    initial ecall_halt_en = 1'b0;  // FPGA: ecalls are real SBI/syscalls, not test halts
+`endif
 
     always_comb begin
         wb_next = '0;
@@ -73,12 +77,14 @@ module ooo_alu_pipe
             // Reported here as an exception that the ROB takes precisely at
             // commit; fetch is kept on an aligned path meanwhile since the
             // misaligned target is never actually executed.
+            // wb_next.redirect_pc already holds actual_target_for(...) from above;
+            // reuse it (indexing a struct field, not a function call -- Vivado
+            // rejects a bit-select directly on a function call, Synth 8-12513).
             if (control_taken(issue_entry, rs1_data, rs2_data) &&
-                    actual_target_for(issue_entry, rs1_data, rs2_data)[1]) begin
+                    wb_next.redirect_pc[1]) begin
                 wb_next.exception = 1'b1;
                 wb_next.exc_cause = 5'd0;   // EXC_INSTR_MISALIGNED
-                wb_next.data =
-                    actual_target_for(issue_entry, rs1_data, rs2_data);
+                wb_next.data = wb_next.redirect_pc;
                 wb_next.redirect_pc = issue_entry.pc + 32'd4;
             end
 
@@ -129,6 +135,16 @@ module ooo_alu_pipe
         endcase
     endfunction
 
+    // FP via a `real` behavioral model. VERIFIED DEAD for FP: every FP op is
+    // decoded EXEC_FP and dispatched to FU_FP -> CVFPU (niigo_fp_unit); the ALU
+    // pipe processes ZERO FP ops (measured: 0 across the F/D ACT suites incl.
+    // FCLASS/FCVT/FCMP, which still pass -- CVFPU produces those GPR results).
+    // This function is still *called* for non-FP entries (where fp_data is
+    // unused, fp_write=0); only its FP branches are unreachable. `real` is not
+    // synthesizable, so under SYNTHESIS a behaviorally-equivalent stub replaces
+    // it (exact for the called, non-FP path; the dead FP branches are dropped).
+    // The `real` model could simply be deleted as a follow-up cleanup.
+`ifndef SYNTHESIS
     function automatic fp_reg_data_t fp_result_for(issue_entry_t entry,
             logic [31:0] int_src);
         real a;
@@ -175,6 +191,16 @@ module ooo_alu_pipe
             fp_result_for = {32'hffff_ffff, s_bits};
         end
     endfunction
+`else
+    function automatic fp_reg_data_t fp_result_for(issue_entry_t entry,
+            logic [31:0] int_src);
+        unique case (entry.ctrl.fp_op)
+            FP_MV_F_X:                   fp_result_for = {32'hffff_ffff, int_src};
+            FP_SGNJ, FP_SGNJN, FP_SGNJX: fp_result_for = fp_sign_result(entry);
+            default:                     fp_result_for = entry.fp_src1_data; // CVFPU drives FP arith
+        endcase
+    endfunction
+`endif
 
     function automatic fp_reg_data_t fp_sign_result(issue_entry_t entry);
         logic [63:0] mag;
@@ -198,6 +224,7 @@ module ooo_alu_pipe
         end
     endfunction
 
+`ifndef SYNTHESIS
     function automatic logic [31:0] fp_gpr_result_for(issue_entry_t entry,
             logic [31:0] int_src);
         real a;
@@ -285,6 +312,18 @@ module ooo_alu_pipe
         end
         pow2 = value;
     endfunction
+`else
+    function automatic logic [31:0] fp_gpr_result_for(issue_entry_t entry,
+            logic [31:0] int_src);
+        unique case (entry.ctrl.fp_op)
+            FP_MV_X:  fp_gpr_result_for = entry.fp_src1_data[31:0];
+            FP_CLASS: fp_gpr_result_for = fp_class(entry);
+            // FEQ/FLT/FLE/FCVT.{W,WU} are EXEC_FP -> CVFPU; unreachable here (the
+            // ALU pipe never executes EXEC_FP), so the default is never taken for FP.
+            default:  fp_gpr_result_for = int_src;
+        endcase
+    endfunction
+`endif
 
     function automatic logic [31:0] fp_class(issue_entry_t entry);
         logic sign;

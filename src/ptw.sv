@@ -22,22 +22,22 @@
 module ptw
     import RISCV_Priv::*;
 (
-    input  logic        clk,
-    input  logic        rst_l,
+    input wire logic        clk,
+    input wire logic        rst_l,
 
     // Translation request
-    input  logic        req_valid,
-    input  logic [VM_VPN_W-1:0] req_vpn,    // vaddr[38:12] / vaddr[31:12]
-    input  logic [VM_PPN_W-1:0] satp_ppn,   // satp.PPN
-    input  logic [1:0]  req_access,     // 0 = fetch, 1 = load, 2 = store
-    input  priv_mode_t  req_priv,       // effective privilege of the access
-    input  logic        mstatus_sum,
-    input  logic        mstatus_mxr,
-    input  logic        adue,           // menvcfg.ADUE: 1=HW A/D update (Svadu),
+    input wire logic        req_valid,
+    input wire logic [VM_VPN_W-1:0] req_vpn,    // vaddr[38:12] / vaddr[31:12]
+    input wire logic [VM_PPN_W-1:0] satp_ppn,   // satp.PPN
+    input wire logic [1:0]  req_access,     // 0 = fetch, 1 = load, 2 = store
+    input wire priv_mode_t  req_priv,       // effective privilege of the access
+    input wire logic        mstatus_sum,
+    input wire logic        mstatus_mxr,
+    input wire logic        adue,           // menvcfg.ADUE: 1=HW A/D update (Svadu),
                                         // 0=fault when an A/D update is needed (Svade)
     // Sv39: the full VA's bits [63:39] do not all equal bit 38 -- the access
     // page-faults without walking. Tied 0 at RV32 (every VA is canonical).
-    input  logic        req_noncanonical,
+    input wire logic        req_noncanonical,
 
     // Memory port (byte addressed)
     output logic        mem_req,
@@ -49,13 +49,13 @@ module ptw
     output logic        mem_is_write,
     output logic [MXLEN-1:0] mem_addr,
     output logic [MXLEN-1:0] mem_wdata,
-    input  logic        mem_ack,
-    input  logic [MXLEN-1:0] mem_rdata,
+    input wire logic        mem_ack,
+    input wire logic [MXLEN-1:0] mem_rdata,
     // PMP violation on the PTE access at mem_addr (driven combinationally by the
     // integrating core against the address this walk is currently requesting).
     // Per the priv spec a PMP fault on a PTE access aborts the walk and raises an
     // access fault of the *original* access type, not a page fault.
-    input  logic        pte_pmp_fault,
+    input wire logic        pte_pmp_fault,
 
     // Result (asserted for one cycle with done)
     output logic        busy,

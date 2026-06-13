@@ -6,6 +6,11 @@
 
 package OOO_Types;
 
+    // Pull in the shared control/ALU types from their package (not $unit) so the
+    // helper functions below can name ALU_*/ctrl_signals_t without a package ->
+    // $unit reference (Vivado Synth 8-10854).
+    import Internal_Defines::*;
+
     // Re-export the ISA width as an OOO_Types localparam so modules that do
     // `import OOO_Types::*` see XLEN (a wildcard import does not chain the
     // symbols a package itself imported).

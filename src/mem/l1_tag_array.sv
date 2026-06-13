@@ -24,18 +24,18 @@ module l1_tag_array #(
     parameter int WAYS     = 4,
     parameter int TAG_BITS = 20
 ) (
-    input  logic clk,
-    input  logic                       ren,
-    input  logic [$clog2(SETS)-1:0]    ridx,
+    input wire logic clk,
+    input wire logic                       ren,
+    input wire logic [$clog2(SETS)-1:0]    ridx,
     output logic [WAYS-1:0][TAG_BITS-1:0] rtag,
     // Second read port (C4 snoop): independent index, registered one cycle.
-    input  logic                       ren2,
-    input  logic [$clog2(SETS)-1:0]    ridx2,
+    input wire logic                       ren2,
+    input wire logic [$clog2(SETS)-1:0]    ridx2,
     output logic [WAYS-1:0][TAG_BITS-1:0] rtag2,
-    input  logic                       wen,
-    input  logic [$clog2(SETS)-1:0]    widx,
-    input  logic [$clog2(WAYS)-1:0]    wway,
-    input  logic [TAG_BITS-1:0]        wtag
+    input wire logic                       wen,
+    input wire logic [$clog2(SETS)-1:0]    widx,
+    input wire logic [$clog2(WAYS)-1:0]    wway,
+    input wire logic [TAG_BITS-1:0]        wtag
 );
 
     genvar w;

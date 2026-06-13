@@ -25,18 +25,18 @@ module nmi_mem_adapter
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
     import NIIGO_Mem::*;
 (
-    input  logic clk,
-    input  logic rst_l,
+    input wire logic clk,
+    input wire logic rst_l,
 
     // ---- NMI slave ----
-    input  nmi_req_t  nmi_req,
+    input wire nmi_req_t  nmi_req,
     output logic      nmi_req_ready,
     output nmi_resp_t nmi_resp,
 
     // ---- Backend: main_memory read port (combinational, MEMORY_READ_WIDTH words) ----
     output logic [MEMORY_ADDR_WIDTH-1:0]            mem_rd_addr,
-    input  logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0]  mem_rd_data,
-    input  logic                                    mem_rd_excpt,
+    input wire logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0]  mem_rd_data,
+    input wire logic                                    mem_rd_excpt,
 
     // ---- Backend: main_memory write port (one word per cycle) ----
     output logic                          mem_wr_en,
@@ -45,10 +45,10 @@ module nmi_mem_adapter
     output logic [XLEN_BYTES-1:0]         mem_wr_mask,
 
     // ---- Fuzz config (driven by niigo_memsys; constant after init) ----
-    input  logic        fz_en,
-    input  int unsigned fz_seed,
-    input  int unsigned fz_min,
-    input  int unsigned fz_max
+    input wire logic        fz_en,
+    input int unsigned fz_seed,
+    input int unsigned fz_min,
+    input int unsigned fz_max
 );
 
     // Words returned per backend read beat.

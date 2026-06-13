@@ -5,13 +5,13 @@
 module ooo_writeback_bus
     import OOO_Types::*;
 (
-    input  writeback_packet_t alu0_writeback,
-    input  writeback_packet_t alu1_writeback,
-    input  writeback_packet_t load_writeback,
-    input  writeback_packet_t mul_writeback,
-    input  writeback_packet_t div_writeback,
-    input  writeback_packet_t fp_writeback,
-    input  branch_mask_t      abort_mask_q,
+    input wire writeback_packet_t alu0_writeback,
+    input wire writeback_packet_t alu1_writeback,
+    input wire writeback_packet_t load_writeback,
+    input wire writeback_packet_t mul_writeback,
+    input wire writeback_packet_t div_writeback,
+    input wire writeback_packet_t fp_writeback,
+    input wire branch_mask_t      abort_mask_q,
     output logic              mul_writeback_ready,
     output logic              div_writeback_ready,
     output logic              fp_writeback_ready,
