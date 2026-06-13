@@ -580,25 +580,36 @@ module load_store_queue
         if (!double_store_pending_q && commit_store && entries_next[head_next].entry.valid &&
                 entries_next[head_next].entry.ctrl.memWrite &&
                 (entries_next[head_next].entry.active_id == commit_store_id)) begin
+            // Read the committing store's data/PA/mask from the REGISTERED entry
+            // (entries_q), not entries_next. entries_next recomputes store_data /
+            // store_data_hi via format_store_split combinationally every cycle
+            // (the re-derive loop), which dragged that 128-bit shift + the wakeup
+            // chain into the commit-data / double_store cone -- the FB2b worst
+            // path (abort_mask -> double_store_data_q). For a committing store
+            // these fields were finalized cycles ago (operands long resolved, at
+            // the ROB head so branch_mask==0 -> no squash), so entries_q ==
+            // entries_next for them; the registered read is value-equivalent and
+            // shallow (just the head mux, no recompute). The CONDITION still uses
+            // entries_next so a same-cycle squash/zeroing is honored.
             // First (low) beat: written at the captured physical address.
-            data_addr = entries_next[head_next].store_lo_pa[XLEN-1:ADDR_SHIFT];
-            data_store = entries_next[head_next].store_data;
-            data_store_mask = entries_next[head_next].store_mask;
+            data_addr = entries_q[head_next].store_lo_pa[XLEN-1:ADDR_SHIFT];
+            data_store = entries_q[head_next].store_data;
+            data_store_mask = entries_q[head_next].store_mask;
             store_second_beat = 1'b1;
             // Second (high) beat of a two-beat store: queue a fire-and-forget
             // write at the high word's captured physical address. The high page
             // was already proven fault-free during the probe above, so this
             // write cannot fault. store_second_beat tells the core port to use
             // this PA directly (the entry will have retired by then).
-            if (needs_two_beats(entries_next[head_next].entry.ctrl,
-                    entries_next[head_next].addr)) begin
+            if (needs_two_beats(entries_q[head_next].entry.ctrl,
+                    entries_q[head_next].addr)) begin
                 double_store_pending_next = 1'b1;
-                double_store_addr_next = entries_next[head_next].store_hi_pa[XLEN-1:ADDR_SHIFT];
-                double_store_data_next = entries_next[head_next].store_data_hi;
-                double_store_mask_next = entries_next[head_next].store_mask_hi;
+                double_store_addr_next = entries_q[head_next].store_hi_pa[XLEN-1:ADDR_SHIFT];
+                double_store_data_next = entries_q[head_next].store_data_hi;
+                double_store_mask_next = entries_q[head_next].store_mask_hi;
             end
             if (reservation_valid_next &&
-                    (reservation_addr_next == entries_next[head_next].addr)) begin
+                    (reservation_addr_next == entries_q[head_next].addr)) begin
                 reservation_valid_next = 1'b0;
             end
             entries_next[head_next] = '0;
