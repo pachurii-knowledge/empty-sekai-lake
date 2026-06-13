@@ -110,6 +110,10 @@ module load_store_queue
     logic [$clog2(MEM_Q_SIZE)-1:0] head_q, head_next;
     logic [$clog2(MEM_Q_SIZE)-1:0] tail_q, tail_next;
     logic head_match, head_xlate_ok, head_xlate_flt;
+    // Parallel leading-invalid-head skip (see the head-advance block): how many
+    // consecutive squashed/empty slots sit at the head this cycle.
+    logic [$clog2(MEM_Q_SIZE+1)-1:0] head_skip_n;
+    logic head_skip_done;
     logic reservation_valid_q, reservation_valid_next;
     logic [XLEN-1:0] reservation_addr_q, reservation_addr_next;
     // Unused high-word outputs of the AMO result repositioning (atomics are
@@ -280,12 +284,29 @@ module load_store_queue
             end
         end
 
-        for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
-            if ((count_next != '0) && !entries_next[head_next].entry.valid) begin
-                head_next = head_next + 1'b1;
-                count_next -= 1'b1;
+        // Advance the head over leading invalid (squashed/empty) slots in one
+        // shot. Behaviorally identical to the former sequential ripple (which
+        // re-indexed entries_next[head_next] with a rippling index, rebuilding a
+        // 16:1 struct mux and a head_next add every iteration -- a ~16-deep
+        // combinational chain), but here each slot is read at a CONSTANT offset
+        // (head_next + k), so the 16 validity reads are independent and only the
+        // leading-count accumulates -- a far shallower cone. head_next is still
+        // == head_q at this point, so the skip must reach the first valid head
+        // THIS cycle (a store committed by the ROB the same cycle its predecessor
+        // hole is skipped relies on it -- a single-step skip would drop it).
+        head_skip_n = '0;
+        head_skip_done = 1'b0;
+        for (int k = 0; k < MEM_Q_SIZE; k += 1) begin
+            if (!head_skip_done && (head_skip_n < count_next) &&
+                    !entries_next[head_next +
+                        ($clog2(MEM_Q_SIZE))'(k)].entry.valid) begin
+                head_skip_n = head_skip_n + 1'b1;
+            end else begin
+                head_skip_done = 1'b1;
             end
         end
+        head_next  = head_next  + head_skip_n[$clog2(MEM_Q_SIZE)-1:0];
+        count_next = count_next - head_skip_n;
 
         // ---- Sv32 data translation gating ----
         // Under paging, a head memory op may only touch memory once its
