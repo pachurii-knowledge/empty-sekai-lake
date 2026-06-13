@@ -413,13 +413,15 @@ module ooo_alu_pipe
 
     function automatic logic [XLEN-1:0] alu_result(logic [XLEN-1:0] a,
             logic [XLEN-1:0] b, alu_op_t op);
-        localparam logic [XLEN-1:0] MIN_INT = {1'b1, {(XLEN-1){1'b0}}};
-        logic signed [2*XLEN-1:0] signed_product;
-        logic signed [2*XLEN+1:0] mixed_product;
-        logic [2*XLEN-1:0] unsigned_product;
-        signed_product   = signed'(a) * signed'(b);
-        mixed_product    = $signed({a[XLEN-1], a}) * $signed({1'b0, b});
-        unsigned_product = {{XLEN{1'b0}}, a} * {{XLEN{1'b0}}, b};
+        // The ALU pipe executes ONLY single-cycle ALU ops. The M-extension ops
+        // (MUL*/DIV*/REM*) are FU_MUL/FU_DIV class and route exclusively to the
+        // dedicated ooo_mul_unit / ooo_div_unit -- int_issue_queue's
+        // port_accepts_entry restricts ISSUE_ALU0/ALU1 to FU_ALU, so an M-ext
+        // op never reaches this function. Their arms are intentionally ABSENT:
+        // including them synthesized a combinational 64x64 multiplier (three
+        // 128-bit products) plus a combinational 64-bit divide into writeback.data
+        // on BOTH ALU pipes -- the FB2b timing wall (~640 CARRY8, 248 ns
+        // register-to-register into ALU0/writeback_reg[data]), all dead logic.
         unique case (op)
             ALU_ADD: alu_result = a + b;
             ALU_SUB: alu_result = a - b;
@@ -431,22 +433,6 @@ module ooo_alu_pipe
             ALU_SRA: alu_result = signed'(a) >>> b[$clog2(XLEN)-1:0];
             ALU_SLT: alu_result = {{(XLEN-1){1'b0}}, signed'(a) < signed'(b)};
             ALU_SLTU: alu_result = {{(XLEN-1){1'b0}}, a < b};
-            ALU_MUL: alu_result = signed_product[XLEN-1:0];
-            ALU_MULH: alu_result = signed_product[2*XLEN-1:XLEN];
-            ALU_MULHSU: alu_result = mixed_product[2*XLEN-1:XLEN];
-            ALU_MULHU: alu_result = unsigned_product[2*XLEN-1:XLEN];
-            ALU_DIV: begin
-                if (b == '0)                          alu_result = '1;
-                else if ((a == MIN_INT) && (b == '1)) alu_result = MIN_INT;
-                else                                  alu_result = signed'(a) / signed'(b);
-            end
-            ALU_DIVU: alu_result = (b == '0) ? '1 : (a / b);
-            ALU_REM: begin
-                if (b == '0)                          alu_result = a;
-                else if ((a == MIN_INT) && (b == '1)) alu_result = '0;
-                else                                  alu_result = signed'(a) % signed'(b);
-            end
-            ALU_REMU: alu_result = (b == '0) ? a : (a % b);
             // RV64 W-form ops: 32-bit operate, sign-extend bit 31 to XLEN.
             ALU_ADDW: alu_result = sext32(a[31:0] +  b[31:0]);
             ALU_SUBW: alu_result = sext32(a[31:0] -  b[31:0]);
