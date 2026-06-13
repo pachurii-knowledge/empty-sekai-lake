@@ -114,6 +114,16 @@ module load_store_queue
     // consecutive squashed/empty slots sit at the head this cycle.
     logic [$clog2(MEM_Q_SIZE+1)-1:0] head_skip_n;
     logic head_skip_done;
+    // Deferred head retire: the per-op head blocks (fault/misaligned-AMO/SC/
+    // load-complete) set this instead of advancing head_next mid-block, so the
+    // whole load/fault/issue/complete group indexes entries_next at a CONSTANT
+    // head_next -> one shared 16:1 struct mux instead of one rebuilt per block.
+    // The advance is applied once below, before the store-commit block (which
+    // must see the post-retire head to allow a load-complete + store-commit in
+    // the same cycle). At most one of those blocks fires per cycle (they share
+    // the single load_writeback port and a fault gates head_xlate_ok off), so
+    // deferring the advance is correctness-preserving.
+    logic head_retire;
     logic reservation_valid_q, reservation_valid_next;
     logic [XLEN-1:0] reservation_addr_q, reservation_addr_next;
     // Unused high-word outputs of the AMO result repositioning (atomics are
@@ -178,6 +188,7 @@ module load_store_queue
         store_probe_hi_next = 1'b0;
         mem_inflight_next = mem_inflight_q;
         mem_inflight_kill_next = mem_inflight_kill_q;
+        head_retire = 1'b0;
 
         // A delivered response frees the single outstanding-load slot whether
         // it is consumed (match block below) or discarded as stale (killed /
@@ -341,8 +352,7 @@ module load_store_queue
             load_writeback.exc_cause = xlate_cause;
             load_writeback.data = entries_next[head_next].addr;   // mtval = VA
             entries_next[head_next] = '0;
-            head_next = head_next + 1'b1;
-            count_next -= 1'b1;
+            head_retire = 1'b1;
         end
 
         // Misaligned AMO / LR / SC: the implementation does not support
@@ -370,8 +380,7 @@ module load_store_queue
                     RISCV_Priv::EXC_LOAD_ACCESS : RISCV_Priv::EXC_STORE_ACCESS;
             load_writeback.data = entries_next[head_next].addr;   // mtval = VA
             entries_next[head_next] = '0;
-            head_next = head_next + 1'b1;
-            count_next -= 1'b1;
+            head_retire = 1'b1;
         end
 
         if (head_xlate_ok && !double_store_pending_q && entries_next[head_next].entry.valid &&
@@ -394,8 +403,7 @@ module load_store_queue
                 reservation_valid_next = 1'b0;
             end else begin
                 entries_next[head_next] = '0;
-                head_next = head_next + 1'b1;
-                count_next -= 1'b1;
+                head_retire = 1'b1;
             end
         end
 
@@ -481,8 +489,7 @@ module load_store_queue
                     reservation_valid_next = 1'b1;
                     reservation_addr_next = entries_next[head_next].addr;
                     entries_next[head_next] = '0;
-                    head_next = head_next + 1'b1;
-                    count_next -= 1'b1;
+                    head_retire = 1'b1;
                 end else begin
                     // Compute on the raw (unshifted) operands at the access
                     // width, then position the result back into its memory
@@ -547,10 +554,20 @@ module load_store_queue
                     load_writeback.has_dest = 1'b0;
                     end
                     entries_next[head_next] = '0;
-                    head_next = head_next + 1'b1;
-                    count_next -= 1'b1;
+                    head_retire = 1'b1;
                 end
             end
+        end
+
+        // Apply the deferred head advance from the per-op blocks above (fault /
+        // misaligned-AMO / SC-fail / load-complete -- at most one fires) before
+        // the store-commit block, so store-commit sees the post-retire head and
+        // the load-complete + store-commit two-retire-per-cycle case still works.
+        // Keeping head_next constant through all the per-op blocks lets them share
+        // a single entries_next[head_next] mux instead of rebuilding one each.
+        if (head_retire) begin
+            head_next = head_next + 1'b1;
+            count_next -= 1'b1;
         end
 
         // Store commit: the committing store was already proven translatable at
