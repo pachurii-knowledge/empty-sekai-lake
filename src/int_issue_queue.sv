@@ -48,7 +48,6 @@ module int_issue_queue
 
     always_comb begin
         entries_next = entries_q;
-        count_next = count_q;
         issue_valid = '0;
         selected = '0;
         branch_issued = 1'b0;
@@ -60,7 +59,6 @@ module int_issue_queue
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
             if ((entries_next[i].branch_mask & abort_mask) != '0) begin
                 entries_next[i] = '0;
-                count_next -= 1'b1;
             end else if (entries_next[i].valid) begin
                 entries_next[i].branch_mask &= ~reset_mask;
                 for (int w = 0; w < OOO_WIDTH; w += 1) begin
@@ -115,7 +113,6 @@ module int_issue_queue
                     branch_issued |= is_control_flow(entries_next[i]);
                     selected[i] = 1'b1;
                     entries_next[i] = '0;
-                    count_next -= 1'b1;
                 end
             end
         end
@@ -127,7 +124,6 @@ module int_issue_queue
                         if (!entries_next[i].valid) begin
                             entries_next[i] = insert_entry[lane];
                             entries_next[i].valid = 1'b1;
-                            count_next += 1'b1;
                             break;
                         end
                     end
@@ -139,11 +135,20 @@ module int_issue_queue
             for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
                 entries_next[i] = '0;
             end
-            count_next = '0;
             issue_valid = '0;
             for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
                 issue_entry[i] = '0;
             end
+        end
+
+        // Queue occupancy = popcount of the valid bits in the final next-state
+        // (flush zeroes every entry -> 0). Replaces the serial -1/+1 RMW that was
+        // threaded through squash/issue/insert, which put count_next on the deep
+        // serial select->count chain (the abort_mask -> count_q worst path). The
+        // sum of 1-bit valids synthesizes to a shallow popcount adder tree.
+        count_next = '0;
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            count_next += entries_next[i].valid;
         end
     end
 
