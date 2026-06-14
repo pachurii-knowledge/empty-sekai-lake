@@ -32,10 +32,18 @@ module int_issue_queue
     issue_entry_t entries_q [INT_IQ_SIZE];
     issue_entry_t entries_next [INT_IQ_SIZE];
     logic [$clog2(INT_IQ_SIZE+1)-1:0] count_q, count_next;
-    logic [INT_IQ_SIZE-1:0] selected;
     logic [$clog2(OOO_WIDTH+1)-1:0] insert_count;
-    logic branch_issued;
-    logic branch_issue_blocked;
+
+    // Parallel per-FU-class issue select (replaces the serial 5-port x 16-entry
+    // scan). Each entry belongs to exactly one fu_class, so the port classes never
+    // contend for the same entry -- pick each class independently. Only the two ALU
+    // ports share a class, and only ALU ops can be control flow, so the branch
+    // constraints live entirely in the ALU 2-pick.
+    typedef logic [$clog2(INT_IQ_SIZE)-1:0] iq_idx_t;
+    logic [INT_IQ_SIZE-1:0] sel_rdy, sel_cf, sel_alu_cand, sel_alu1_cand;
+    logic [INT_IQ_SIZE-1:0] sel_mul, sel_div, sel_fp;
+    iq_idx_t alu0_idx, alu1_idx, mul_idx, div_idx, fp_idx;
+    logic alu0_found, alu1_found, alu0_is_cf;
 
     assign full = (count_q > INT_IQ_SIZE - OOO_WIDTH);
 
@@ -49,9 +57,6 @@ module int_issue_queue
     always_comb begin
         entries_next = entries_q;
         issue_valid = '0;
-        selected = '0;
-        branch_issued = 1'b0;
-        branch_issue_blocked = 1'b0;
         for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
             issue_entry[i] = '0;
         end
@@ -93,28 +98,65 @@ module int_issue_queue
             end
         end
 
-        for (int port = 0; port < FU_ISSUE_PORTS; port += 1) begin
-            for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-                if (issue_ready[port] && !issue_valid[port] &&
-                        entries_next[i].valid &&
-                        entries_next[i].src1_ready && entries_next[i].src2_ready &&
-                        !selected[i] && port_accepts_entry(port, entries_next[i])) begin
-                    if (is_control_flow(entries_next[i]) &&
-                            (entries_next[i].branch_mask != '0)) begin
-                        branch_issue_blocked = 1'b1;
-                        continue;
-                    end
-                    if (branch_issued && is_control_flow(entries_next[i])) begin
-                        branch_issue_blocked = 1'b1;
-                        continue;
-                    end
-                    issue_valid[port] = 1'b1;
-                    issue_entry[port] = entries_next[i];
-                    branch_issued |= is_control_flow(entries_next[i]);
-                    selected[i] = 1'b1;
-                    entries_next[i] = '0;
-                end
-            end
+        // ---- Per-FU-class eligibility (parallel over the post-wakeup entries) ----
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            sel_rdy[i] = entries_next[i].valid &&
+                entries_next[i].src1_ready && entries_next[i].src2_ready;
+            sel_cf[i] = is_control_flow(entries_next[i]);
+            // A control-flow op may issue only once every older branch it is
+            // speculative under has resolved (branch_mask == 0).
+            sel_alu_cand[i] = sel_rdy[i] && (entries_next[i].fu_class == FU_ALU) &&
+                !(sel_cf[i] && (entries_next[i].branch_mask != '0));
+            sel_mul[i] = sel_rdy[i] && (entries_next[i].fu_class == FU_MUL);
+            sel_div[i] = sel_rdy[i] && (entries_next[i].fu_class == FU_DIV);
+            sel_fp[i]  = sel_rdy[i] && (entries_next[i].fu_class == FU_FP);
+        end
+
+        // ---- ALU 2-pick (ports 0,1) ----  a0 = lowest candidate; a1 = next lowest
+        // excluding a0, and -- if a0 is a control transfer -- excluding any other
+        // control transfer (at most one branch/jump issues per cycle).
+        alu0_idx   = lowest_idx(sel_alu_cand);
+        alu0_found = issue_ready[ISSUE_ALU0] && (sel_alu_cand != '0);
+        alu0_is_cf = alu0_found && sel_cf[alu0_idx];
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            sel_alu1_cand[i] = sel_alu_cand[i] && (iq_idx_t'(i) != alu0_idx) &&
+                !(alu0_is_cf && sel_cf[i]);
+        end
+        alu1_idx   = lowest_idx(sel_alu1_cand);
+        alu1_found = alu0_found && issue_ready[ISSUE_ALU1] && (sel_alu1_cand != '0);
+
+        // ---- MUL/DIV/FP single picks (independent; never control flow) ----
+        mul_idx = lowest_idx(sel_mul);
+        div_idx = lowest_idx(sel_div);
+        fp_idx  = lowest_idx(sel_fp);
+
+        // ---- Apply picks: drive the FU ports, clear the issued entries. The picked
+        // indices are distinct (a1 != a0; MUL/DIV/FP are different fu_class), so the
+        // clears never collide. ----
+        if (alu0_found) begin
+            issue_valid[ISSUE_ALU0] = 1'b1;
+            issue_entry[ISSUE_ALU0] = entries_next[alu0_idx];
+            entries_next[alu0_idx] = '0;
+        end
+        if (alu1_found) begin
+            issue_valid[ISSUE_ALU1] = 1'b1;
+            issue_entry[ISSUE_ALU1] = entries_next[alu1_idx];
+            entries_next[alu1_idx] = '0;
+        end
+        if (issue_ready[ISSUE_MUL] && (sel_mul != '0)) begin
+            issue_valid[ISSUE_MUL] = 1'b1;
+            issue_entry[ISSUE_MUL] = entries_next[mul_idx];
+            entries_next[mul_idx] = '0;
+        end
+        if (issue_ready[ISSUE_DIV] && (sel_div != '0)) begin
+            issue_valid[ISSUE_DIV] = 1'b1;
+            issue_entry[ISSUE_DIV] = entries_next[div_idx];
+            entries_next[div_idx] = '0;
+        end
+        if (issue_ready[ISSUE_FP] && (sel_fp != '0)) begin
+            issue_valid[ISSUE_FP] = 1'b1;
+            issue_entry[ISSUE_FP] = entries_next[fp_idx];
+            entries_next[fp_idx] = '0;
         end
 
         if (!full) begin
@@ -158,15 +200,14 @@ module int_issue_queue
             (entry.ctrl.pc_source == PC_indirect);
     endfunction
 
-    function automatic logic port_accepts_entry(input int port,
-            input issue_entry_t entry);
-        unique case (port)
-            ISSUE_ALU0, ISSUE_ALU1: port_accepts_entry = entry.fu_class == FU_ALU;
-            ISSUE_MUL: port_accepts_entry = entry.fu_class == FU_MUL;
-            ISSUE_DIV: port_accepts_entry = entry.fu_class == FU_DIV;
-            ISSUE_FP: port_accepts_entry = entry.fu_class == FU_FP;
-            default: port_accepts_entry = 1'b0;
-        endcase
+    // Lowest set index in a per-entry mask (a priority encoder over the 16 IQ
+    // slots). The reverse iteration leaves index 0 assigned last, so the lowest
+    // set bit wins; returns 0 when the mask is empty (callers gate on mask != 0).
+    function automatic iq_idx_t lowest_idx(input logic [INT_IQ_SIZE-1:0] mask);
+        lowest_idx = '0;
+        for (int i = INT_IQ_SIZE-1; i >= 0; i -= 1) begin
+            if (mask[i]) lowest_idx = iq_idx_t'(i);
+        end
     endfunction
 
     always_ff @(posedge clk or negedge rst_l) begin
