@@ -114,6 +114,27 @@ module load_store_queue
     // consecutive squashed/empty slots sit at the head this cycle.
     logic [$clog2(MEM_Q_SIZE+1)-1:0] head_skip_n;
     logic head_skip_done;
+    // Registered snapshot of the (post-find-first) head entry. The per-op head
+    // blocks (fault / misaligned-AMO / SC / load-issue / store-complete /
+    // load-complete) read their conditions + data from THIS (entries_q) rather
+    // than the combinationally-updated entries_next -- so the load AGU / data_addr
+    // / store fields come from a shallow registered mux instead of the deep
+    // abort->squash->wakeup->format chain (the FB2b LSQ worst path). Cost: a head
+    // op fires one cycle after its operand is registered-ready (+1 load-use cycle);
+    // the LSQ is latency-tolerant (mem_inflight) so this is functionally safe. The
+    // head-op WRITES still target entries_next[head_next] (merging with this
+    // cycle's wakeup/squash). The translation gating (mem_req_valid/head_xlate_ok)
+    // is ALREADY registered-head based, so this makes the head op self-consistent.
+    mem_entry_t headq;
+    // At-most-one head-op per cycle. The per-op blocks formerly excluded each
+    // other implicitly: an earlier block's entries_next write (retire ->
+    // valid=0, or issued_load=1) was visible to a later block reading
+    // entries_next. Now that they read the REGISTERED headq, that same-cycle
+    // visibility is gone, so this explicit flag enforces the same single-fire
+    // (a faulted/retired/handled head must not also be picked up by a later
+    // block). store-commit is OUTSIDE this group (it runs on the post-retire
+    // head, allowing the load-complete + store-commit two-retire-per-cycle case).
+    logic head_done;
     // Deferred head retire: the per-op head blocks (fault/misaligned-AMO/SC/
     // load-complete) set this instead of advancing head_next mid-block, so the
     // whole load/fault/issue/complete group indexes entries_next at a CONSTANT
@@ -189,6 +210,7 @@ module load_store_queue
         mem_inflight_next = mem_inflight_q;
         mem_inflight_kill_next = mem_inflight_kill_q;
         head_retire = 1'b0;
+        head_done = 1'b0;
 
         // A delivered response frees the single outstanding-load slot whether
         // it is consumed (match block below) or discarded as stale (killed /
@@ -319,6 +341,14 @@ module load_store_queue
         head_next  = head_next  + head_skip_n[$clog2(MEM_Q_SIZE)-1:0];
         count_next = count_next - head_skip_n;
 
+        // Registered snapshot of the head entry for the per-op blocks below.
+        // find-first (above, on entries_next) guarantees head_next lands on a
+        // non-squashed valid entry, so entries_q[head_next] is its registered
+        // (this-cycle-stable) view; reading it instead of entries_next keeps the
+        // load AGU / store data / readiness off the deep squash->wakeup->format
+        // chain. A head op thus fires one cycle after its operand registers.
+        headq = entries_q[head_next];
+
         // ---- Sv32 data translation gating ----
         // Under paging, a head memory op may only touch memory once its
         // translation is established (DTLB hit, walk done, no fault) and the
@@ -337,20 +367,21 @@ module load_store_queue
         head_xlate_flt = head_match && mem_req_valid && xlate_fault;
 
         // Faulting access: retire it with an exception instead of touching memory.
-        if (head_xlate_flt && !double_store_pending_q &&
-                entries_next[head_next].entry.valid &&
-                (entries_next[head_next].entry.ctrl.memRead ||
-                 entries_next[head_next].entry.ctrl.memWrite) &&
-                entries_next[head_next].entry.src1_ready &&
-                !entries_next[head_next].issued_load) begin
+        if (head_xlate_flt && !head_done && !double_store_pending_q &&
+                headq.entry.valid &&
+                (headq.entry.ctrl.memRead ||
+                 headq.entry.ctrl.memWrite) &&
+                headq.entry.src1_ready &&
+                !headq.issued_load) begin
+            head_done = 1'b1;
             load_writeback.valid = 1'b1;
-            load_writeback.active_id = entries_next[head_next].entry.active_id;
-            load_writeback.prd = entries_next[head_next].entry.prd;
-            load_writeback.has_dest = entries_next[head_next].entry.has_dest;
-            load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
+            load_writeback.active_id = headq.entry.active_id;
+            load_writeback.prd = headq.entry.prd;
+            load_writeback.has_dest = headq.entry.has_dest;
+            load_writeback.branch_mask = headq.entry.branch_mask;
             load_writeback.exception = 1'b1;
             load_writeback.exc_cause = xlate_cause;
-            load_writeback.data = entries_next[head_next].addr;   // mtval = VA
+            load_writeback.data = headq.addr;   // mtval = VA
             entries_next[head_next] = '0;
             head_retire = 1'b1;
         end
@@ -361,41 +392,43 @@ module load_store_queue
         // never touches memory or the reservation. Gated by head_match so it
         // only acts on the registered head (and never clobbers a writeback the
         // fault block above already produced for a different entry).
-        if (head_match && !double_store_pending_q &&
-                entries_next[head_next].entry.valid &&
-                (entries_next[head_next].entry.ctrl.exec_class == EXEC_AMO) &&
-                entries_next[head_next].entry.src1_ready &&
-                !entries_next[head_next].issued_load &&
-                ((entries_next[head_next].addr[1:0] != 2'b00) ||
-                 ((entries_next[head_next].entry.ctrl.ldst_mode == LDST_D) &&
-                  entries_next[head_next].addr[2]))) begin
+        if (head_match && !head_done && !double_store_pending_q &&
+                headq.entry.valid &&
+                (headq.entry.ctrl.exec_class == EXEC_AMO) &&
+                headq.entry.src1_ready &&
+                !headq.issued_load &&
+                ((headq.addr[1:0] != 2'b00) ||
+                 ((headq.entry.ctrl.ldst_mode == LDST_D) &&
+                  headq.addr[2]))) begin
+            head_done = 1'b1;
             load_writeback.valid = 1'b1;
-            load_writeback.active_id = entries_next[head_next].entry.active_id;
-            load_writeback.prd = entries_next[head_next].entry.prd;
-            load_writeback.has_dest = entries_next[head_next].entry.has_dest;
-            load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
+            load_writeback.active_id = headq.entry.active_id;
+            load_writeback.prd = headq.entry.prd;
+            load_writeback.has_dest = headq.entry.has_dest;
+            load_writeback.branch_mask = headq.entry.branch_mask;
             load_writeback.exception = 1'b1;
             load_writeback.exc_cause =
-                (entries_next[head_next].entry.ctrl.amo_op == AMO_LR) ?
+                (headq.entry.ctrl.amo_op == AMO_LR) ?
                     RISCV_Priv::EXC_LOAD_ACCESS : RISCV_Priv::EXC_STORE_ACCESS;
-            load_writeback.data = entries_next[head_next].addr;   // mtval = VA
+            load_writeback.data = headq.addr;   // mtval = VA
             entries_next[head_next] = '0;
             head_retire = 1'b1;
         end
 
-        if (head_xlate_ok && !double_store_pending_q && entries_next[head_next].entry.valid &&
-                (entries_next[head_next].entry.ctrl.exec_class == EXEC_AMO) &&
-                (entries_next[head_next].entry.ctrl.amo_op == AMO_SC) &&
-                entries_next[head_next].entry.src1_ready &&
-                entries_next[head_next].entry.src2_ready &&
-                !entries_next[head_next].issued_load) begin
+        if (head_xlate_ok && !head_done && !double_store_pending_q && headq.entry.valid &&
+                (headq.entry.ctrl.exec_class == EXEC_AMO) &&
+                (headq.entry.ctrl.amo_op == AMO_SC) &&
+                headq.entry.src1_ready &&
+                headq.entry.src2_ready &&
+                !headq.issued_load) begin
+            head_done = 1'b1;
             load_writeback.valid = 1'b1;
-            load_writeback.active_id = entries_next[head_next].entry.active_id;
-            load_writeback.prd = entries_next[head_next].entry.prd;
-            load_writeback.has_dest = entries_next[head_next].entry.has_dest;
-            load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
+            load_writeback.active_id = headq.entry.active_id;
+            load_writeback.prd = headq.entry.prd;
+            load_writeback.has_dest = headq.entry.has_dest;
+            load_writeback.branch_mask = headq.entry.branch_mask;
             load_writeback.data = (reservation_valid_q &&
-                (reservation_addr_q == entries_next[head_next].addr)) ? '0 : XLEN'(1);
+                (reservation_addr_q == headq.addr)) ? '0 : XLEN'(1);
             if (load_writeback.data == '0) begin
                 // SC succeeds: capture its PA for the commit write-back.
                 entries_next[head_next].store_lo_pa = xlate_pa;
@@ -407,12 +440,18 @@ module load_store_queue
             end
         end
 
-        if (head_xlate_ok && !double_store_pending_q && entries_next[head_next].entry.valid &&
-                entries_next[head_next].entry.ctrl.memRead &&
-                entries_next[head_next].entry.src1_ready && !entries_next[head_next].issued_load &&
+        // Load issue: reads/conditions from the REGISTERED head snapshot (headq)
+        // so data_addr is a shallow registered mux, not the deep AGU chain (the
+        // FB2b worst path -> L1D ADDRARDADDR). A load thus issues one cycle after
+        // its address operand registers (headq.src1_ready); the LSQ tolerates the
+        // extra latency. Writes (store_lo_pa, issued_load) stay on entries_next.
+        if (head_xlate_ok && !head_done && !double_store_pending_q && headq.entry.valid &&
+                headq.entry.ctrl.memRead &&
+                headq.entry.src1_ready && !headq.issued_load &&
                 !mem_inflight_q && dmem_req_ready) begin
+            head_done = 1'b1;
             data_load_en = 1'b1;
-            data_addr = entries_next[head_next].addr[XLEN-1:ADDR_SHIFT];
+            data_addr = headq.addr[XLEN-1:ADDR_SHIFT];
             // Capture the PA for an AMO's write-back beat (same address it read);
             // harmless for a pure load.
             entries_next[head_next].store_lo_pa = xlate_pa;
@@ -426,20 +465,21 @@ module load_store_queue
         // the high word's translation BEFORE it is allowed to commit, so that a
         // page fault on the second word is reported as the store's exception and
         // no partial write is ever performed (store atomicity).
-        if (head_xlate_ok && !double_store_pending_q && entries_next[head_next].entry.valid &&
-                entries_next[head_next].entry.ctrl.memWrite &&
-                entries_next[head_next].entry.src1_ready &&
-                entries_next[head_next].entry.src2_ready &&
-                !entries_next[head_next].entry.ctrl.memRead &&
-                !entries_next[head_next].issued_load) begin
-            if (!needs_two_beats(entries_next[head_next].entry.ctrl,
-                    entries_next[head_next].addr)) begin
+        if (head_xlate_ok && !head_done && !double_store_pending_q && headq.entry.valid &&
+                headq.entry.ctrl.memWrite &&
+                headq.entry.src1_ready &&
+                headq.entry.src2_ready &&
+                !headq.entry.ctrl.memRead &&
+                !headq.issued_load) begin
+            head_done = 1'b1;
+            if (!needs_two_beats(headq.entry.ctrl,
+                    headq.addr)) begin
                 // Single-beat store proven translatable: latch its PA and mark
                 // it complete. The commit write below uses this latched PA.
                 entries_next[head_next].store_lo_pa = xlate_pa;
                 load_writeback.valid = 1'b1;
-                load_writeback.active_id = entries_next[head_next].entry.active_id;
-                load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
+                load_writeback.active_id = headq.entry.active_id;
+                load_writeback.branch_mask = headq.entry.branch_mask;
                 load_writeback.has_dest = 1'b0;
                 entries_next[head_next].issued_load = 1'b1;
             end else if (!store_probe_hi_q) begin
@@ -451,43 +491,45 @@ module load_store_queue
                 // High word translated OK; capture its PA and complete.
                 entries_next[head_next].store_hi_pa = xlate_pa;
                 load_writeback.valid = 1'b1;
-                load_writeback.active_id = entries_next[head_next].entry.active_id;
-                load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
+                load_writeback.active_id = headq.entry.active_id;
+                load_writeback.branch_mask = headq.entry.branch_mask;
                 load_writeback.has_dest = 1'b0;
                 entries_next[head_next].issued_load = 1'b1;
                 store_probe_hi_next = 1'b0;
             end
-        end else if (!double_store_pending_q && entries_next[head_next].entry.valid &&
-                entries_next[head_next].entry.ctrl.memWrite &&
-                entries_next[head_next].entry.src1_ready &&
-                entries_next[head_next].entry.src2_ready &&
-                !entries_next[head_next].entry.ctrl.memRead &&
-                !entries_next[head_next].issued_load &&
+        end else if (!head_done && !double_store_pending_q && headq.entry.valid &&
+                headq.entry.ctrl.memWrite &&
+                headq.entry.src1_ready &&
+                headq.entry.src2_ready &&
+                !headq.entry.ctrl.memRead &&
+                !headq.issued_load &&
                 store_probe_hi_q) begin
             // High-word translation still walking: hold the probe phase.
+            head_done = 1'b1;
             store_probe_hi_next = 1'b1;
         end
 
-        if (!double_store_pending_q && entries_next[head_next].entry.valid &&
-                entries_next[head_next].entry.ctrl.memRead &&
-                entries_next[head_next].issued_load && data_load_valid &&
-                !entries_next[head_next].load_complete &&
+        if (!head_done && !double_store_pending_q && headq.entry.valid &&
+                headq.entry.ctrl.memRead &&
+                headq.issued_load && data_load_valid &&
+                !headq.load_complete &&
                 mem_inflight_q && !mem_inflight_kill_q) begin
+            head_done = 1'b1;
             load_writeback.valid = 1'b1;
-            load_writeback.active_id = entries_next[head_next].entry.active_id;
-            load_writeback.prd = entries_next[head_next].entry.prd;
-            load_writeback.has_dest = entries_next[head_next].entry.has_dest;
-            load_writeback.branch_mask = entries_next[head_next].entry.branch_mask;
-            if (entries_next[head_next].entry.ctrl.exec_class == EXEC_AMO) begin
+            load_writeback.active_id = headq.entry.active_id;
+            load_writeback.prd = headq.entry.prd;
+            load_writeback.has_dest = headq.entry.has_dest;
+            load_writeback.branch_mask = headq.entry.branch_mask;
+            if (headq.entry.ctrl.exec_class == EXEC_AMO) begin
                 // rd gets the old memory value at the access width (an AMO.W on
                 // RV64 sign-extends bit 31, and may sit at offset 4 of the
                 // 8-byte memory word).
                 load_writeback.data = format_load(data_load,
-                    entries_next[head_next].addr[ADDR_SHIFT-1:0],
-                    entries_next[head_next].entry.ctrl.ldst_mode);
-                if (entries_next[head_next].entry.ctrl.amo_op == AMO_LR) begin
+                    headq.addr[ADDR_SHIFT-1:0],
+                    headq.entry.ctrl.ldst_mode);
+                if (headq.entry.ctrl.amo_op == AMO_LR) begin
                     reservation_valid_next = 1'b1;
-                    reservation_addr_next = entries_next[head_next].addr;
+                    reservation_addr_next = headq.addr;
                     entries_next[head_next] = '0;
                     head_retire = 1'b1;
                 end else begin
@@ -495,12 +537,12 @@ module load_store_queue
                     // width, then position the result back into its memory
                     // word with the matching byte-enable mask.
                     format_store_split(
-                        entries_next[head_next].entry.ctrl.ldst_mode,
-                        entries_next[head_next].addr[ADDR_SHIFT-1:0],
-                        amo_result(entries_next[head_next].entry.ctrl.amo_op,
+                        headq.entry.ctrl.ldst_mode,
+                        headq.addr[ADDR_SHIFT-1:0],
+                        amo_result(headq.entry.ctrl.amo_op,
                             load_writeback.data,
-                            entries_next[head_next].store_raw,
-                            entries_next[head_next].entry.ctrl.ldst_mode != LDST_D),
+                            headq.store_raw,
+                            headq.entry.ctrl.ldst_mode != LDST_D),
                         entries_next[head_next].store_data,
                         entries_next[head_next].store_mask,
                         amo_split_hi_data,
@@ -508,9 +550,9 @@ module load_store_queue
                     entries_next[head_next].load_complete = 1'b1;
                 end
             end else begin
-                if (needs_two_beats(entries_next[head_next].entry.ctrl,
-                        entries_next[head_next].addr) &&
-                        !entries_next[head_next].double_low_valid) begin
+                if (needs_two_beats(headq.entry.ctrl,
+                        headq.addr) &&
+                        !headq.double_low_valid) begin
                     // First beat of a two-beat load (cross-word misaligned, or
                     // the low word of an FP double): stash it, advance one word,
                     // and re-issue. Adding 4 preserves the byte offset used for
@@ -520,35 +562,35 @@ module load_store_queue
                     entries_next[head_next].double_low_valid = 1'b1;
                     entries_next[head_next].issued_load = 1'b0;
                     entries_next[head_next].addr =
-                        entries_next[head_next].addr + XLEN'(XLEN_BYTES);
+                        headq.addr + XLEN'(XLEN_BYTES);
                 end else begin
-                    if (entries_next[head_next].double_low_valid) begin
+                    if (headq.double_low_valid) begin
                         // Final beat: combine {high, low} and extract the
                         // requested bytes at the original byte offset.
                         load_writeback.data = format_load_wide(
-                            {data_load, entries_next[head_next].load_low_word},
-                            entries_next[head_next].addr[ADDR_SHIFT-1:0],
-                            entries_next[head_next].entry.ctrl.ldst_mode);
+                            {data_load, headq.load_low_word},
+                            headq.addr[ADDR_SHIFT-1:0],
+                            headq.entry.ctrl.ldst_mode);
                     end else begin
                         load_writeback.data = format_load(data_load,
-                            entries_next[head_next].addr[ADDR_SHIFT-1:0],
-                            entries_next[head_next].entry.ctrl.ldst_mode);
+                            headq.addr[ADDR_SHIFT-1:0],
+                            headq.entry.ctrl.ldst_mode);
                     end
-                    if (entries_next[head_next].entry.ctrl.exec_class == EXEC_FP) begin
+                    if (headq.entry.ctrl.exec_class == EXEC_FP) begin
                     load_writeback.fp_write =
-                        entries_next[head_next].entry.ctrl.fp_writes_fpr;
-                    load_writeback.fp_rd = entries_next[head_next].entry.fp_rd;
+                        headq.entry.ctrl.fp_writes_fpr;
+                    load_writeback.fp_rd = headq.entry.fp_rd;
 `ifdef RV64
                     // load_writeback.data was just extracted at the access
                     // width/offset (FLD decodes LDST_D, FLW LDST_W), so an FLD
                     // is the full value and an FLW NaN-boxes its low word --
                     // correct for any byte offset and for misaligned splits.
-                    load_writeback.fp_data = entries_next[head_next].entry.ctrl.fp_double ?
+                    load_writeback.fp_data = headq.entry.ctrl.fp_double ?
                         load_writeback.data :
                         {32'hffff_ffff, load_writeback.data[31:0]};
 `else
-                    load_writeback.fp_data = entries_next[head_next].entry.ctrl.fp_double ?
-                        {data_load, entries_next[head_next].load_low_word} :
+                    load_writeback.fp_data = headq.entry.ctrl.fp_double ?
+                        {data_load, headq.load_low_word} :
                         {32'hffff_ffff, data_load};
 `endif
                     load_writeback.has_dest = 1'b0;
