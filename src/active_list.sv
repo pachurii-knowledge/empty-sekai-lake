@@ -95,7 +95,6 @@ module active_list
     // Parallel leading-invalid-head skip (see the head-advance block): replaces a
     // 32-deep sequential ripple with a constant-offset leading count.
     active_count_t head_skip_n;
-    logic head_skip_done;
 
     assign tail = tail_q;
     assign full = (count_q > ACTIVE_LIST_SIZE - OOO_WIDTH);
@@ -135,18 +134,20 @@ module active_list
         // iteration), but each slot is read at a CONSTANT offset (head_next + k)
         // so the validity reads are independent and only the leading-count
         // accumulates -- a far shallower cone feeding the commit/pop logic.
-        head_skip_n = '0;
-        head_skip_done = 1'b0;
-        for (int k = 0; k < ACTIVE_LIST_SIZE; k += 1) begin
-            if (!head_skip_done && (head_skip_n < count_next) &&
-                    !entries_next[head_next +
+        // head_skip_n = number of leading invalid (squashed) slots at the head,
+        // capped at count_next = the first VALID slot's offset from head_next. A
+        // priority mux (reverse scan, lowest in-range valid k wins) instead of the
+        // former 32-deep serial +1 accumulation; defaults to count_next when every
+        // in-range slot is invalid. count_next is folded into the parallel-sum below.
+        head_skip_n = count_next;
+        for (int k = ACTIVE_LIST_SIZE-1; k >= 0; k -= 1) begin
+            if ((active_count_t'(k) < count_next) &&
+                    entries_next[head_next +
                         ($clog2(ACTIVE_LIST_SIZE))'(k)].valid) begin
-                head_skip_n = head_skip_n + 1'b1;
-            end else begin
-                head_skip_done = 1'b1;
+                head_skip_n = active_count_t'(k);
             end
         end
-        head_next  = head_next  + head_skip_n[$clog2(ACTIVE_LIST_SIZE)-1:0];
+        head_next = head_next + head_skip_n[$clog2(ACTIVE_LIST_SIZE)-1:0];
         count_next = count_next - head_skip_n;
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
