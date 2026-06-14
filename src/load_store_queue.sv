@@ -113,7 +113,6 @@ module load_store_queue
     // Parallel leading-invalid-head skip (see the head-advance block): how many
     // consecutive squashed/empty slots sit at the head this cycle.
     logic [$clog2(MEM_Q_SIZE+1)-1:0] head_skip_n;
-    logic head_skip_done;
     // Registered snapshot of the (post-find-first) head entry. The per-op head
     // blocks (fault / misaligned-AMO / SC / load-issue / store-complete /
     // load-complete) read their conditions + data from THIS (entries_q) rather
@@ -327,15 +326,19 @@ module load_store_queue
         // == head_q at this point, so the skip must reach the first valid head
         // THIS cycle (a store committed by the ROB the same cycle its predecessor
         // hole is skipped relies on it -- a single-step skip would drop it).
-        head_skip_n = '0;
-        head_skip_done = 1'b0;
-        for (int k = 0; k < MEM_Q_SIZE; k += 1) begin
-            if (!head_skip_done && (head_skip_n < count_next) &&
-                    !entries_next[head_next +
+        // head_skip_n = leading invalid (squashed/empty) slots at the head, capped
+        // at count_next = the first VALID slot's offset from head_next. Priority mux
+        // (reverse scan, lowest in-range valid k wins) instead of the former 16-deep
+        // serial +1 accumulation; defaults to count_next when every in-range slot is
+        // invalid. Same parallelize as the ActiveList head-skip. Multi-step skip
+        // preserved (so a store committed the same cycle its predecessor hole is
+        // skipped is not dropped).
+        head_skip_n = count_next;
+        for (int k = MEM_Q_SIZE-1; k >= 0; k -= 1) begin
+            if ((($clog2(MEM_Q_SIZE+1))'(k) < count_next) &&
+                    entries_next[head_next +
                         ($clog2(MEM_Q_SIZE))'(k)].entry.valid) begin
-                head_skip_n = head_skip_n + 1'b1;
-            end else begin
-                head_skip_done = 1'b1;
+                head_skip_n = ($clog2(MEM_Q_SIZE+1))'(k);
             end
         end
         head_next  = head_next  + head_skip_n[$clog2(MEM_Q_SIZE)-1:0];
