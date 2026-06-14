@@ -89,6 +89,9 @@ module active_list
     int commit_count;
     active_id_t walk_id;
     active_count_t walk_left;
+    logic commit_go;   // running prefix for the parallel commit presentation
+    active_id_t commit_idx;
+    logic commit_ready;
     // Parallel leading-invalid-head skip (see the head-advance block): replaces a
     // 32-deep sequential ripple with a constant-offset leading count.
     active_count_t head_skip_n;
@@ -174,52 +177,57 @@ module active_list
         // entries_next so same-cycle aborts and writeback payloads are
         // visible, but `done` comes from the registered entry (a completion
         // becomes eligible to retire one cycle after its writeback).
+        // Present up to OOO_WIDTH completed entries (oldest first), in PARALLEL.
+        // The presented entries are CONTIGUOUS from head_next, so lane i reads
+        // entry (head_next + i) at a CONSTANT offset -- 4 parallel 32:1 muxes,
+        // not a data-dependent walk_id that serialized the 4 wide commit_packet
+        // muxes (the FB2b ActiveList worst-path cone: commit_valid/commit_packet,
+        // ~259 levels). commit_go is a 4-deep prefix: a lane presents iff every
+        // older lane presented and none halted/excepted (matches the former
+        // serial walk's break-on-stop and stop-on-gap). Condition reads
+        // entries_next[idx].valid (this-cycle squash honored); payload reads
+        // entries_q[idx] (done a prior cycle -> registered/stable, value-equiv).
+        commit_go = 1'b1;
+        commit_count = 0;
         walk_id = head_next;
         walk_left = count_next;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            if ((walk_left != '0) && entries_next[walk_id].valid &&
-                    entries_q[walk_id].done) begin
-                // Copy the committing entry's fields from the REGISTERED entry,
-                // not entries_next. A presented entry is gated on
-                // entries_q[walk_id].done, i.e. it completed in a PRIOR cycle, so
-                // all its payload fields are already registered and stable
-                // (a this-cycle writeback can only set done in entries_next, which
-                // does not become committable until next cycle). entries_q ==
-                // entries_next for these fields, so this is value-equivalent but
-                // decouples the wide commit_packet mux from the this-cycle
-                // squash/writeback/head-advance chain (the FB2b ActiveList cone).
-                // The presentation CONDITION still reads entries_next[walk_id].valid
-                // so a same-cycle abort is honored.
+            commit_idx = head_next + active_id_t'(i);
+            commit_ready = (active_count_t'(i) < count_next) &&
+                entries_next[commit_idx].valid && entries_q[commit_idx].done;
+            if (commit_go && commit_ready) begin
                 commit_valid[i] = 1'b1;
                 commit_packet[i].valid = 1'b1;
-                commit_packet[i].active_id = walk_id;
-                commit_packet[i].rd = entries_q[walk_id].rd;
-                commit_packet[i].prd = entries_q[walk_id].prd;
-                commit_packet[i].old_prd = entries_q[walk_id].old_prd;
-                commit_packet[i].has_dest = entries_q[walk_id].has_dest;
-                commit_packet[i].pc = entries_q[walk_id].pc;
-                commit_packet[i].instr = entries_q[walk_id].instr;
-                commit_packet[i].data = entries_q[walk_id].data;
-                commit_packet[i].fp_write = entries_q[walk_id].fp_write;
-                commit_packet[i].fp_rd = entries_q[walk_id].fp_rd;
-                commit_packet[i].fp_data = entries_q[walk_id].fp_data;
-                commit_packet[i].csr_write = entries_q[walk_id].csr_write;
-                commit_packet[i].csr_addr = entries_q[walk_id].csr_addr;
-                commit_packet[i].csr_wdata = entries_q[walk_id].csr_wdata;
+                commit_packet[i].active_id = commit_idx;
+                commit_packet[i].rd = entries_q[commit_idx].rd;
+                commit_packet[i].prd = entries_q[commit_idx].prd;
+                commit_packet[i].old_prd = entries_q[commit_idx].old_prd;
+                commit_packet[i].has_dest = entries_q[commit_idx].has_dest;
+                commit_packet[i].pc = entries_q[commit_idx].pc;
+                commit_packet[i].instr = entries_q[commit_idx].instr;
+                commit_packet[i].data = entries_q[commit_idx].data;
+                commit_packet[i].fp_write = entries_q[commit_idx].fp_write;
+                commit_packet[i].fp_rd = entries_q[commit_idx].fp_rd;
+                commit_packet[i].fp_data = entries_q[commit_idx].fp_data;
+                commit_packet[i].csr_write = entries_q[commit_idx].csr_write;
+                commit_packet[i].csr_addr = entries_q[commit_idx].csr_addr;
+                commit_packet[i].csr_wdata = entries_q[commit_idx].csr_wdata;
                 commit_packet[i].fp_fflags_valid =
-                    entries_q[walk_id].fp_fflags_valid;
-                commit_packet[i].fp_fflags = entries_q[walk_id].fp_fflags;
-                commit_packet[i].serializing = entries_q[walk_id].serializing;
-                commit_packet[i].is_store = entries_q[walk_id].is_store;
-                commit_packet[i].halted = entries_q[walk_id].halted;
-                commit_packet[i].exception = entries_q[walk_id].exception;
-                commit_packet[i].exc_cause = entries_q[walk_id].exc_cause;
-                walk_id = walk_id + 1'b1;
-                walk_left -= 1'b1;
+                    entries_q[commit_idx].fp_fflags_valid;
+                commit_packet[i].fp_fflags = entries_q[commit_idx].fp_fflags;
+                commit_packet[i].serializing = entries_q[commit_idx].serializing;
+                commit_packet[i].is_store = entries_q[commit_idx].is_store;
+                commit_packet[i].halted = entries_q[commit_idx].halted;
+                commit_packet[i].exception = entries_q[commit_idx].exception;
+                commit_packet[i].exc_cause = entries_q[commit_idx].exc_cause;
                 commit_count += 1;
+                // Stop younger lanes after a halt/exception (precise commit).
                 if (commit_packet[i].halted || commit_packet[i].exception) begin
-                    break;
+                    commit_go = 1'b0;
                 end
+            end else begin
+                // Gap (entry not yet committable): no younger lane may present.
+                commit_go = 1'b0;
             end
         end
 
