@@ -11,6 +11,13 @@ module int_issue_queue
     input wire issue_entry_t         insert_entry [OOO_WIDTH],
     input wire logic [OOO_WIDTH-1:0] wakeup_valid,
     input wire phys_reg_t            wakeup_prd [OOO_WIDTH],
+    // Speculative wakeup: an ALU producer in EXECUTE (S2) broadcasts its dest one
+    // cycle before its writeback bus appears, so a dependent ALU consumer can issue
+    // back-to-back (zero bubble) across the new select->execute pipeline register.
+    // Applied to FU_ALU consumers ONLY (see the wakeup loop) -- they read operands
+    // in their own S2 (select+1), where the producer's writeback is bypassed.
+    input wire logic [ALU_ISSUE_PORTS-1:0] spec_wake_valid,
+    input wire phys_reg_t            spec_wake_prd [ALU_ISSUE_PORTS],
     input wire logic [FU_ISSUE_PORTS-1:0] issue_ready,
     input wire branch_mask_t         reset_mask,
     input wire branch_mask_t         abort_mask,
@@ -63,6 +70,25 @@ module int_issue_queue
                         end
                         if (entries_next[i].prs2 == wakeup_prd[w]) begin
                             entries_next[i].src2_ready = 1'b1;
+                        end
+                    end
+                end
+                // Speculative ALU wakeup -> FU_ALU consumers only. An ALU consumer
+                // reads its operands in its own execute stage (select+1), where the
+                // spec-woken producer's writeback is already on the bus (bypassed in
+                // the phys_reg_file). MUL/DIV/FP read operands at select (no execute
+                // register) so the value is NOT yet available -> they wake only on
+                // the completion wakeup above. spec_wake_prd is a freshly allocated
+                // dest (has_dest, prd != 0), so it never spuriously matches prs == 0.
+                if (entries_next[i].fu_class == FU_ALU) begin
+                    for (int w = 0; w < ALU_ISSUE_PORTS; w += 1) begin
+                        if (spec_wake_valid[w]) begin
+                            if (entries_next[i].prs1 == spec_wake_prd[w]) begin
+                                entries_next[i].src1_ready = 1'b1;
+                            end
+                            if (entries_next[i].prs2 == spec_wake_prd[w]) begin
+                                entries_next[i].src2_ready = 1'b1;
+                            end
                         end
                     end
                 end

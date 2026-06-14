@@ -14,6 +14,14 @@ module ooo_alu_pipe
     input wire logic [XLEN-1:0]  csr_rdata,
     input wire logic             csr_illegal,
     input wire branch_mask_t     abort_mask,
+    // Full-pipeline flush (precise trap). With the select->execute pipeline
+    // register feeding this unit, an ALU op can be in EXECUTE the cycle a trap
+    // commits; it is younger than the trapping instruction, so its writeback (and
+    // any branch redirect it carries) must be squashed -- otherwise a younger
+    // jalr/branch resolved one cycle after the trap would redirect the (already
+    // trap-redirected, now M-mode) frontend to its wrong-path target. Mirrors the
+    // flush the MUL/DIV/FP units already take.
+    input wire logic             flush,
     output writeback_packet_t writeback
 );
 
@@ -104,7 +112,7 @@ module ooo_alu_pipe
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             writeback <= '0;
-        end else if ((wb_next.branch_mask & abort_mask) != '0) begin
+        end else if (flush || ((wb_next.branch_mask & abort_mask) != '0)) begin
             writeback <= '0;
         end else begin
             writeback <= wb_next;

@@ -243,6 +243,17 @@ module riscv_core_ooo
     logic [FU_ISSUE_PORTS-1:0] int_issue_ready;
     issue_entry_t int_issue_entry [FU_ISSUE_PORTS];
 
+    // Select -> Execute pipeline register (S2) for the two ALU ports. The IQ select
+    // (S1) registers the chosen entry here; the ALU pipe / regfile read / CSR read
+    // all run from the registered copy in S2. Halves the single-cycle select+wakeup
+    // +regread+execute critical cone. MUL/DIV/FP keep their combinational issue path
+    // (own multi-cycle pipelines, not on the critical path). spec_wake_* broadcasts
+    // an in-S2 ALU producer's dest one cycle early for zero-bubble ALU->ALU chains.
+    logic [ALU_ISSUE_PORTS-1:0] alu_issue_valid_q;
+    issue_entry_t alu_issue_entry_q [ALU_ISSUE_PORTS];
+    logic [ALU_ISSUE_PORTS-1:0] spec_wake_valid;
+    phys_reg_t spec_wake_prd [ALU_ISSUE_PORTS];
+
     phys_reg_t phys_rs1 [PHYS_READ_PORTS];
     phys_reg_t phys_rs2 [PHYS_READ_PORTS];
     logic [PHYS_READ_PORTS-1:0][XLEN-1:0] phys_rs1_data;
@@ -515,10 +526,12 @@ module riscv_core_ooo
         .rst_l,
         .retire(csr_retire),
         .mtime(clint_mtime),
-        .read_addr(int_issue_entry[0].instr[31:20]),
+        // ALU ports read CSRs in S2 (the execute stage), so the read address comes
+        // from the registered issue entry, matching the ALU pipe's csr_rdata use.
+        .read_addr(alu_issue_entry_q[0].instr[31:20]),
         .read_data(csr_read_data[0]),
         .read_illegal(csr_read_illegal[0]),
-        .read_addr1(int_issue_entry[1].instr[31:20]),
+        .read_addr1(alu_issue_entry_q[1].instr[31:20]),
         .read_data1(csr_read_data[1]),
         .read_illegal1(csr_read_illegal[1]),
         .write_valid(csr_commit_write),
@@ -1175,6 +1188,8 @@ module riscv_core_ooo
         .insert_entry(dispatch_issue_entries),
         .wakeup_valid,
         .wakeup_prd,
+        .spec_wake_valid,
+        .spec_wake_prd,
         .issue_ready(int_issue_ready),
         .reset_mask,
         .abort_mask,
@@ -1183,6 +1198,45 @@ module riscv_core_ooo
         .issue_valid(int_issue_valid),
         .issue_entry(int_issue_entry)
     );
+
+    // ---- Select -> Execute pipeline register (S2) for the ALU ports ----
+    // The IQ select output (S1) is registered here; the ALU pipes, their phys-reg
+    // reads, and the CSR reads all run from this registered copy (S2). An entry
+    // aborted at its select cycle never enters S2 (branch_mask & abort_mask gate);
+    // an entry aborted while in S2 is squashed by the ALU pipe's own abort handling
+    // and by the spec_wake abort gate below. A pipeline flush (trap_take) forces
+    // int_issue_valid to 0 in the IQ, which clears these registers next cycle.
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin
+            alu_issue_valid_q <= '0;
+            for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+                alu_issue_entry_q[p] <= '0;
+            end
+        end else begin
+            for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+                if (!trap_take && int_issue_valid[p] &&
+                        ((int_issue_entry[p].branch_mask & abort_mask) == '0)) begin
+                    alu_issue_valid_q[p] <= 1'b1;
+                    alu_issue_entry_q[p] <= int_issue_entry[p];
+                end else begin
+                    alu_issue_valid_q[p] <= 1'b0;
+                    alu_issue_entry_q[p] <= '0;
+                end
+            end
+        end
+    end
+
+    // Speculative ALU wakeup: an ALU op executing in S2 broadcasts its dest a cycle
+    // before its writeback bus appears (gated by abort -- a squashed producer must
+    // not wake anyone). has_dest implies prd != 0.
+    always_comb begin
+        for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+            spec_wake_valid[p] = alu_issue_valid_q[p] &&
+                alu_issue_entry_q[p].has_dest &&
+                ((alu_issue_entry_q[p].branch_mask & abort_mask) == '0);
+            spec_wake_prd[p] = alu_issue_entry_q[p].prd;
+        end
+    end
 
     phys_reg_file #(.READ_PORTS(PHYS_READ_PORTS)) PhysRegFile (
         .clk,
@@ -1199,26 +1253,28 @@ module riscv_core_ooo
     ooo_alu_pipe ALU0 (
         .clk,
         .rst_l,
-        .issue_valid(int_issue_valid[0]),
-        .issue_entry(int_issue_entry[0]),
+        .issue_valid(alu_issue_valid_q[0]),
+        .issue_entry(alu_issue_entry_q[0]),
         .rs1_data(phys_rs1_data[0]),
         .rs2_data(phys_rs2_data[0]),
         .csr_rdata(csr_read_data[0]),
         .csr_illegal(csr_read_illegal[0]),
         .abort_mask,
+        .flush(trap_take),
         .writeback(alu0_writeback)
     );
 
     ooo_alu_pipe ALU1 (
         .clk,
         .rst_l,
-        .issue_valid(int_issue_valid[1]),
-        .issue_entry(int_issue_entry[1]),
+        .issue_valid(alu_issue_valid_q[1]),
+        .issue_entry(alu_issue_entry_q[1]),
         .rs1_data(phys_rs1_data[1]),
         .rs2_data(phys_rs2_data[1]),
         .csr_rdata(csr_read_data[1]),
         .csr_illegal(csr_read_illegal[1]),
         .abort_mask,
+        .flush(trap_take),
         .writeback(alu1_writeback)
     );
 
@@ -1667,8 +1723,15 @@ module riscv_core_ooo
         end
 
         for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
-            phys_rs1[i] = int_issue_entry[i].prs1;
-            phys_rs2[i] = int_issue_entry[i].prs2;
+            // ALU ports read the phys regfile in S2 (from the registered issue
+            // entry); MUL/DIV/FP read at select (combinational issue), unchanged.
+            if (i < ALU_ISSUE_PORTS) begin
+                phys_rs1[i] = alu_issue_entry_q[i].prs1;
+                phys_rs2[i] = alu_issue_entry_q[i].prs2;
+            end else begin
+                phys_rs1[i] = int_issue_entry[i].prs1;
+                phys_rs2[i] = int_issue_entry[i].prs2;
+            end
         end
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             phys_rs1[FU_ISSUE_PORTS + i] = dispatch_issue_entries[i].prs1;
