@@ -45,6 +45,11 @@ module int_issue_queue
     iq_idx_t alu0_idx, alu1_idx, mul_idx, div_idx, fp_idx;
     logic alu0_found, alu1_found, alu0_is_cf;
 
+    // Parallel insert: the (<= OOO_WIDTH) incoming ops fill the lowest free slots.
+    logic [INT_IQ_SIZE-1:0] ins_free_mask;
+    iq_idx_t ins_free [OOO_WIDTH];
+    logic [$clog2(OOO_WIDTH+1)-1:0] ins_rank [OOO_WIDTH];
+
     assign full = (count_q > INT_IQ_SIZE - OOO_WIDTH);
 
     always_comb begin
@@ -159,16 +164,37 @@ module int_issue_queue
             entries_next[fp_idx] = '0;
         end
 
+        // ---- Parallel insert ---- The incoming ops fill the lowest free slots, in
+        // lane order. free_mask is the post-squash/select occupancy; ins_free[k] is
+        // the k-th lowest free slot (priority encoders, each excluding the prior).
+        // A valid lane takes ins_free[its prefix rank] = the (#valid lanes before
+        // it)-th lowest free slot -- exactly the serial "first free, in lane order".
+        // !full guarantees >= OOO_WIDTH free slots, so all ins_free[] are valid.
         if (!full) begin
+            for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+                ins_free_mask[i] = !entries_next[i].valid;
+            end
+            ins_free[0] = lowest_idx(ins_free_mask);
+            for (int k = 1; k < OOO_WIDTH; k += 1) begin
+                logic [INT_IQ_SIZE-1:0] taken;
+                taken = '0;
+                for (int p = 0; p < k; p += 1) begin
+                    taken[ins_free[p]] = 1'b1;
+                end
+                ins_free[k] = lowest_idx(ins_free_mask & ~taken);
+            end
+            for (int lane = 0; lane < OOO_WIDTH; lane += 1) begin
+                ins_rank[lane] = '0;
+                for (int j = 0; j < OOO_WIDTH; j += 1) begin
+                    if ((j < lane) && insert_valid[j]) begin
+                        ins_rank[lane] += 1'b1;
+                    end
+                end
+            end
             for (int lane = 0; lane < OOO_WIDTH; lane += 1) begin
                 if (insert_valid[lane]) begin
-                    for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-                        if (!entries_next[i].valid) begin
-                            entries_next[i] = insert_entry[lane];
-                            entries_next[i].valid = 1'b1;
-                            break;
-                        end
-                    end
+                    entries_next[ins_free[ins_rank[lane]]] = insert_entry[lane];
+                    entries_next[ins_free[ins_rank[lane]]].valid = 1'b1;
                 end
             end
         end
