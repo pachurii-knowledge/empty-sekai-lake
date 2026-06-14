@@ -28,6 +28,11 @@ report_utilization
 puts "==== POST-SYNTH WNS ===="
 report_timing_summary -setup -max_paths 1
 
+# opt_design's power-optimization sub-task segfaults on this design (pwropt
+# HACOOException: "Too many fanin/fanouts" from the high-fanout abort_mask / false
+# comb loops). Raise the fanin/fanout guard so the exception path (and the segfault
+# that follows it) is never taken; keep the full logic-opt phases for comparability.
+set_param pwropt.maxFaninFanoutToNetRatio 1000000000
 if {[catch {opt_design} e]} { puts "OPT_FAIL: $e" }
 puts "==== POST-OPT WNS ===="
 report_timing_summary -setup -max_paths 1
