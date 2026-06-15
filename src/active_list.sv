@@ -87,8 +87,13 @@ module active_list
     active_count_t count_q, count_next;
     logic [$clog2(OOO_WIDTH+1)-1:0] alloc_count;
     logic [$clog2(OOO_WIDTH+1)-1:0] commit_pop_count;
-    logic [$clog2(OOO_WIDTH+1)-1:0] alloc_rank [OOO_WIDTH];
-    active_id_t alloc_slot [OOO_WIDTH];
+    // Dispatch->insert (D->Q) pipeline register: the tail/count RESERVE advances
+    // combinationally from this cycle's allocate_valid (D stage), but the wide
+    // entry-array WRITE is deferred one cycle and driven from these registered
+    // packets (Q stage). Takes the rename cone off the entry-fill input path.
+    logic [OOO_WIDTH-1:0] allocate_valid_q;
+    rename_packet_t       allocate_packet_q [OOO_WIDTH];
+    logic [ACTIVE_LIST_SIZE-1:0] inflight_mask;
     int commit_count;
     active_id_t walk_id;
     active_count_t walk_left;
@@ -133,6 +138,26 @@ module active_list
             end
         end
 
+        // In-flight reserved mask for the head-skip. The registered dispatch group
+        // (allocate_valid_q) reserved its ROB slots last cycle (count_q includes
+        // them), but the wide entry write is deferred to the Q stage BELOW (after
+        // the commit presentation, to keep that write out of the commit cone). So
+        // for the one cycle before the deferred write, a reserved slot reads
+        // valid=0. Mark those slots occupied here so the head-skip does not mistake
+        // a reserved-but-unwritten head slot for a squashed (=zeroed) one and skip
+        // it -- the near-empty deadlock. Built from REGISTERED signals only
+        // (allocate_valid_q / allocate_packet_q), so it adds NO path into the
+        // commit cone (writing the entry early here instead would close a
+        // valid -> commit_valid -> trap_take/commit_taken -> entry loop). Same gate
+        // as the Q write below, so mask membership == will-be-written.
+        inflight_mask = '0;
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (allocate_valid_q[i] &&
+                    ((allocate_packet_q[i].branch_mask & abort_mask) == '0)) begin
+                inflight_mask[allocate_packet_q[i].active_id] = 1'b1;
+            end
+        end
+
         // Advance the head over leading invalid (squashed) slots in one shot.
         // Behaviorally identical to the former 32-deep sequential ripple (which
         // re-indexed entries_next[head_next] with a rippling index each
@@ -144,36 +169,27 @@ module active_list
         // priority mux (reverse scan, lowest in-range valid k wins) instead of the
         // former 32-deep serial +1 accumulation; defaults to count_next when every
         // in-range slot is invalid. count_next is folded into the parallel-sum below.
+        // A slot counts as occupied (not skippable) if its entry is valid OR it is
+        // a reserved-but-unwritten in-flight slot (inflight_mask) -- only a genuine
+        // squash (zeroed, not in-flight) is skipped.
         head_skip_n = count_next;
         for (int k = ACTIVE_LIST_SIZE-1; k >= 0; k -= 1) begin
             if ((active_count_t'(k) < count_next) &&
-                    entries_next[head_next +
-                        ($clog2(ACTIVE_LIST_SIZE))'(k)].valid) begin
+                    (entries_next[head_next +
+                        ($clog2(ACTIVE_LIST_SIZE))'(k)].valid ||
+                     inflight_mask[head_next +
+                        ($clog2(ACTIVE_LIST_SIZE))'(k)])) begin
                 head_skip_n = active_count_t'(k);
             end
         end
         head_next = head_next + head_skip_n[$clog2(ACTIVE_LIST_SIZE)-1:0];
         count_next = count_next - head_skip_n;
 
-        for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            if (writeback_valid[i]) begin
-                entries_next[writeback_id[i]].done = 1'b1;
-                entries_next[writeback_id[i]].data = writeback_data[i];
-                entries_next[writeback_id[i]].fp_write = writeback_fp_write[i];
-                entries_next[writeback_id[i]].fp_rd = writeback_fp_rd[i];
-                entries_next[writeback_id[i]].fp_data = writeback_fp_data[i];
-                entries_next[writeback_id[i]].csr_write = writeback_csr_write[i];
-                entries_next[writeback_id[i]].csr_addr = writeback_csr_addr[i];
-                entries_next[writeback_id[i]].csr_wdata = writeback_csr_wdata[i];
-                entries_next[writeback_id[i]].fp_fflags_valid =
-                    writeback_fp_fflags_valid[i];
-                entries_next[writeback_id[i]].fp_fflags = writeback_fp_fflags[i];
-                if (writeback_exception[i] && !entries_next[writeback_id[i]].exception)
-                    entries_next[writeback_id[i]].exc_cause = writeback_exc_cause[i];
-                entries_next[writeback_id[i]].exception |= writeback_exception[i];
-                entries_next[writeback_id[i]].halted |= writeback_halted[i];
-            end
-        end
+        // (Writeback marking moved to AFTER the Q-stage allocate write below, so a
+        // store/op that writes back in the SAME cycle as its deferred allocate
+        // write keeps its done/data instead of being clobbered by the alloc reset.
+        // Safe to move: the commit presentation reads the REGISTERED entries_q for
+        // done/payload, so it never observes this cycle's writeback regardless.)
 
         // Present up to OOO_WIDTH completed entries (oldest first) WITHOUT
         // popping them. The commit unit decides which prefix actually retires
@@ -259,53 +275,98 @@ module active_list
         head_next = head_next + active_id_t'(commit_pop_count);
         count_next = count_next - commit_pop_count;
 
-        // Allocate the dispatched ops at the tail in PARALLEL. dispatch_valid
-        // may carry an internal gap (an invalid middle lane), which the serial
-        // loop packed (the k-th valid lane took the k-th tail slot); reproduce
-        // that exactly with a prefix rank -- valid lane i writes the slot at
-        // (tail_next + rank), where rank = #valid lanes before it. tail_next and
-        // count_next then advance by alloc_count in one step instead of the
-        // rippling +1 per lane (the serial tail_next chain that fed tail_q).
+        // Reserve (D stage): advance the tail/count from THIS cycle's dispatch
+        // group, exactly as before -- so tail_q/count_q/full are unchanged. Only
+        // the wide entry-array write is deferred to the Q stage (below); the tail
+        // pointer still names where the reserved slots are.
         if (!restore_valid && !full) begin
-            for (int i = 0; i < OOO_WIDTH; i += 1) begin
-                alloc_rank[i] = '0;
-                for (int j = 0; j < OOO_WIDTH; j += 1) begin
-                    if ((j < i) && allocate_valid[j]) begin
-                        alloc_rank[i] += 1'b1;
-                    end
-                end
-                alloc_slot[i] = tail_next + active_id_t'(alloc_rank[i]);
-            end
-            for (int i = 0; i < OOO_WIDTH; i += 1) begin
-                if (allocate_valid[i]) begin
-                    entries_next[alloc_slot[i]].valid = 1'b1;
-                    entries_next[alloc_slot[i]].done = 1'b0;
-                    entries_next[alloc_slot[i]].exception = 1'b0;
-                    entries_next[alloc_slot[i]].exc_cause = 5'd0;
-                    entries_next[alloc_slot[i]].halted = 1'b0;
-                    entries_next[alloc_slot[i]].data = '0;
-                    entries_next[alloc_slot[i]].fp_write = 1'b0;
-                    entries_next[alloc_slot[i]].fp_rd = allocate_packet[i].fp_rd;
-                    entries_next[alloc_slot[i]].fp_data = '0;
-                    entries_next[alloc_slot[i]].csr_write = 1'b0;
-                    entries_next[alloc_slot[i]].csr_addr = allocate_packet[i].instr[31:20];
-                    entries_next[alloc_slot[i]].csr_wdata = '0;
-                    entries_next[alloc_slot[i]].fp_fflags_valid = 1'b0;
-                    entries_next[alloc_slot[i]].fp_fflags = '0;
-                    entries_next[alloc_slot[i]].serializing =
-                        allocate_packet[i].ctrl.serializing;
-                    entries_next[alloc_slot[i]].pc = allocate_packet[i].pc;
-                    entries_next[alloc_slot[i]].instr = allocate_packet[i].instr;
-                    entries_next[alloc_slot[i]].rd = allocate_packet[i].rd;
-                    entries_next[alloc_slot[i]].prd = allocate_packet[i].prd;
-                    entries_next[alloc_slot[i]].old_prd = allocate_packet[i].old_prd;
-                    entries_next[alloc_slot[i]].has_dest = allocate_packet[i].has_dest;
-                    entries_next[alloc_slot[i]].is_store = allocate_packet[i].ctrl.memWrite;
-                    entries_next[alloc_slot[i]].branch_mask = allocate_packet[i].branch_mask;
-                end
-            end
             tail_next = tail_next + active_id_t'(alloc_count);
             count_next = count_next + alloc_count;
+        end
+
+        // Write (Q stage of the dispatch->insert pipeline): fill the reserved ROB
+        // slots from the registered dispatch group (reserved last cycle in D; the
+        // wide rename-packet fields land here one cycle later -- this is the timing
+        // cut, taking the rename cone off the entry-fill input). active_id, computed
+        // in D from the then-current tail, names the slot, now behind tail and
+        // within [head, tail). Placed AFTER the commit presentation so this write
+        // is OUT of the commit cone (no entry -> commit_valid -> commit_taken/
+        // trap_take -> entry loop); the head-skip already treats these slots as
+        // occupied via inflight_mask. The reserved slot read valid=0 in the gap, so
+        // the commit presentation saw it as a not-yet-committable gap (correct); the
+        // earliest writeback is dispatch+2 (> this dispatch+1 write), so .done is
+        // never marked before the entry exists. Gate off a branch-aborted in-flight
+        // group; `flush` is NOT gated here (it is a commit output -> would re-close
+        // the loop) -- the trailing flush block zeroes every entry on a trap anyway.
+        // Initialize the FULL entry (static + dynamic-field reset). The writeback
+        // marking below runs AFTER this, so a same-cycle writeback re-asserts
+        // done/data on top of this reset (no clobber).
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (allocate_valid_q[i] &&
+                    ((allocate_packet_q[i].branch_mask & abort_mask) == '0)) begin
+                entries_next[allocate_packet_q[i].active_id].valid = 1'b1;
+                entries_next[allocate_packet_q[i].active_id].done = 1'b0;
+                entries_next[allocate_packet_q[i].active_id].exception = 1'b0;
+                entries_next[allocate_packet_q[i].active_id].exc_cause = 5'd0;
+                entries_next[allocate_packet_q[i].active_id].halted = 1'b0;
+                entries_next[allocate_packet_q[i].active_id].data = '0;
+                entries_next[allocate_packet_q[i].active_id].fp_write = 1'b0;
+                entries_next[allocate_packet_q[i].active_id].fp_rd =
+                    allocate_packet_q[i].fp_rd;
+                entries_next[allocate_packet_q[i].active_id].fp_data = '0;
+                entries_next[allocate_packet_q[i].active_id].csr_write = 1'b0;
+                entries_next[allocate_packet_q[i].active_id].csr_addr =
+                    allocate_packet_q[i].instr[31:20];
+                entries_next[allocate_packet_q[i].active_id].csr_wdata = '0;
+                entries_next[allocate_packet_q[i].active_id].fp_fflags_valid = 1'b0;
+                entries_next[allocate_packet_q[i].active_id].fp_fflags = '0;
+                entries_next[allocate_packet_q[i].active_id].serializing =
+                    allocate_packet_q[i].ctrl.serializing;
+                entries_next[allocate_packet_q[i].active_id].pc =
+                    allocate_packet_q[i].pc;
+                entries_next[allocate_packet_q[i].active_id].instr =
+                    allocate_packet_q[i].instr;
+                entries_next[allocate_packet_q[i].active_id].rd =
+                    allocate_packet_q[i].rd;
+                entries_next[allocate_packet_q[i].active_id].prd =
+                    allocate_packet_q[i].prd;
+                entries_next[allocate_packet_q[i].active_id].old_prd =
+                    allocate_packet_q[i].old_prd;
+                entries_next[allocate_packet_q[i].active_id].has_dest =
+                    allocate_packet_q[i].has_dest;
+                entries_next[allocate_packet_q[i].active_id].is_store =
+                    allocate_packet_q[i].ctrl.memWrite;
+                entries_next[allocate_packet_q[i].active_id].branch_mask =
+                    allocate_packet_q[i].branch_mask & ~reset_mask;
+            end
+        end
+
+        // Writeback marking (moved here from before the commit presentation so it
+        // runs AFTER the Q-stage allocate write above): a completing op marks its
+        // ROB entry done + records its result. Placed after the allocate write so a
+        // same-cycle writeback (its dispatch+1 write coinciding with a fast AGU
+        // store/op completion) wins over the allocate's done=0 reset. The commit
+        // presentation reads the REGISTERED entries_q for done/payload, so this
+        // cycle's marking only affects NEXT cycle's commit -- moving it past the
+        // presentation is value-neutral.
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (writeback_valid[i]) begin
+                entries_next[writeback_id[i]].done = 1'b1;
+                entries_next[writeback_id[i]].data = writeback_data[i];
+                entries_next[writeback_id[i]].fp_write = writeback_fp_write[i];
+                entries_next[writeback_id[i]].fp_rd = writeback_fp_rd[i];
+                entries_next[writeback_id[i]].fp_data = writeback_fp_data[i];
+                entries_next[writeback_id[i]].csr_write = writeback_csr_write[i];
+                entries_next[writeback_id[i]].csr_addr = writeback_csr_addr[i];
+                entries_next[writeback_id[i]].csr_wdata = writeback_csr_wdata[i];
+                entries_next[writeback_id[i]].fp_fflags_valid =
+                    writeback_fp_fflags_valid[i];
+                entries_next[writeback_id[i]].fp_fflags = writeback_fp_fflags[i];
+                if (writeback_exception[i] && !entries_next[writeback_id[i]].exception)
+                    entries_next[writeback_id[i]].exc_cause = writeback_exc_cause[i];
+                entries_next[writeback_id[i]].exception |= writeback_exception[i];
+                entries_next[writeback_id[i]].halted |= writeback_halted[i];
+            end
         end
 
         // Trap flush: discard everything still in flight behind the trapping
@@ -334,6 +395,7 @@ module active_list
             head_q <= '0;
             tail_q <= '0;
             count_q <= '0;
+            allocate_valid_q <= '0;
             for (int i = 0; i < ACTIVE_LIST_SIZE; i += 1) begin
                 entries_q[i] <= '0;
             end
@@ -342,6 +404,12 @@ module active_list
             head_q <= head_next;
             tail_q <= tail_next;
             count_q <= count_next;
+            // D->Q dispatch register: carry this cycle's allocate group to the Q
+            // stage. Dispatch is suppressed on a flush/abort cycle (allocate_valid
+            // is then 0), so the register drains naturally across recovery; a
+            // wrong-path group that slips in is gated off at the Q write above.
+            allocate_valid_q <= allocate_valid;
+            allocate_packet_q <= allocate_packet;
         end
     end
 
