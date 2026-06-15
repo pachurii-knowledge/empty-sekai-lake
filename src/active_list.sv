@@ -86,6 +86,9 @@ module active_list
     active_id_t tail_q, tail_next;
     active_count_t count_q, count_next;
     logic [$clog2(OOO_WIDTH+1)-1:0] alloc_count;
+    logic [$clog2(OOO_WIDTH+1)-1:0] commit_pop_count;
+    logic [$clog2(OOO_WIDTH+1)-1:0] alloc_rank [OOO_WIDTH];
+    active_id_t alloc_slot [OOO_WIDTH];
     int commit_count;
     active_id_t walk_id;
     active_count_t walk_left;
@@ -102,8 +105,10 @@ module active_list
 
     always_comb begin
         alloc_count = '0;
+        commit_pop_count = '0;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             alloc_count += allocate_valid[i];
+            commit_pop_count += commit_taken[i];
         end
     end
 
@@ -232,53 +237,75 @@ module active_list
             end
         end
 
-        // Pop exactly the retired prefix. An excepting instruction discards
-        // its result: its rd keeps the old mapping (restored from the
-        // architectural map on flush), so old_prd must NOT be freed here;
-        // its freshly allocated prd is reclaimed by rolling the free-list
-        // head back to the committed head instead.
+        // Pop exactly the retired prefix. commit_taken is a contiguous prefix
+        // of the presented lanes (the commit unit's stop_prefix halts every
+        // younger lane once one is held/halted/excepted), so retired lane i
+        // pops the entry at the CONSTANT offset (head_next + i) -- the frees and
+        // zeroes are independent across lanes, and head_next/count_next advance
+        // by the popcount in one step. Replaces the rippling head_next +1 chain
+        // (a 4-deep serial accumulation that fed head_q/count_q). An excepting
+        // instruction discards its result: its rd keeps the old mapping
+        // (restored from the architectural map on flush), so old_prd must NOT be
+        // freed here; its freshly allocated prd is reclaimed by rolling the
+        // free-list head back to the committed head instead.
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (commit_taken[i]) begin
-                free_valid[i] = entries_next[head_next].has_dest &&
-                    !entries_next[head_next].exception;
-                free_prd[i] = entries_next[head_next].old_prd;
-                entries_next[head_next] = '0;
-                head_next = head_next + 1'b1;
-                count_next -= 1'b1;
+                free_valid[i] = entries_next[head_next + active_id_t'(i)].has_dest &&
+                    !entries_next[head_next + active_id_t'(i)].exception;
+                free_prd[i] = entries_next[head_next + active_id_t'(i)].old_prd;
+                entries_next[head_next + active_id_t'(i)] = '0;
             end
         end
+        head_next = head_next + active_id_t'(commit_pop_count);
+        count_next = count_next - commit_pop_count;
 
+        // Allocate the dispatched ops at the tail in PARALLEL. dispatch_valid
+        // may carry an internal gap (an invalid middle lane), which the serial
+        // loop packed (the k-th valid lane took the k-th tail slot); reproduce
+        // that exactly with a prefix rank -- valid lane i writes the slot at
+        // (tail_next + rank), where rank = #valid lanes before it. tail_next and
+        // count_next then advance by alloc_count in one step instead of the
+        // rippling +1 per lane (the serial tail_next chain that fed tail_q).
         if (!restore_valid && !full) begin
             for (int i = 0; i < OOO_WIDTH; i += 1) begin
+                alloc_rank[i] = '0;
+                for (int j = 0; j < OOO_WIDTH; j += 1) begin
+                    if ((j < i) && allocate_valid[j]) begin
+                        alloc_rank[i] += 1'b1;
+                    end
+                end
+                alloc_slot[i] = tail_next + active_id_t'(alloc_rank[i]);
+            end
+            for (int i = 0; i < OOO_WIDTH; i += 1) begin
                 if (allocate_valid[i]) begin
-                    entries_next[tail_next].valid = 1'b1;
-                    entries_next[tail_next].done = 1'b0;
-                    entries_next[tail_next].exception = 1'b0;
-                    entries_next[tail_next].exc_cause = 5'd0;
-                    entries_next[tail_next].halted = 1'b0;
-                    entries_next[tail_next].data = '0;
-                    entries_next[tail_next].fp_write = 1'b0;
-                    entries_next[tail_next].fp_rd = allocate_packet[i].fp_rd;
-                    entries_next[tail_next].fp_data = '0;
-                    entries_next[tail_next].csr_write = 1'b0;
-                    entries_next[tail_next].csr_addr = allocate_packet[i].instr[31:20];
-                    entries_next[tail_next].csr_wdata = '0;
-                    entries_next[tail_next].fp_fflags_valid = 1'b0;
-                    entries_next[tail_next].fp_fflags = '0;
-                    entries_next[tail_next].serializing =
+                    entries_next[alloc_slot[i]].valid = 1'b1;
+                    entries_next[alloc_slot[i]].done = 1'b0;
+                    entries_next[alloc_slot[i]].exception = 1'b0;
+                    entries_next[alloc_slot[i]].exc_cause = 5'd0;
+                    entries_next[alloc_slot[i]].halted = 1'b0;
+                    entries_next[alloc_slot[i]].data = '0;
+                    entries_next[alloc_slot[i]].fp_write = 1'b0;
+                    entries_next[alloc_slot[i]].fp_rd = allocate_packet[i].fp_rd;
+                    entries_next[alloc_slot[i]].fp_data = '0;
+                    entries_next[alloc_slot[i]].csr_write = 1'b0;
+                    entries_next[alloc_slot[i]].csr_addr = allocate_packet[i].instr[31:20];
+                    entries_next[alloc_slot[i]].csr_wdata = '0;
+                    entries_next[alloc_slot[i]].fp_fflags_valid = 1'b0;
+                    entries_next[alloc_slot[i]].fp_fflags = '0;
+                    entries_next[alloc_slot[i]].serializing =
                         allocate_packet[i].ctrl.serializing;
-                    entries_next[tail_next].pc = allocate_packet[i].pc;
-                    entries_next[tail_next].instr = allocate_packet[i].instr;
-                    entries_next[tail_next].rd = allocate_packet[i].rd;
-                    entries_next[tail_next].prd = allocate_packet[i].prd;
-                    entries_next[tail_next].old_prd = allocate_packet[i].old_prd;
-                    entries_next[tail_next].has_dest = allocate_packet[i].has_dest;
-                    entries_next[tail_next].is_store = allocate_packet[i].ctrl.memWrite;
-                    entries_next[tail_next].branch_mask = allocate_packet[i].branch_mask;
-                    tail_next = tail_next + 1'b1;
-                    count_next += 1'b1;
+                    entries_next[alloc_slot[i]].pc = allocate_packet[i].pc;
+                    entries_next[alloc_slot[i]].instr = allocate_packet[i].instr;
+                    entries_next[alloc_slot[i]].rd = allocate_packet[i].rd;
+                    entries_next[alloc_slot[i]].prd = allocate_packet[i].prd;
+                    entries_next[alloc_slot[i]].old_prd = allocate_packet[i].old_prd;
+                    entries_next[alloc_slot[i]].has_dest = allocate_packet[i].has_dest;
+                    entries_next[alloc_slot[i]].is_store = allocate_packet[i].ctrl.memWrite;
+                    entries_next[alloc_slot[i]].branch_mask = allocate_packet[i].branch_mask;
                 end
             end
+            tail_next = tail_next + active_id_t'(alloc_count);
+            count_next = count_next + alloc_count;
         end
 
         // Trap flush: discard everything still in flight behind the trapping
