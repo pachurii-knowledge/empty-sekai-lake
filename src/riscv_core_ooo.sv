@@ -1469,6 +1469,53 @@ module riscv_core_ooo
         end
     end
 
+    // ---- Phys-reg read-address fan-out (FB2b false-loop break) ----
+    // Extracted from the monolithic dispatch always_comb so that the read of
+    // int_issue_entry / alu_issue_entry_q here does NOT alias into that block's
+    // hundreds of unrelated outputs (lane_valid, dispatch_valid, commit_exc_valid,
+    // branch_allocate ...). Verilator/Vivado analyze dependencies at whole-block
+    // granularity, so an int_issue_entry read inside the dispatch block drew a
+    // spurious edge to every output of it, closing the issue/wakeup/abort_mask
+    // false combinational loops. With this as its own block the dependency graph is
+    // the real (acyclic) one. Value-identical -- pure code motion.
+    always_comb begin
+        for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
+            // ALU ports read the phys regfile in S2 (from the registered issue
+            // entry); MUL/DIV/FP read at select (combinational issue), unchanged.
+            if (i < ALU_ISSUE_PORTS) begin
+                phys_rs1[i] = alu_issue_entry_q[i].prs1;
+                phys_rs2[i] = alu_issue_entry_q[i].prs2;
+            end else begin
+                phys_rs1[i] = int_issue_entry[i].prs1;
+                phys_rs2[i] = int_issue_entry[i].prs2;
+            end
+        end
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            phys_rs1[FU_ISSUE_PORTS + i] = dispatch_issue_entries[i].prs1;
+            phys_rs2[FU_ISSUE_PORTS + i] = dispatch_issue_entries[i].prs2;
+        end
+    end
+
+    // ---- Mem-operand data read + writeback fan-out (wakeup / phys-write) ----
+    // Reads the phys-regfile OUTPUT (phys_rs*_data) and the writeback bus, so it
+    // is a SEPARATE block from the read-address fan-out above (which writes
+    // phys_rs*) -- keeping them split puts the regfile flop between them in the
+    // dependency graph (addr -> regfile -> data) instead of a same-block apparent
+    // cycle. wakeup/phys_write are pure writeback-bus fan-out. Value-identical.
+    always_comb begin
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            mem_insert_rs1_data[i] = phys_rs1_data[FU_ISSUE_PORTS + i];
+            mem_insert_rs2_data[i] = phys_rs2_data[FU_ISSUE_PORTS + i];
+        end
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            wakeup_valid[i] = writeback_valid[i] && writeback_has_dest[i];
+            wakeup_prd[i] = writeback_prd[i];
+            phys_write_valid[i] = writeback_valid[i] && writeback_has_dest[i];
+            phys_write_prd[i] = writeback_prd[i];
+            phys_write_data[i] = writeback_data[i];
+        end
+    end
+
     always_comb begin
         lane_valid = '0;
         lane_has_dest = '0;
@@ -1722,31 +1769,13 @@ module riscv_core_ooo
             branch_allocate |= dispatch_valid[i] && lane_is_branch[i];
         end
 
-        for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
-            // ALU ports read the phys regfile in S2 (from the registered issue
-            // entry); MUL/DIV/FP read at select (combinational issue), unchanged.
-            if (i < ALU_ISSUE_PORTS) begin
-                phys_rs1[i] = alu_issue_entry_q[i].prs1;
-                phys_rs2[i] = alu_issue_entry_q[i].prs2;
-            end else begin
-                phys_rs1[i] = int_issue_entry[i].prs1;
-                phys_rs2[i] = int_issue_entry[i].prs2;
-            end
-        end
-        for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            phys_rs1[FU_ISSUE_PORTS + i] = dispatch_issue_entries[i].prs1;
-            phys_rs2[FU_ISSUE_PORTS + i] = dispatch_issue_entries[i].prs2;
-            mem_insert_rs1_data[i] = phys_rs1_data[FU_ISSUE_PORTS + i];
-            mem_insert_rs2_data[i] = phys_rs2_data[FU_ISSUE_PORTS + i];
-        end
-
-        for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            wakeup_valid[i] = writeback_valid[i] && writeback_has_dest[i];
-            wakeup_prd[i] = writeback_prd[i];
-            phys_write_valid[i] = writeback_valid[i] && writeback_has_dest[i];
-            phys_write_prd[i] = writeback_prd[i];
-            phys_write_data[i] = writeback_data[i];
-        end
+        // (phys-reg read addresses, mem-insert operand data, wakeup and
+        // phys-write fan-out moved OUT of this monolithic dispatch always_comb
+        // into the dedicated PhysRegRead/MemOperandWakeup blocks below -- see the
+        // FB2b false-loop note there. Keeping them here made Verilator/Vivado draw
+        // a spurious edge from int_issue_entry into every output of this 700-line
+        // block, closing the abort_mask/branch_mask/issue false combinational loops
+        // that corrupt the post-place STA.)
 
         arch_rd_we = '0;
         arch_rd = '0;
