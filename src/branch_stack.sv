@@ -111,11 +111,17 @@ module branch_stack
             end
         end
 
-        // restore_valid is squashed by a precise-trap flush (the branch is part of
-        // the discarded younger window); the rest of the flush is in block A.
-        if (flush) begin
-            restore_valid = 1'b0;
-        end
+        // NOTE: restore_valid is intentionally NOT zeroed on a precise-trap flush
+        // here (FB2b false-loop break: gating it on flush=trap_take closed the
+        // branch_restore_valid <-> trap_take false comb loop). Doing so is
+        // correctness-safe -- every architectural consumer already prioritizes the
+        // trap on a flush: the rename-map / free-list restore muxes select the
+        // architectural (RRAT/committed-free-head) state when trap_take=1, and the
+        // active_list runs its own flush (tail=head, count=0) that overrides any
+        // branch restore. Only the speculative RAS/GHR predictor state can differ on
+        // a (rare) trap+branch-resolve coincidence -- predictor-only, self-correcting,
+        // no architectural effect. restore_valid is now a pure function of the
+        // registered resolve/meta_q state.
     end
 
     // ---- Block A: allocate (new checkpoint into a free slot) + flush. Reads the
