@@ -45,21 +45,32 @@ module branch_stack
 
     branch_meta_t meta_q [BRANCH_STACK_SIZE];
     branch_meta_t meta_next [BRANCH_STACK_SIZE];
+    // FB2b false-loop break: the single always_comb read the ALLOCATE snapshots
+    // (free_head/tail/count, active_tail, map) AND wrote the RESOLVE outputs
+    // (abort_mask/reset_mask/restore_*) -- a whole-block alias drawing the false
+    // free_head_snapshot -> abort_mask edge (the commit/recovery cycle). The two
+    // are independent: resolve depends only on resolve_*/meta_q; allocate depends
+    // only on the snapshots. Split via meta_premerge: block R (resolve) writes the
+    // resolve outputs + meta_premerge (post-resolve-clear) reading NO snapshots;
+    // block A (allocate + flush) fills a free slot of meta_premerge -> meta_next.
+    branch_meta_t meta_premerge [BRANCH_STACK_SIZE];
     phys_reg_t map_q [BRANCH_STACK_SIZE][32];
     phys_reg_t map_next [BRANCH_STACK_SIZE][32];
     branch_mask_t valid_mask_q, valid_mask_next;
+    branch_mask_t valid_mask_premerge;
     branch_mask_t resolve_abort_mask;
 
     assign full = &valid_mask_q;
     assign current_mask = valid_mask_q;
 
+    // ---- Block R: resolve (misprediction abort / reset / restore). Reads
+    // resolve_*/meta_q/map_q ONLY -- NO allocate snapshots -- so abort_mask /
+    // reset_mask / restore_* no longer whole-block-alias the snapshots. Produces
+    // meta_premerge / valid_mask_premerge = the post-resolve state for block A. ----
     always_comb begin
-        meta_next = meta_q;
-        map_next = map_q;
-        valid_mask_next = valid_mask_q;
+        meta_premerge = meta_q;
+        valid_mask_premerge = valid_mask_q;
         resolve_abort_mask = '0;
-        allocate_valid = 1'b0;
-        allocate_id = '0;
         restore_valid = 1'b0;
         restore_active_tail = '0;
         restore_free_head = '0;
@@ -92,13 +103,30 @@ module branch_stack
             abort_mask = mispredict ? resolve_abort_mask : '0;
             for (int slot = 0; slot < BRANCH_STACK_SIZE; slot += 1) begin
                 if (resolve_abort_mask[slot]) begin
-                    valid_mask_next[slot] = 1'b0;
-                    meta_next[slot].valid = 1'b0;
-                end else if (meta_next[slot].valid) begin
-                    meta_next[slot].branch_mask &= ~resolve_abort_mask;
+                    valid_mask_premerge[slot] = 1'b0;
+                    meta_premerge[slot].valid = 1'b0;
+                end else if (meta_premerge[slot].valid) begin
+                    meta_premerge[slot].branch_mask &= ~resolve_abort_mask;
                 end
             end
         end
+
+        // restore_valid is squashed by a precise-trap flush (the branch is part of
+        // the discarded younger window); the rest of the flush is in block A.
+        if (flush) begin
+            restore_valid = 1'b0;
+        end
+    end
+
+    // ---- Block A: allocate (new checkpoint into a free slot) + flush. Reads the
+    // snapshots + meta_premerge; writes meta_next / valid_mask_next / allocate_* /
+    // map_next. Snapshots are confined here, off the resolve outputs. ----
+    always_comb begin
+        meta_next = meta_premerge;
+        valid_mask_next = valid_mask_premerge;
+        map_next = map_q;
+        allocate_valid = 1'b0;
+        allocate_id = '0;
 
         if (allocate && !full) begin
             for (int slot = 0; slot < BRANCH_STACK_SIZE; slot += 1) begin
@@ -126,7 +154,6 @@ module branch_stack
             end
             allocate_valid = 1'b0;
             allocate_id = '0;
-            restore_valid = 1'b0;
         end
     end
 
