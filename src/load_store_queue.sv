@@ -106,7 +106,16 @@ module load_store_queue
 
     mem_entry_t entries_q [MEM_Q_SIZE];
     mem_entry_t entries_next [MEM_Q_SIZE];
+    // FB2b false-loop break: the main always_comb formed load_writeback (from the
+    // REGISTERED head) AND read the insert operands (insert_rs*_data) -- a whole-
+    // block alias that drew the false phys_rs_data -> load_writeback loop edge.
+    // Split: block 1 computes entries_premerge (post squash/wakeup/head-ops/store-
+    // commit, pre-insert) + load_writeback from registered state only; block 2 (the
+    // insert, the sole insert_rs*_data reader) fills entries_premerge's free slots
+    // into entries_next. Value-identical (insert never touches the occupied head).
+    mem_entry_t entries_premerge [MEM_Q_SIZE];
     logic [$clog2(MEM_Q_SIZE+1)-1:0] count_q, count_next;
+    logic [$clog2(MEM_Q_SIZE+1)-1:0] count_next_pre;
     logic [$clog2(MEM_Q_SIZE)-1:0] head_q, head_next;
     logic [$clog2(MEM_Q_SIZE)-1:0] tail_q, tail_next;
     logic head_match, head_xlate_ok, head_xlate_flt;
@@ -189,10 +198,9 @@ module load_store_queue
 
 
     always_comb begin
-        entries_next = entries_q;
-        count_next = count_q;
+        entries_premerge = entries_q;
+        count_next_pre = count_q;
         head_next = head_q;
-        tail_next = tail_q;
         data_load_en = 1'b0;
         data_addr = '0;
         data_store = '0;
@@ -237,33 +245,33 @@ module load_store_queue
         end
 
         for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
-            if ((entries_next[i].entry.branch_mask & abort_mask) != '0) begin
-                entries_next[i] = '0;
-            end else if (entries_next[i].entry.valid) begin
-                entries_next[i].entry.branch_mask &= ~reset_mask;
+            if ((entries_premerge[i].entry.branch_mask & abort_mask) != '0) begin
+                entries_premerge[i] = '0;
+            end else if (entries_premerge[i].entry.valid) begin
+                entries_premerge[i].entry.branch_mask &= ~reset_mask;
                 for (int w = 0; w < OOO_WIDTH; w += 1) begin
                     if (wakeup_valid[w]) begin
-                        if (entries_next[i].entry.prs1 == wakeup_prd[w]) begin
-                            entries_next[i].entry.src1_ready = 1'b1;
-                            entries_next[i].addr_ready = 1'b1;
-                            entries_next[i].addr = wakeup_data[w] +
-                                ((entries_next[i].entry.ctrl.exec_class == EXEC_AMO) ?
-                                 '0 : entries_next[i].entry.imm);
+                        if (entries_premerge[i].entry.prs1 == wakeup_prd[w]) begin
+                            entries_premerge[i].entry.src1_ready = 1'b1;
+                            entries_premerge[i].addr_ready = 1'b1;
+                            entries_premerge[i].addr = wakeup_data[w] +
+                                ((entries_premerge[i].entry.ctrl.exec_class == EXEC_AMO) ?
+                                 '0 : entries_premerge[i].entry.imm);
                         end
-                        if ((entries_next[i].entry.prs2 == wakeup_prd[w]) &&
-                                !((entries_next[i].entry.ctrl.exec_class == EXEC_FP) &&
-                                  entries_next[i].entry.ctrl.memWrite)) begin
-                            entries_next[i].entry.src2_ready = 1'b1;
-                            entries_next[i].data_ready = 1'b1;
-                            entries_next[i].store_raw = wakeup_data[w];
+                        if ((entries_premerge[i].entry.prs2 == wakeup_prd[w]) &&
+                                !((entries_premerge[i].entry.ctrl.exec_class == EXEC_FP) &&
+                                  entries_premerge[i].entry.ctrl.memWrite)) begin
+                            entries_premerge[i].entry.src2_ready = 1'b1;
+                            entries_premerge[i].data_ready = 1'b1;
+                            entries_premerge[i].store_raw = wakeup_data[w];
                             format_store_split(
-                                entries_next[i].entry.ctrl.ldst_mode,
-                                entries_next[i].addr[ADDR_SHIFT-1:0],
+                                entries_premerge[i].entry.ctrl.ldst_mode,
+                                entries_premerge[i].addr[ADDR_SHIFT-1:0],
                                 wakeup_data[w],
-                                entries_next[i].store_data,
-                                entries_next[i].store_mask,
-                                entries_next[i].store_data_hi,
-                                entries_next[i].store_mask_hi);
+                                entries_premerge[i].store_data,
+                                entries_premerge[i].store_mask,
+                                entries_premerge[i].store_data_hi,
+                                entries_premerge[i].store_mask_hi);
                         end
                     end
                 end
@@ -292,33 +300,33 @@ module load_store_queue
         // fp_src2_data -- is always present from dispatch, so only the address
         // needs to have resolved).
         for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
-            if (entries_next[i].entry.valid &&
-                    entries_next[i].entry.ctrl.memWrite &&
-                    !entries_next[i].entry.ctrl.memRead &&
-                    (entries_next[i].entry.ctrl.exec_class != EXEC_AMO) &&
-                    entries_next[i].addr_ready &&
+            if (entries_premerge[i].entry.valid &&
+                    entries_premerge[i].entry.ctrl.memWrite &&
+                    !entries_premerge[i].entry.ctrl.memRead &&
+                    (entries_premerge[i].entry.ctrl.exec_class != EXEC_AMO) &&
+                    entries_premerge[i].addr_ready &&
 `ifdef RV64
-                    ((entries_next[i].entry.ctrl.exec_class == EXEC_FP) ||
-                     entries_next[i].data_ready)
+                    ((entries_premerge[i].entry.ctrl.exec_class == EXEC_FP) ||
+                     entries_premerge[i].data_ready)
 `else
-                    (entries_next[i].entry.ctrl.exec_class != EXEC_FP) &&
-                    entries_next[i].data_ready
+                    (entries_premerge[i].entry.ctrl.exec_class != EXEC_FP) &&
+                    entries_premerge[i].data_ready
 `endif
                     ) begin
                 format_store_split(
-                    entries_next[i].entry.ctrl.ldst_mode,
-                    entries_next[i].addr[ADDR_SHIFT-1:0],
-                    entries_next[i].store_raw,
-                    entries_next[i].store_data,
-                    entries_next[i].store_mask,
-                    entries_next[i].store_data_hi,
-                    entries_next[i].store_mask_hi);
+                    entries_premerge[i].entry.ctrl.ldst_mode,
+                    entries_premerge[i].addr[ADDR_SHIFT-1:0],
+                    entries_premerge[i].store_raw,
+                    entries_premerge[i].store_data,
+                    entries_premerge[i].store_mask,
+                    entries_premerge[i].store_data_hi,
+                    entries_premerge[i].store_mask_hi);
             end
         end
 
         // Advance the head over leading invalid (squashed/empty) slots in one
         // shot. Behaviorally identical to the former sequential ripple (which
-        // re-indexed entries_next[head_next] with a rippling index, rebuilding a
+        // re-indexed entries_premerge[head_next] with a rippling index, rebuilding a
         // 16:1 struct mux and a head_next add every iteration -- a ~16-deep
         // combinational chain), but here each slot is read at a CONSTANT offset
         // (head_next + k), so the 16 validity reads are independent and only the
@@ -327,27 +335,27 @@ module load_store_queue
         // THIS cycle (a store committed by the ROB the same cycle its predecessor
         // hole is skipped relies on it -- a single-step skip would drop it).
         // head_skip_n = leading invalid (squashed/empty) slots at the head, capped
-        // at count_next = the first VALID slot's offset from head_next. Priority mux
+        // at count_next_pre = the first VALID slot's offset from head_next. Priority mux
         // (reverse scan, lowest in-range valid k wins) instead of the former 16-deep
-        // serial +1 accumulation; defaults to count_next when every in-range slot is
+        // serial +1 accumulation; defaults to count_next_pre when every in-range slot is
         // invalid. Same parallelize as the ActiveList head-skip. Multi-step skip
         // preserved (so a store committed the same cycle its predecessor hole is
         // skipped is not dropped).
-        head_skip_n = count_next;
+        head_skip_n = count_next_pre;
         for (int k = MEM_Q_SIZE-1; k >= 0; k -= 1) begin
-            if ((($clog2(MEM_Q_SIZE+1))'(k) < count_next) &&
-                    entries_next[head_next +
+            if ((($clog2(MEM_Q_SIZE+1))'(k) < count_next_pre) &&
+                    entries_premerge[head_next +
                         ($clog2(MEM_Q_SIZE))'(k)].entry.valid) begin
                 head_skip_n = ($clog2(MEM_Q_SIZE+1))'(k);
             end
         end
         head_next  = head_next  + head_skip_n[$clog2(MEM_Q_SIZE)-1:0];
-        count_next = count_next - head_skip_n;
+        count_next_pre = count_next_pre - head_skip_n;
 
         // Registered snapshot of the head entry for the per-op blocks below.
-        // find-first (above, on entries_next) guarantees head_next lands on a
+        // find-first (above, on entries_premerge) guarantees head_next lands on a
         // non-squashed valid entry, so entries_q[head_next] is its registered
-        // (this-cycle-stable) view; reading it instead of entries_next keeps the
+        // (this-cycle-stable) view; reading it instead of entries_premerge keeps the
         // load AGU / store data / readiness off the deep squash->wakeup->format
         // chain. A head op thus fires one cycle after its operand registers.
         headq = entries_q[head_next];
@@ -385,7 +393,7 @@ module load_store_queue
             load_writeback.exception = 1'b1;
             load_writeback.exc_cause = xlate_cause;
             load_writeback.data = headq.addr;   // mtval = VA
-            entries_next[head_next] = '0;
+            entries_premerge[head_next] = '0;
             head_retire = 1'b1;
         end
 
@@ -414,7 +422,7 @@ module load_store_queue
                 (headq.entry.ctrl.amo_op == AMO_LR) ?
                     RISCV_Priv::EXC_LOAD_ACCESS : RISCV_Priv::EXC_STORE_ACCESS;
             load_writeback.data = headq.addr;   // mtval = VA
-            entries_next[head_next] = '0;
+            entries_premerge[head_next] = '0;
             head_retire = 1'b1;
         end
 
@@ -434,11 +442,11 @@ module load_store_queue
                 (reservation_addr_q == headq.addr)) ? '0 : XLEN'(1);
             if (load_writeback.data == '0) begin
                 // SC succeeds: capture its PA for the commit write-back.
-                entries_next[head_next].store_lo_pa = xlate_pa;
-                entries_next[head_next].issued_load = 1'b1;
+                entries_premerge[head_next].store_lo_pa = xlate_pa;
+                entries_premerge[head_next].issued_load = 1'b1;
                 reservation_valid_next = 1'b0;
             end else begin
-                entries_next[head_next] = '0;
+                entries_premerge[head_next] = '0;
                 head_retire = 1'b1;
             end
         end
@@ -447,7 +455,7 @@ module load_store_queue
         // so data_addr is a shallow registered mux, not the deep AGU chain (the
         // FB2b worst path -> L1D ADDRARDADDR). A load thus issues one cycle after
         // its address operand registers (headq.src1_ready); the LSQ tolerates the
-        // extra latency. Writes (store_lo_pa, issued_load) stay on entries_next.
+        // extra latency. Writes (store_lo_pa, issued_load) stay on entries_premerge.
         if (head_xlate_ok && !head_done && !double_store_pending_q && headq.entry.valid &&
                 headq.entry.ctrl.memRead &&
                 headq.entry.src1_ready && !headq.issued_load &&
@@ -457,8 +465,8 @@ module load_store_queue
             data_addr = headq.addr[XLEN-1:ADDR_SHIFT];
             // Capture the PA for an AMO's write-back beat (same address it read);
             // harmless for a pure load.
-            entries_next[head_next].store_lo_pa = xlate_pa;
-            entries_next[head_next].issued_load = 1'b1;
+            entries_premerge[head_next].store_lo_pa = xlate_pa;
+            entries_premerge[head_next].issued_load = 1'b1;
             mem_inflight_next = 1'b1;
         end
 
@@ -479,25 +487,25 @@ module load_store_queue
                     headq.addr)) begin
                 // Single-beat store proven translatable: latch its PA and mark
                 // it complete. The commit write below uses this latched PA.
-                entries_next[head_next].store_lo_pa = xlate_pa;
+                entries_premerge[head_next].store_lo_pa = xlate_pa;
                 load_writeback.valid = 1'b1;
                 load_writeback.active_id = headq.entry.active_id;
                 load_writeback.branch_mask = headq.entry.branch_mask;
                 load_writeback.has_dest = 1'b0;
-                entries_next[head_next].issued_load = 1'b1;
+                entries_premerge[head_next].issued_load = 1'b1;
             end else if (!store_probe_hi_q) begin
                 // Low word translated OK: capture its PA, then probe the high
                 // word next cycle.
-                entries_next[head_next].store_lo_pa = xlate_pa;
+                entries_premerge[head_next].store_lo_pa = xlate_pa;
                 store_probe_hi_next = 1'b1;
             end else begin
                 // High word translated OK; capture its PA and complete.
-                entries_next[head_next].store_hi_pa = xlate_pa;
+                entries_premerge[head_next].store_hi_pa = xlate_pa;
                 load_writeback.valid = 1'b1;
                 load_writeback.active_id = headq.entry.active_id;
                 load_writeback.branch_mask = headq.entry.branch_mask;
                 load_writeback.has_dest = 1'b0;
-                entries_next[head_next].issued_load = 1'b1;
+                entries_premerge[head_next].issued_load = 1'b1;
                 store_probe_hi_next = 1'b0;
             end
         end else if (!head_done && !double_store_pending_q && headq.entry.valid &&
@@ -533,7 +541,7 @@ module load_store_queue
                 if (headq.entry.ctrl.amo_op == AMO_LR) begin
                     reservation_valid_next = 1'b1;
                     reservation_addr_next = headq.addr;
-                    entries_next[head_next] = '0;
+                    entries_premerge[head_next] = '0;
                     head_retire = 1'b1;
                 end else begin
                     // Compute on the raw (unshifted) operands at the access
@@ -546,11 +554,11 @@ module load_store_queue
                             load_writeback.data,
                             headq.store_raw,
                             headq.entry.ctrl.ldst_mode != LDST_D),
-                        entries_next[head_next].store_data,
-                        entries_next[head_next].store_mask,
+                        entries_premerge[head_next].store_data,
+                        entries_premerge[head_next].store_mask,
                         amo_split_hi_data,
                         amo_split_hi_mask);
-                    entries_next[head_next].load_complete = 1'b1;
+                    entries_premerge[head_next].load_complete = 1'b1;
                 end
             end else begin
                 if (needs_two_beats(headq.entry.ctrl,
@@ -561,10 +569,10 @@ module load_store_queue
                     // and re-issue. Adding 4 preserves the byte offset used for
                     // the final extraction.
                     load_writeback = '0;
-                    entries_next[head_next].load_low_word = data_load;
-                    entries_next[head_next].double_low_valid = 1'b1;
-                    entries_next[head_next].issued_load = 1'b0;
-                    entries_next[head_next].addr =
+                    entries_premerge[head_next].load_low_word = data_load;
+                    entries_premerge[head_next].double_low_valid = 1'b1;
+                    entries_premerge[head_next].issued_load = 1'b0;
+                    entries_premerge[head_next].addr =
                         headq.addr + XLEN'(XLEN_BYTES);
                 end else begin
                     if (headq.double_low_valid) begin
@@ -598,7 +606,7 @@ module load_store_queue
 `endif
                     load_writeback.has_dest = 1'b0;
                     end
-                    entries_next[head_next] = '0;
+                    entries_premerge[head_next] = '0;
                     head_retire = 1'b1;
                 end
             end
@@ -609,10 +617,10 @@ module load_store_queue
         // the store-commit block, so store-commit sees the post-retire head and
         // the load-complete + store-commit two-retire-per-cycle case still works.
         // Keeping head_next constant through all the per-op blocks lets them share
-        // a single entries_next[head_next] mux instead of rebuilding one each.
+        // a single entries_premerge[head_next] mux instead of rebuilding one each.
         if (head_retire) begin
             head_next = head_next + 1'b1;
-            count_next -= 1'b1;
+            count_next_pre -= 1'b1;
         end
 
         // Store commit: the committing store was already proven translatable at
@@ -622,20 +630,20 @@ module load_store_queue
         // leaving the committed store orphaned and wedging the queue. store_lo_pa
         // is a physical address, so assert store_second_beat to tell the core
         // port to use data_addr directly (skip the head-VA translation mux).
-        if (!double_store_pending_q && commit_store && entries_next[head_next].entry.valid &&
-                entries_next[head_next].entry.ctrl.memWrite &&
-                (entries_next[head_next].entry.active_id == commit_store_id)) begin
+        if (!double_store_pending_q && commit_store && entries_premerge[head_next].entry.valid &&
+                entries_premerge[head_next].entry.ctrl.memWrite &&
+                (entries_premerge[head_next].entry.active_id == commit_store_id)) begin
             // Read the committing store's data/PA/mask from the REGISTERED entry
-            // (entries_q), not entries_next. entries_next recomputes store_data /
+            // (entries_q), not entries_premerge. entries_premerge recomputes store_data /
             // store_data_hi via format_store_split combinationally every cycle
             // (the re-derive loop), which dragged that 128-bit shift + the wakeup
             // chain into the commit-data / double_store cone -- the FB2b worst
             // path (abort_mask -> double_store_data_q). For a committing store
             // these fields were finalized cycles ago (operands long resolved, at
             // the ROB head so branch_mask==0 -> no squash), so entries_q ==
-            // entries_next for them; the registered read is value-equivalent and
+            // entries_premerge for them; the registered read is value-equivalent and
             // shallow (just the head mux, no recompute). The CONDITION still uses
-            // entries_next so a same-cycle squash/zeroing is honored.
+            // entries_premerge so a same-cycle squash/zeroing is honored.
             // First (low) beat: written at the captured physical address.
             data_addr = entries_q[head_next].store_lo_pa[XLEN-1:ADDR_SHIFT];
             data_store = entries_q[head_next].store_data;
@@ -657,10 +665,37 @@ module load_store_queue
                     (reservation_addr_next == entries_q[head_next].addr)) begin
                 reservation_valid_next = 1'b0;
             end
-            entries_next[head_next] = '0;
+            entries_premerge[head_next] = '0;
             head_next = head_next + 1'b1;
-            count_next -= 1'b1;
+            count_next_pre -= 1'b1;
         end
+
+        // ---- Block-1 flush: zero the head / load_writeback / in-flight outputs.
+        // entries (entries_next), tail, and count are flushed in block 2 below.
+        // Store WRITES driven above (committed stores) are intentionally NOT
+        // suppressed -- see the store-commit comment.
+        if (flush) begin
+            head_next = '0;
+            data_load_en = 1'b0;
+            load_writeback = '0;
+            store_probe_hi_next = 1'b0;
+            // A load issue suppressed by this flush must not leave a phantom
+            // in-flight slot; an already-outstanding load stays outstanding and its
+            // eventual response is discarded as stale.
+            mem_inflight_next = mem_inflight_q && !data_load_valid;
+            mem_inflight_kill_next = mem_inflight_q && !data_load_valid;
+        end
+    end
+
+    // ---- Block 2: parallel insert (the only insert_rs*_data reader) + occupancy +
+    // entries/tail/count flush. Splitting load_writeback (block 1) from the insert
+    // here is what breaks the false phys_rs_data -> load_writeback loop edge.
+    // entries_premerge is the post-squash/wakeup/head/store-commit state; insert
+    // fills its free (tail) slots, which the head block never touches. ----
+    always_comb begin
+        entries_next = entries_premerge;
+        count_next = count_next_pre;
+        tail_next = tail_q;
 
         if (!full) begin
             for (int lane = 0; lane < OOO_WIDTH; lane += 1) begin
@@ -758,18 +793,10 @@ module load_store_queue
             for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
                 entries_next[i] = '0;
             end
-            head_next = '0;
             tail_next = '0;
             count_next = '0;
-            data_load_en = 1'b0;
-            load_writeback = '0;
-            store_probe_hi_next = 1'b0;
-            // A load issue suppressed by this flush (data_load_en cleared
-            // above) must not leave a phantom in-flight slot; a load that was
-            // already outstanding before this cycle stays outstanding and its
-            // eventual response is discarded as stale.
-            mem_inflight_next = mem_inflight_q && !data_load_valid;
-            mem_inflight_kill_next = mem_inflight_q && !data_load_valid;
+            // head_next / data_load_en / load_writeback / in-flight are flushed in
+            // the block-1 flush above.
         end
     end
 

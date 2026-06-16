@@ -1535,8 +1535,11 @@ module riscv_core_ooo
     // their owning block.
     // ================================================================
 
-    // ---- B1: lane decode (per-lane attributes, rename source regs,
-    // dispatch/valid counts, partial-resume) ----
+    // ---- B1a: lane decode (per-lane attributes + rename source regs + valid
+    // count). Reads decode_lanes ONLY -- NOT dispatch_valid -- so lane_valid (and
+    // the lane_is_* attrs) no longer whole-block-alias dispatch_valid (the false
+    // dispatch_valid -> lane_valid -> dispatch_control -> dispatch_valid loop edge).
+    // Value-identical: the dispatch-count / partial-resume half moved to B1b. ----
     always_comb begin
         lane_valid = '0;
         lane_has_dest = '0;
@@ -1547,11 +1550,7 @@ module riscv_core_ooo
         lane_is_memory = '0;
         lane_is_terminal = '0;
         lane_is_serializing = '0;
-        dispatch_count = '0;
         valid_count = '0;
-        partial_resume_valid = 1'b0;
-        partial_resume_lane = '0;
-        partial_resume_lane_is_branch = 1'b0;
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             map_rs1[i] = decode_lanes[i].rs1;
@@ -1580,10 +1579,24 @@ module riscv_core_ooo
                 (decode_lanes[i].ctrl.syscall || decode_lanes[i].ctrl.illegal_instr);
             lane_is_serializing[i] = lane_valid[i] &&
                 decode_lanes[i].ctrl.serializing;
-            lane_active_offset[i] = dispatch_count;
             if (lane_valid[i]) begin
                 valid_count += 1'b1;
             end
+        end
+    end
+
+    // ---- B1b: dispatch-count + active-list offset + partial-resume. Reads
+    // dispatch_valid (and the B1a lane attrs), kept separate from the decode above
+    // so dispatch_valid does not reach lane_valid. Same running-count semantics
+    // (lane_active_offset[i] = dispatch_count before this lane's +1). ----
+    always_comb begin
+        dispatch_count = '0;
+        partial_resume_valid = 1'b0;
+        partial_resume_lane = '0;
+        partial_resume_lane_is_branch = 1'b0;
+
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            lane_active_offset[i] = dispatch_count;
             if (dispatch_valid[i]) begin
                 dispatch_count += 1'b1;
             end else if (lane_valid[i] && !partial_resume_valid) begin
@@ -1612,7 +1625,6 @@ module riscv_core_ooo
         ras_stack_next = ras_stack_q;
         ras_count_next = branch_restore_valid ?
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
-        ras_checkpoint_count_next = ras_checkpoint_count_q;
         ras_branch_snapshot_count = ras_count_next;
         // Speculative global history: on a misprediction restore the branch's
         // pre-push checkpoint, then re-push the resolved direction if the
@@ -1624,7 +1636,6 @@ module riscv_core_ooo
             ghr_next = {ghr_next[DIRECT_HISTORY_BITS-2:0],
                 (branch_writeback.redirect_pc != branch_writeback.pc + 32'd4)};
         end
-        ghr_checkpoint_next = ghr_checkpoint_q;
         ghr_branch_snapshot = ghr_next;
         branch_active_tail_snapshot = active_tail;
         branch_free_head_snapshot = free_head_snapshot;
@@ -1688,15 +1699,25 @@ module riscv_core_ooo
                 end
             end
         end
-        if (branch_allocate_valid) begin
-            ras_checkpoint_count_next[branch_allocate_id] = ras_branch_snapshot_count;
-            ghr_checkpoint_next[branch_allocate_id] = ghr_branch_snapshot;
-        end
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (dispatch_valid[i] && lane_is_unpredicted_control[i] &&
                     !lane_control_predicted[i]) begin
                 dispatched_unpredicted_control = 1'b1;
             end
+        end
+    end
+
+    // ---- B2c: per-branch RAS/GHR checkpoint write. Split out so B2 no longer
+    // reads branch_allocate_valid/id, which closed the false branch_allocate_valid
+    // -> branch_free_head_snapshot loop edge (B2 computes the snapshot independently
+    // of branch_allocate_*; it only read them for this checkpoint store). The
+    // snapshot values come from B2; value-identical. ----
+    always_comb begin
+        ras_checkpoint_count_next = ras_checkpoint_count_q;
+        ghr_checkpoint_next = ghr_checkpoint_q;
+        if (branch_allocate_valid) begin
+            ras_checkpoint_count_next[branch_allocate_id] = ras_branch_snapshot_count;
+            ghr_checkpoint_next[branch_allocate_id] = ghr_branch_snapshot;
         end
     end
 
