@@ -96,6 +96,16 @@ module active_list
     active_id_t tail_q, tail_next;
     active_count_t count_q, count_next;
     active_count_t count_next_c;   // post-commit count handed to the allocate block
+    // FB2b false-loop break (retire_valid): the commit block read commit_taken (the
+    // pop) AND wrote commit_valid (the present) -- a whole-block alias that closed the
+    // last false loop commit_valid -> commit_unit -> retire_valid(=commit_taken) -> pop.
+    // commit_valid is computed (present) BEFORE the pop reads commit_taken, so the
+    // alias is false. Split: block C1 (squash + head-skip + present) writes commit_valid
+    // + the post-squash/head-skip state below, reading NO commit_taken; block C2 (pop)
+    // reads commit_taken and produces the final entries_premerge/head_next/count_next_c.
+    active_entry_t entries_squash [ACTIVE_LIST_SIZE]; // post-squash (pre-pop) entries
+    active_id_t    head_postskip;                     // head after the leading-skip
+    active_count_t count_postskip;                    // count after the leading-skip
     logic [$clog2(OOO_WIDTH+1)-1:0] alloc_count;
     logic [$clog2(OOO_WIDTH+1)-1:0] commit_pop_count;
     // Dispatch->insert (D->Q) pipeline register: the tail/count RESERVE advances
@@ -128,23 +138,28 @@ module active_list
         end
     end
 
+    // ---- Block C1: squash + reset + head-skip + commit PRESENT. Writes commit_valid
+    // / commit_packet + the post-squash/head-skip state (entries_squash / head_postskip
+    // / count_postskip). Reads entries_q (registered) + abort_mask/reset_mask +
+    // allocate_*_q (registered) ONLY -- crucially NO commit_taken -> commit_valid is
+    // severed from the pop, breaking the last false loop (commit_valid -> commit_unit
+    // -> retire_valid(=commit_taken) -> pop). The present already ran BEFORE the pop,
+    // so this is value-identical pure code motion. ----
     always_comb begin
-        entries_premerge = entries_q;
-        head_next = head_q;
-        count_next_c = restore_valid ? active_distance(head_q, restore_tail) : count_q;
+        entries_squash = entries_q;
+        head_postskip = head_q;
+        count_postskip = restore_valid ? active_distance(head_q, restore_tail) : count_q;
         commit_valid = '0;
-        free_valid = '0;
         commit_count = 0;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             commit_packet[i] = '0;
-            free_prd[i] = '0;
         end
 
         for (int i = 0; i < ACTIVE_LIST_SIZE; i += 1) begin
-            if ((entries_premerge[i].branch_mask & abort_mask) != '0) begin
-                entries_premerge[i] = '0;
-            end else if (entries_premerge[i].valid) begin
-                entries_premerge[i].branch_mask &= ~reset_mask;
+            if ((entries_squash[i].branch_mask & abort_mask) != '0) begin
+                entries_squash[i] = '0;
+            end else if (entries_squash[i].valid) begin
+                entries_squash[i].branch_mask &= ~reset_mask;
             end
         end
 
@@ -182,18 +197,18 @@ module active_list
         // A slot counts as occupied (not skippable) if its entry is valid OR it is
         // a reserved-but-unwritten in-flight slot (inflight_mask) -- only a genuine
         // squash (zeroed, not in-flight) is skipped.
-        head_skip_n = count_next_c;
+        head_skip_n = count_postskip;
         for (int k = ACTIVE_LIST_SIZE-1; k >= 0; k -= 1) begin
-            if ((active_count_t'(k) < count_next_c) &&
-                    (entries_premerge[head_next +
+            if ((active_count_t'(k) < count_postskip) &&
+                    (entries_squash[head_postskip +
                         ($clog2(ACTIVE_LIST_SIZE))'(k)].valid ||
-                     inflight_mask[head_next +
+                     inflight_mask[head_postskip +
                         ($clog2(ACTIVE_LIST_SIZE))'(k)])) begin
                 head_skip_n = active_count_t'(k);
             end
         end
-        head_next = head_next + head_skip_n[$clog2(ACTIVE_LIST_SIZE)-1:0];
-        count_next_c = count_next_c - head_skip_n;
+        head_postskip = head_postskip + head_skip_n[$clog2(ACTIVE_LIST_SIZE)-1:0];
+        count_postskip = count_postskip - head_skip_n;
 
         // (Writeback marking moved to AFTER the Q-stage allocate write below, so a
         // store/op that writes back in the SAME cycle as its deferred allocate
@@ -221,12 +236,12 @@ module active_list
         // entries_q[idx] (done a prior cycle -> registered/stable, value-equiv).
         commit_go = 1'b1;
         commit_count = 0;
-        walk_id = head_next;
-        walk_left = count_next_c;
+        walk_id = head_postskip;
+        walk_left = count_postskip;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            commit_idx = head_next + active_id_t'(i);
-            commit_ready = (active_count_t'(i) < count_next_c) &&
-                entries_premerge[commit_idx].valid && entries_q[commit_idx].done;
+            commit_idx = head_postskip + active_id_t'(i);
+            commit_ready = (active_count_t'(i) < count_postskip) &&
+                entries_squash[commit_idx].valid && entries_q[commit_idx].done;
             if (commit_go && commit_ready) begin
                 commit_valid[i] = 1'b1;
                 commit_packet[i].valid = 1'b1;
@@ -263,27 +278,43 @@ module active_list
             end
         end
 
-        // Pop exactly the retired prefix. commit_taken is a contiguous prefix
-        // of the presented lanes (the commit unit's stop_prefix halts every
-        // younger lane once one is held/halted/excepted), so retired lane i
-        // pops the entry at the CONSTANT offset (head_next + i) -- the frees and
-        // zeroes are independent across lanes, and head_next/count_next_c advance
-        // by the popcount in one step. Replaces the rippling head_next +1 chain
-        // (a 4-deep serial accumulation that fed head_q/count_q). An excepting
-        // instruction discards its result: its rd keeps the old mapping
-        // (restored from the architectural map on flush), so old_prd must NOT be
-        // freed here; its freshly allocated prd is reclaimed by rolling the
-        // free-list head back to the committed head instead.
+    end
+
+    // ---- Block C2: POP the retired prefix (commit_taken). Reads commit_taken +
+    // commit_pop_count + C1's post-squash/head-skip state (entries_squash /
+    // head_postskip / count_postskip); writes the FINAL entries_premerge / head_next /
+    // count_next_c (consumed by block A + the head/count registers) + free_valid /
+    // free_prd. This is the ONLY commit_taken reader on the path, and it is strictly
+    // downstream of commit_valid (C1) -> no commit_valid <-> commit_taken loop. ----
+    always_comb begin
+        entries_premerge = entries_squash;
+        head_next = head_postskip;
+        count_next_c = count_postskip;
+        free_valid = '0;
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            free_prd[i] = '0;
+        end
+
+        // Pop exactly the retired prefix. commit_taken is a contiguous prefix of the
+        // presented lanes (the commit unit's stop_prefix halts every younger lane once
+        // one is held/halted/excepted), so retired lane i pops the entry at the CONSTANT
+        // offset (head_postskip + i) -- frees and zeroes are independent across lanes,
+        // and head_next/count_next_c advance by the popcount in one step. An excepting
+        // instruction discards its result: its rd keeps the old mapping (restored from
+        // the architectural map on flush), so old_prd must NOT be freed here; its
+        // freshly allocated prd is reclaimed by rolling the free-list head back to the
+        // committed head instead. The per-lane reads come from entries_squash (C1, never
+        // popped), so they are independent of this block's zeroing.
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (commit_taken[i]) begin
-                free_valid[i] = entries_premerge[head_next + active_id_t'(i)].has_dest &&
-                    !entries_premerge[head_next + active_id_t'(i)].exception;
-                free_prd[i] = entries_premerge[head_next + active_id_t'(i)].old_prd;
-                entries_premerge[head_next + active_id_t'(i)] = '0;
+                free_valid[i] = entries_squash[head_postskip + active_id_t'(i)].has_dest &&
+                    !entries_squash[head_postskip + active_id_t'(i)].exception;
+                free_prd[i] = entries_squash[head_postskip + active_id_t'(i)].old_prd;
+                entries_premerge[head_postskip + active_id_t'(i)] = '0;
             end
         end
-        head_next = head_next + active_id_t'(commit_pop_count);
-        count_next_c = count_next_c - commit_pop_count;
+        head_next = head_postskip + active_id_t'(commit_pop_count);
+        count_next_c = count_postskip - commit_pop_count;
     end
 
     // ---- Block A: reserve (tail/count from this cycle's dispatch) + Q-stage entry

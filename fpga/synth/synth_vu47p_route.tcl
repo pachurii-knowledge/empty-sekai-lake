@@ -22,10 +22,12 @@ if {[catch {synth_design -top niigo_soc -part $part -mode out_of_context \
       -flatten_hierarchy rebuilt} e]} { puts "VU47P_FAIL: $e"; exit 1 }
 create_clock -name clk -period 8.0 [get_ports clk]
 
-# Let the tools route past the residual false comb loops.
+# Let the tools route past the one residual false comb loop (retire_valid, the
+# in-order commit cycle). The LSQ wakeup<->load_writeback and ptw loops are now
+# broken in RTL (d863562 / 7f0e923), so only the commit cycle remains.
 set_property ALLOW_COMBINATORIAL_LOOPS TRUE [get_nets -hierarchical -filter \
-  {NAME =~ *load_writeback* || NAME =~ *wakeup_valid* || NAME =~ *stack_abort_mask* \
-   || NAME =~ *ptw_pte_pmp_fault*}]
+  {NAME =~ *retire_valid* || NAME =~ *active_commit* || NAME =~ *commit_taken* \
+   || NAME =~ *stack_abort_mask*}]
 
 set_param pwropt.maxFaninFanoutToNetRatio 1000000000
 if {[catch {opt_design} e]} { puts "OPT_FAIL: $e" }
