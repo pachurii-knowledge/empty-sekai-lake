@@ -41,6 +41,13 @@ module int_issue_queue
     issue_entry_t entries_wake [INT_IQ_SIZE]; // post squash + wakeup
     issue_entry_t entries_sel  [INT_IQ_SIZE]; // post select (issued slots cleared)
     logic [$clog2(INT_IQ_SIZE+1)-1:0] count_q, count_next;
+    // FB2b depth cut: incremental occupancy (count_q - squashed - issued + inserted)
+    // instead of popcount(entries_next.valid), which put count_next at the tail of the
+    // deep abort_mask -> squash -> select -> insert -> entries_next chain (the -12.8 ns
+    // worst path). These three popcounts read the shallow squash/issue/insert masks.
+    logic [$clog2(INT_IQ_SIZE+1)-1:0] sq_count;   // entries squashed by abort this cycle
+    logic [$clog2(INT_IQ_SIZE+1)-1:0] iss_count;  // entries issued (selected) this cycle
+    logic [$clog2(INT_IQ_SIZE+1)-1:0] ins_count;  // entries inserted this cycle
     logic [$clog2(OOO_WIDTH+1)-1:0] insert_count;
 
     // Parallel per-FU-class issue select (replaces the serial 5-port x 16-entry
@@ -233,13 +240,33 @@ module int_issue_queue
             end
         end
 
-        // Queue occupancy = popcount of the valid bits in the final next-state
-        // (flush zeroes every entry -> 0). The sum of 1-bit valids synthesizes to a
-        // shallow popcount adder tree.
-        count_next = '0;
+        // Queue occupancy, computed INCREMENTALLY (value-identical to the former
+        // popcount(entries_next.valid), but off the deep select/insert chain): the
+        // surviving entries are count_q minus the squashed (abort) and issued
+        // (selected) entries -- which are DISJOINT, since a squashed entry reads
+        // valid=0 in entries_wake and so cannot be selected -- plus the inserted ops.
+        // count_q >= squashed + issued (both are subsets of the valid entries), so the
+        // running value never underflows. squashed reads entries_q + abort_mask
+        // directly (shallow, parallel to the select); issued/inserted are popcounts of
+        // the fire / insert_valid masks. flush -> 0 (matches the entry zeroing above).
+        sq_count = '0;
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-            count_next += entries_next[i].valid;
+            if (entries_q[i].valid &&
+                    ((entries_q[i].branch_mask & abort_mask) != '0)) begin
+                sq_count += 1'b1;
+            end
         end
+        iss_count = '0;
+        for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
+            iss_count += issue_valid[i];
+        end
+        ins_count = '0;
+        if (!full) begin
+            for (int lane = 0; lane < OOO_WIDTH; lane += 1) begin
+                ins_count += insert_valid[lane];
+            end
+        end
+        count_next = flush ? '0 : (count_q - sq_count - iss_count + ins_count);
     end
 
     function automatic logic is_control_flow(issue_entry_t entry);

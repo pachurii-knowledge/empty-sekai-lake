@@ -160,3 +160,58 @@ ROB commit chain (stack_reset_mask -> active_commit_valid -> retire_valid -> com
 branch flush). This is the last false loop; it is NOT on the LSQ/IQ critical path. Next: re-synth at 1
 loop to read the REAL WNS (the route experiment proved the loops inflate WNS; with the DAG nearly clean
 the binding path should finally be a true logic/route path, not a phantom).
+
+## UPDATE 4 (2026-06-17): retire_valid broken -> UNOPTFLAT 26->0; TRUE WNS is REAL
+
+**Last loop broken (47baf97):** ActiveList commit block read commit_taken (pop) AND wrote
+commit_valid (present) -- the present runs before the pop, so the alias is false. Split into
+C1-present (writes commit_valid, reads NO commit_taken) + C2-pop (reads commit_taken -> final
+entries/head/count). Value-identical. UNOPTFLAT 1->0: DAG now fully combinational-loop-free.
+
+**DEFINITIVE WNS (0 loops, trustworthy STA): -12.77 ns Quick-place (~48.5 MHz).** The worst path is
+IDENTICAL across 26/6/1/0 loops: ALU writeback_reg[branch_mask] -> IntIssueQueue count_q, 75 levels,
+77% route. **With 0 loops STA has nothing to unroll, so this path is REAL** -- the branch-recovery
+broadcast (a resolved branch's abort_mask fans out to squash IQ/LSQ/ActiveList/BranchStack, then IQ
+occupancy recomputes). The none-flatten 8-module thread I read as an "unrolled loop" was the GENUINE
+broadcast cone touching all speculative structures.
+
+**HYPOTHESIS REFUTED:** "false loops inflate WNS; clean DAG reveals a better number" was WRONG. The
+loops corrupted STA ATTRIBUTION (the -42<->-12 phantom oscillation, endpoint mislabeling) but NOT the
+binding WNS value, which was always this real ~-12.5 ns path. **What the campaign DID deliver (real,
+and a prerequisite): UNOPTFLAT 26->0 = robust loop-free F2 netlist (no LUTLP-1) + trustworthy stable
+STA so every future cut is measurable. Zero IPC, full matrix green.** Default place+phys_opt = -17
+(WORSE), confirming logic-depth/fanout wall, not routing.
+
+**TO 125 MHz (now a clean, measurable target):** attack the branch_mask -> abort_mask broadcast ->
+squash -> IQ-count cone (75 lvl, 77% route). Levers: (a) reduce abort_mask compute depth; (b) split
+the IQ occupancy count from the full per-entry squash; (c) replicate the high-fanout abort_mask driver
+per consumer; (d) pipeline branch recovery (register abort_mask, +1 misprediction-recovery cycle, IPC).
+(a)-(c) are the lower-risk value-identical-ish cuts to try first.
+
+## UPDATE 5 (2026-06-17): value-identical timing opt EXHAUSTED -- the recovery cone is pipeline-bound
+
+With the DAG clean (0 loops), attempted a value-identical depth cut on the -12.77 worst path
+(ALU writeback branch_mask -> IntIssueQueue count_q, 74 lvl, 77% route): **IQ occupancy computed
+INCREMENTALLY (count_q - squashed - issued + inserted) instead of popcount(entries_next.valid).**
+Rigorously value-identical (squashed = entries_q.valid & abort-match; issued = popcount(issue_valid);
+disjoint since a squashed entry reads valid=0 in entries_wake so can't be selected; inserted =
+popcount(insert_valid) when !full). Verified rv32 247 / priv 28 / rv64 289 / xv6.
+
+**RESULT: WNS -12.77 -> -12.75 = NEUTRAL.** The cut took count_q OFF the path (endpoint moved to
+IntIssueQueue entries_q[imm]), but WNS held because the binding depth is the SHARED serial chain
+abort_mask -> squash (entries_wake) -> select (priority picks, clears entries_sel) -> insert (ins_free
+over the POST-select free mask, fills entries_next). count was just one tail branching off the END;
+the insert tail is co-deep. **No value-identical change shortens this serial chain:** de-serializing
+insert (fill PRE-select free slots so it doesn't wait for select) is NOT value-identical -- when an
+issued slot is lower than a free slot, lowest_idx picks a different slot -> different issue priority
+(architecturally correct, but not bit-identical, and a scheduling change can expose latent OoO bugs).
+
+**CONCLUSION: value-identical timing optimization is EXHAUSTED at -12.75 ns (~48.5 MHz, full IPC).**
+The recovery cone (a resolved branch's abort_mask broadcast -> per-structure squash -> IQ select +
+compaction, all single-cycle) is ~74 levels / 77% route and is fundamentally PIPELINE-bound. The
+count cut is kept as a building block (count off the path; a prerequisite for any later insert
+reschedule to show benefit), but it does not move WNS alone. **To 125 MHz, two user-decided levers:**
+(1) PIPELINE branch recovery -- register abort_mask so squash/select/insert span 2 cycles + a kill-bit
+to block wrong-path issue (+1 misprediction-recovery cycle; IPC on mispredicts); (2) RESCHEDULE --
+de-serialize insert-from-select (no IPC, architecturally correct, but not bit-identical -> re-verify
++ usertests stress). Both reshape the OoO surface -> supervised.
