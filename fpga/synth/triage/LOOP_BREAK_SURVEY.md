@@ -135,3 +135,28 @@ This is the single most intricate split in the campaign. Execute with FRESH cont
 ptw_pte_pmp_fault -> PTW: split ptw.sv so mem_addr is computed in a block not reading pte_pmp_fault,
 OR register the PMP address +1 PTW-walk cycle). Then a clean DAG -> trustworthy STA -> measure the
 real WNS (may be << -12) -> route/fanout/pipeline as needed.
+
+## UPDATE 3 (2026-06-17): LSQ + ptw DONE -- UNOPTFLAT 6 -> 1
+
+**LSQ wakeup<->load_writeback (d863562):** done as a 3-block split (HD / W / M), SIMPLER than the
+4-block design above. HD (head-skip + headq + per-op head blocks) reads entries_q + abort_mask
+(inline squash-valid) + registered state only -> load_writeback + head_delta (sparse per-field
+write-enables). W (squash + reset + wakeup + store-rederive) is the sole wakeup reader -> entries_wake.
+M layers head_delta onto entries_wake + store-commit + data-port mux. The AMO store_data is kept in HD
+(local to where load_writeback.data lives), so NO amo recompute in M was needed. head_delta's per-field
+we_* (not whole-entry replace) makes M value-identical regardless of same-cycle wakeup on the head
+entry. Result 6 -> 3 (the split also severed extra cycles routing through the LSQ).
+
+**ptw_pte_pmp_fault / ptw_mem_req / ptw_mem_ack (ptw.sv):** done by splitting the PTW next-state
+always_comb into 3 blocks: (1) mem_addr/mem_wdata -- read NEITHER pte_pmp_fault NOR mem_ack;
+(2) mem_req/mem_we -- read pte_pmp_fault (A/D-write suppression) but NOT mem_ack; (3) next-state --
+reads mem_ack/pte_pmp_fault, drives only state. Every memory output is a pure fn of registered state;
+isolating mem_addr from pte_pmp_fault severs the PMP loop, isolating the request strobes from mem_ack
+severs the request<->ack loop. mem_is_write (PtwPMP's other input) was already a registered continuous
+assign. Result 3 -> 1.
+
+**REMAINING (1): retire_valid (riscv_core_ooo.sv:394) -- the in-order commit cycle.** The active_list
+ROB commit chain (stack_reset_mask -> active_commit_valid -> retire_valid -> commit_take_trap ->
+branch flush). This is the last false loop; it is NOT on the LSQ/IQ critical path. Next: re-synth at 1
+loop to read the REAL WNS (the route experiment proved the loops inflate WNS; with the DAG nearly clean
+the binding path should finally be a true logic/route path, not a phantom).

@@ -226,16 +226,59 @@ module ptw
     // A/D update required (Svadu hardware update)
     assign need_ad = (!a_bit) || ((acc_q == ACC_STORE) && (!d_bit));
 
-    // Next-state / datapath
+    // FB2b false-loop break (ptw_pte_pmp_fault / ptw_mem_req / ptw_mem_ack): the
+    // memory-port OUTPUTS are the PA the integrating core PMP-checks (-> pte_pmp_fault)
+    // and the request it presents to memory (-> mem_ack). Computing them in the
+    // next-state block -- which READS pte_pmp_fault and mem_ack -- aliased them onto
+    // those inputs at whole-block granularity, drawing false comb loops
+    //   mem_addr -> PtwPMP -> pte_pmp_fault -> mem_addr   and
+    //   mem_req  -> memory  -> mem_ack       -> mem_req.
+    // But every memory output is a pure function of REGISTERED state. Split into:
+    //  (1) mem_addr/mem_wdata -- read NEITHER pte_pmp_fault NOR mem_ack (severs the
+    //      PMP loop: PtwPMP's address input no longer depends on its fault output);
+    //  (2) mem_req/mem_we -- read pte_pmp_fault (A/D-write suppression; pte_pmp_fault
+    //      is mem_addr-derived, so cannot feed back) but NOT mem_ack (severs the
+    //      request<->ack loop);
+    //  (3) the next-state block -- reads mem_ack/pte_pmp_fault, drives only state.
+    // mem_is_write (PtwPMP's other input) is already a registered continuous assign.
+    always_comb begin
+        mem_addr  = '0;
+        mem_wdata = '0;
+        unique case (state_q)
+            S_REQ:    mem_addr = cur_pte_addr;
+            S_AD_REQ: begin
+                mem_addr  = pte_addr_q;
+                mem_wdata = pte_q | (MXLEN'(1) << RISCV_Priv::PTE_A) |
+                    ((acc_q == ACC_STORE) ?
+                        (MXLEN'(1) << RISCV_Priv::PTE_D) : '0);
+            end
+            default: ;
+        endcase
+    end
+
+    // (2) Memory request strobes: mem_req/mem_we. Gated by pte_pmp_fault in the
+    // A/D-write state (suppress the write the PMP denies), but never read mem_ack.
+    always_comb begin
+        mem_req = 1'b0;
+        mem_we  = 1'b0;
+        unique case (state_q)
+            S_REQ: mem_req = 1'b1;
+            S_AD_REQ: begin
+                // Suppress the write itself when PMP denies it -- the A/D bits must
+                // NOT be updated on a faulting A/D write (the access faults instead).
+                mem_req = !pte_pmp_fault;
+                mem_we  = !pte_pmp_fault;
+            end
+            default: ;
+        endcase
+    end
+
+    // (3) Next-state / datapath
     always_comb begin
         state_n   = state_q;
         level_n   = level_q;
         base_n    = base_q;
         walk_bad_n = walk_bad_q;
-        mem_req   = 1'b0;
-        mem_we    = 1'b0;
-        mem_addr  = '0;
-        mem_wdata = '0;
 
         unique case (state_q)
             S_IDLE: begin
@@ -253,8 +296,6 @@ module ptw
                 end
             end
             S_REQ: begin
-                mem_req  = 1'b1;
-                mem_addr = cur_pte_addr;
                 if (pte_pmp_fault) state_n = S_DONE;   // PMP-denied PTE: abort walk
                 else if (mem_ack)  state_n = S_WAIT;
             end
@@ -281,16 +322,9 @@ module ptw
                 end
             end
             S_AD_REQ: begin
-                // Suppress the write itself when PMP denies it -- the A/D bits
-                // must NOT be updated on a faulting A/D write (the access faults
-                // instead). Asserting mem_we here regardless would wrongly commit
-                // the update before the abort.
-                mem_req   = !pte_pmp_fault;
-                mem_we    = !pte_pmp_fault;
-                mem_addr  = pte_addr_q;
-                mem_wdata = pte_q | (MXLEN'(1) << RISCV_Priv::PTE_A) |
-                    ((acc_q == ACC_STORE) ?
-                        (MXLEN'(1) << RISCV_Priv::PTE_D) : '0);
+                // The A/D write (mem_req/mem_we/mem_wdata/mem_addr) and its PMP
+                // suppression are driven in the memory-output blocks above; here only
+                // the state advance, which aborts the walk on the PMP-denied write.
                 if (pte_pmp_fault) state_n = S_DONE;   // PMP-denied A/D write: abort
                 else if (mem_ack)  state_n = S_AD_WAIT;
             end
