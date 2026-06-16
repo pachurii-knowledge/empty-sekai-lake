@@ -85,3 +85,53 @@ trustworthy, and the real worst path is finally measurable.
   targeted register (IPC). Confidence is high (the registered-derived argument is rigorous and the
   design provably settles), but items 5/6 (B1 commit cycle, ptw) are the least-verified.
 - **Effort:** ~4-6 module decompositions, each the same low-risk pure-code-motion pattern as `5aa3871`.
+
+## UPDATE 2 (2026-06-17): 26->6 done; route experiment; LSQ split fully designed
+
+**Done & verified (26->6, zero IPC):** d7d642c IQ+wb-bus, 99bfc8a LSQ(block1/2)+B1+B2c, d4629f9
+branch_stack, abeec37 active_list, f2f99a4 branch_stack restore_valid flush-gate drop. rv32 247 /
+priv 28 / rv64 289 / xv6 boot-$.
+
+**"Attack the route" PROVED the loops must be broken first:** fresh synth + default place_design +
+phys_opt_design + ALLOW_COMBINATORIAL_LOOPS gave WNS -19.65/-19.53 -- WORSE than Quick's -12.27. The
+aggressive placer chases the false-loop phantom paths (high-fanout, unplaceable) and degrades WNS. So
+the -12 was a lucky loop-cut; the route is unattackable while the loops live. AND the loops INFLATE
+WNS -> a clean DAG may reveal a real WNS << -12. So the LSQ split is UNAVOIDABLE for any real number.
+
+### LSQ wakeup<->load_writeback split -- FULL DESIGN (the remaining WNS-relevant loop)
+
+The alias: load_store_queue block 1 reads wakeup (squash/wakeup writes entries_premerge.src_ready/addr)
+AND writes load_writeback (head-ops). load_writeback is registered-derived (headq=entries_q[head_next]
++ data_load + reservation_q) -- BUT head_next itself aliases wakeup (the head-skip reads the post-
+wakeup entries_premerge[k].valid). So a clean break needs a 4-block decomposition:
+
+- **1a** (squash + wakeup + store-format): entries_q -> entries_wake + extract prem_valid[k] (1-bit).
+  Reads wakeup. The ONLY wakeup reader.
+- **1b** (head-skip): prem_valid -> head_next + count_after_skip. Reads prem_valid (NOT entries_wake)
+  -> head_next no longer aliases wakeup.
+- **1c** (head-ops): reads headq=entries_q[head_next from 1b] + xlate + reservation_q + data_load +
+  mem_inflight_q (ALL registered) -> load_writeback + head_done + head_retire + head_delta + reservation
+  _mid + load_data_en + load_data_addr + mem_inflight_next + store_probe_hi_next + double_store_next.
+  NO entries_wake / wakeup read -> load_writeback is clean.
+- **1d** (merge + store-commit): entries_premerge = entries_wake; apply head_delta to [head_next];
+  store-commit (reads entries_q[head_next] + commit_store); data-port MUX (double_store < load_data <
+  store_commit); reservation_next = reservation_mid then store-commit clears; count. Writes entries_
+  premerge (NOT load_writeback) -> reads wakeup (entries_wake) but does not alias load_writeback.
+- **block 2** (insert, unchanged): entries_next = entries_premerge + insert.
+
+**~30 premerge signals threaded 1c->1d:** head_delta = retire flag + per-field {val,we} for issued_
+load, store_lo_pa, store_hi_pa, store_data, store_mask, load_complete, load_low_word, double_low_valid,
+addr (~9 fields x2). Plus reservation_mid, load_data_en/addr, mem_inflight_next, store_probe_hi_next,
+double_store_{addr,data,mask}_next, head_next, count. SUBTLETIES: (a) AMO store_data is computed from
+load_writeback.data in the current code -> 1d must recompute amo_loaded = format_load(data_load,...)
+locally (1c's load_writeback.data is cross-block). (b) two-retire-per-cycle: load-complete retires
+head N (head_next++), store-commit then operates on N+1 -> 1d's store-commit reads the post-head-delta
+head_next. (c) the data_* memory port is single -> 1d muxes the load-issue drive (1c) under the store-
+commit/double-store drive.
+
+**RISK: a missed field/case = silent LSQ memory corruption that passes ACT but fails under stress.**
+This is the single most intricate split in the campaign. Execute with FRESH context + verify rv32 247
+/priv 28/rv64 289/xv6 + AGENT_DEBUG usertests stress. Then ptw (PtwPMP reads live ptw_mem_addr ->
+ptw_pte_pmp_fault -> PTW: split ptw.sv so mem_addr is computed in a block not reading pte_pmp_fault,
+OR register the PMP address +1 PTW-walk cycle). Then a clean DAG -> trustworthy STA -> measure the
+real WNS (may be << -12) -> route/fanout/pipeline as needed.
