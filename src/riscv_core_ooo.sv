@@ -1516,6 +1516,27 @@ module riscv_core_ooo
         end
     end
 
+    // frontend_stall: pure combinational of two module-input stalls; a
+    // continuous assign keeps it out of the procedural dispatch blocks.
+    assign frontend_stall = dispatch_stall || fetch_xlate_stall;
+
+    // ================================================================
+    // Dispatch pipeline, decomposed into single-purpose comb blocks
+    // (FB2b Wall A). The former 700-line monolith drew false
+    // combinational-loop edges between every input it read and every
+    // output it wrote (Verilator/Vivado analyze dependencies at
+    // whole-block granularity), corrupting the post-place STA. Splitting
+    // it into the real dataflow stages -- LaneDecode -> BranchPredict ->
+    // Rename, and CommitTrap -> InterruptDrain -> FrontendControl --
+    // gives the tool the true (acyclic) graph. Each block is
+    // value-identical pure code motion: every signal has exactly one
+    // driver block, and every cross-block read is of a settled value
+    // (no earlier block reads a later block's output). Inits live with
+    // their owning block.
+    // ================================================================
+
+    // ---- B1: lane decode (per-lane attributes, rename source regs,
+    // dispatch/valid counts, partial-resume) ----
     always_comb begin
         lane_valid = '0;
         lane_has_dest = '0;
@@ -1523,69 +1544,14 @@ module riscv_core_ooo
         lane_is_unpredicted_control = '0;
         lane_is_call = '0;
         lane_is_return = '0;
-        lane_control_predicted = '0;
         lane_is_memory = '0;
         lane_is_terminal = '0;
         lane_is_serializing = '0;
-        alloc_req = '0;
-        int_insert_valid = '0;
-        mem_insert_valid = '0;
-        branch_allocate = 1'b0;
         dispatch_count = '0;
         valid_count = '0;
         partial_resume_valid = 1'b0;
         partial_resume_lane = '0;
         partial_resume_lane_is_branch = 1'b0;
-        dispatched_unpredicted_control = 1'b0;
-        ras_redirect_valid = 1'b0;
-        ras_redirect_pc = '0;
-        predictor_redirect_valid = 1'b0;
-        predictor_redirect_pc = '0;
-        ras_stack_next = ras_stack_q;
-        fp_regs_next = fp_regs_q;
-        serial_pending_next = serial_pending_q;
-        csr_retire = 1'b0;
-        csr_commit_write = 1'b0;
-        csr_commit_addr = '0;
-        csr_commit_wdata = '0;
-        csr_fp_fflags_valid = 1'b0;
-        csr_fp_fflags = '0;
-        commit_exc_valid = 1'b0;
-        commit_exc_cause = 5'd0;
-        commit_exc_tval = 32'd0;
-        commit_trap_epc = 32'd0;
-        commit_take_trap = 1'b0;
-        commit_take_ret = 1'b0;
-        commit_ret_from_s = 1'b0;
-        commit_take_int = 1'b0;
-        commit_int_epc = 32'd0;
-        tlb_flush = 1'b0;
-        irq_drain_next = irq_drain_q;
-        wfi_wait_set = 1'b0;
-        ras_count_next = branch_restore_valid ?
-            ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
-        ras_checkpoint_count_next = ras_checkpoint_count_q;
-        ras_branch_snapshot_count = ras_count_next;
-        // Speculative global history: on a misprediction restore the branch's
-        // pre-push checkpoint, then re-push the resolved direction if the
-        // resolving branch was conditional (mirrors the RAS recovery above).
-        ghr_next = branch_restore_valid ?
-            ghr_checkpoint_q[branch_resolve_id] : ghr_q;
-        if (branch_restore_valid && branch_resolve_valid &&
-                (branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH)) begin
-            ghr_next = {ghr_next[DIRECT_HISTORY_BITS-2:0],
-                (branch_writeback.redirect_pc != branch_writeback.pc + 32'd4)};
-        end
-        ghr_checkpoint_next = ghr_checkpoint_q;
-        ghr_branch_snapshot = ghr_next;
-        frontend_stall = dispatch_stall || fetch_xlate_stall;
-        branch_active_tail_snapshot = active_tail;
-        branch_free_head_snapshot = free_head_snapshot;
-        branch_free_tail_snapshot = free_tail_snapshot;
-        branch_free_count_snapshot = free_count_snapshot;
-        for (int i = 0; i < 32; i += 1) begin
-            branch_map_snapshot[i] = map_snapshot[i];
-        end
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             map_rs1[i] = decode_lanes[i].rs1;
@@ -1614,12 +1580,10 @@ module riscv_core_ooo
                 (decode_lanes[i].ctrl.syscall || decode_lanes[i].ctrl.illegal_instr);
             lane_is_serializing[i] = lane_valid[i] &&
                 decode_lanes[i].ctrl.serializing;
-            lane_predicted_pc[i] = decode_lanes[i].pc + 32'd4;
             lane_active_offset[i] = dispatch_count;
             if (lane_valid[i]) begin
                 valid_count += 1'b1;
             end
-            lane_predictor_info[i] = '0;
             if (dispatch_valid[i]) begin
                 dispatch_count += 1'b1;
             end else if (lane_valid[i] && !partial_resume_valid) begin
@@ -1627,6 +1591,47 @@ module riscv_core_ooo
                 partial_resume_lane = 3'(i);
                 partial_resume_lane_is_branch = lane_is_branch[i];
             end
+        end
+    end
+
+    // ---- B2: branch prediction + checkpoint (RAS/GHR/predictor
+    // redirects, branch-stack snapshots, control-predicted lane attrs) ----
+    always_comb begin
+        // Per-lane control-predicted / predicted-PC / predictor-info
+        // defaults (overridden below for predicted lanes).
+        lane_control_predicted = '0;
+        dispatched_unpredicted_control = 1'b0;
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            lane_predicted_pc[i] = decode_lanes[i].pc + 32'd4;
+            lane_predictor_info[i] = '0;
+        end
+        ras_redirect_valid = 1'b0;
+        ras_redirect_pc = '0;
+        predictor_redirect_valid = 1'b0;
+        predictor_redirect_pc = '0;
+        ras_stack_next = ras_stack_q;
+        ras_count_next = branch_restore_valid ?
+            ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
+        ras_checkpoint_count_next = ras_checkpoint_count_q;
+        ras_branch_snapshot_count = ras_count_next;
+        // Speculative global history: on a misprediction restore the branch's
+        // pre-push checkpoint, then re-push the resolved direction if the
+        // resolving branch was conditional (mirrors the RAS recovery above).
+        ghr_next = branch_restore_valid ?
+            ghr_checkpoint_q[branch_resolve_id] : ghr_q;
+        if (branch_restore_valid && branch_resolve_valid &&
+                (branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH)) begin
+            ghr_next = {ghr_next[DIRECT_HISTORY_BITS-2:0],
+                (branch_writeback.redirect_pc != branch_writeback.pc + 32'd4)};
+        end
+        ghr_checkpoint_next = ghr_checkpoint_q;
+        ghr_branch_snapshot = ghr_next;
+        branch_active_tail_snapshot = active_tail;
+        branch_free_head_snapshot = free_head_snapshot;
+        branch_free_tail_snapshot = free_tail_snapshot;
+        branch_free_count_snapshot = free_count_snapshot;
+        for (int i = 0; i < 32; i += 1) begin
+            branch_map_snapshot[i] = map_snapshot[i];
         end
 
         branch_active_tail_snapshot = active_tail + active_id_t'(dispatch_count);
@@ -1693,7 +1698,14 @@ module riscv_core_ooo
                 dispatched_unpredicted_control = 1'b1;
             end
         end
+    end
 
+    // ---- B3: rename packets + issue-queue insert payloads ----
+    always_comb begin
+        alloc_req = '0;
+        int_insert_valid = '0;
+        mem_insert_valid = '0;
+        branch_allocate = 1'b0;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             alloc_req[i] = dispatch_valid[i] && lane_has_dest[i];
             rename_packets[i] = '0;
@@ -1768,15 +1780,19 @@ module riscv_core_ooo
             mem_insert_valid[i] = dispatch_valid[i] && lane_is_memory[i];
             branch_allocate |= dispatch_valid[i] && lane_is_branch[i];
         end
+    end
 
-        // (phys-reg read addresses, mem-insert operand data, wakeup and
-        // phys-write fan-out moved OUT of this monolithic dispatch always_comb
-        // into the dedicated PhysRegRead/MemOperandWakeup blocks below -- see the
-        // FB2b false-loop note there. Keeping them here made Verilator/Vivado draw
-        // a spurious edge from int_issue_entry into every output of this 700-line
-        // block, closing the abort_mask/branch_mask/issue false combinational loops
-        // that corrupt the post-place STA.)
-
+    // ---- B4: in-order commit -- architectural regfile / RRAT update,
+    // commit-time trap/return detection, precise-trap flush + rollback ----
+    always_comb begin
+        commit_exc_valid = 1'b0;
+        commit_exc_cause = 5'd0;
+        commit_exc_tval = 32'd0;
+        commit_trap_epc = 32'd0;
+        commit_take_trap = 1'b0;
+        commit_take_ret = 1'b0;
+        commit_ret_from_s = 1'b0;
+        wfi_wait_set = 1'b0;
         arch_rd_we = '0;
         arch_rd = '0;
         arch_rd_data = '0;
@@ -1937,6 +1953,13 @@ module riscv_core_ooo
             map_restore_map[i] = trap_take ? arch_map_next[i] :
                                              branch_restore_map[i];
         end
+    end
+
+    // ---- B5: precise interrupt drain (ROB-empty) + WFI idle FSM ----
+    always_comb begin
+        commit_take_int = 1'b0;
+        commit_int_epc = 32'd0;
+        irq_drain_next = irq_drain_q;
 
         // ---- Precise interrupt handling via ROB drain (Phase 3b) ----
         // Mirror trap_controller's interrupt-enable evaluation so we can stop
@@ -1992,7 +2015,10 @@ module riscv_core_ooo
         wfi_wait_next = wfi_wait_q;
         if (wfi_wait_set) wfi_wait_next = 1'b1;
         if (wfi_wake || trap_take || halted_q) wfi_wait_next = 1'b0;
+    end
 
+    // ---- B6: data-memory port request drive ----
+    always_comb begin
         // Drive the data port request. Apply Sv32 translation at the memory
         // port: the LSQ works in virtual addresses; the physical word address
         // is computed by the MMU above. The store write beats are the
@@ -2004,6 +2030,21 @@ module riscv_core_ooo
                                                                 : mem_data_addr;
         dmem_req_wdata = mem_data_store;
         dmem_req_wmask = mem_data_store_mask;
+    end
+
+    // ---- B7: frontend control + commit-driven redirects (pc_next,
+    // fetch flush/consume/issue, ifetch invalidate, pending interlocks,
+    // CSR/FP commit writes, fence.i / sfence / satp / trap redirects) ----
+    always_comb begin
+        fp_regs_next = fp_regs_q;
+        serial_pending_next = serial_pending_q;
+        csr_retire = 1'b0;
+        csr_commit_write = 1'b0;
+        csr_commit_addr = '0;
+        csr_commit_wdata = '0;
+        csr_fp_fflags_valid = 1'b0;
+        csr_fp_fflags = '0;
+        tlb_flush = 1'b0;
 
         pc_next = pc_q;
         fetch_flush = 1'b0;
