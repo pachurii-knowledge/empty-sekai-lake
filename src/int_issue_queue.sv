@@ -31,6 +31,15 @@ module int_issue_queue
 
     issue_entry_t entries_q [INT_IQ_SIZE];
     issue_entry_t entries_next [INT_IQ_SIZE];
+    // FB2b false-loop break: the former monolithic always_comb read insert_entry
+    // (insert) AND wrote issue_entry (select) -- a whole-block alias that drew the
+    // false dispatch_issue_entries -> int_issue_entry loop edge on EVERY UNOPTFLAT
+    // loop. Split into A: squash+wakeup (-> entries_wake), B: select (-> issue_entry
+    // + entries_sel), C: insert+flush+count (-> entries_next). Select runs before
+    // insert, so issue_entry never depended on insert_entry; this is pure code
+    // motion (value-identical), making the acyclicity structural.
+    issue_entry_t entries_wake [INT_IQ_SIZE]; // post squash + wakeup
+    issue_entry_t entries_sel  [INT_IQ_SIZE]; // post select (issued slots cleared)
     logic [$clog2(INT_IQ_SIZE+1)-1:0] count_q, count_next;
     logic [$clog2(OOO_WIDTH+1)-1:0] insert_count;
 
@@ -59,25 +68,21 @@ module int_issue_queue
         end
     end
 
+    // ---- A: squash + branch-mask reset + wakeup (post-wakeup snapshot) ----
     always_comb begin
-        entries_next = entries_q;
-        issue_valid = '0;
-        for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
-            issue_entry[i] = '0;
-        end
-
+        entries_wake = entries_q;
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-            if ((entries_next[i].branch_mask & abort_mask) != '0) begin
-                entries_next[i] = '0;
-            end else if (entries_next[i].valid) begin
-                entries_next[i].branch_mask &= ~reset_mask;
+            if ((entries_wake[i].branch_mask & abort_mask) != '0) begin
+                entries_wake[i] = '0;
+            end else if (entries_wake[i].valid) begin
+                entries_wake[i].branch_mask &= ~reset_mask;
                 for (int w = 0; w < OOO_WIDTH; w += 1) begin
                     if (wakeup_valid[w]) begin
-                        if (entries_next[i].prs1 == wakeup_prd[w]) begin
-                            entries_next[i].src1_ready = 1'b1;
+                        if (entries_wake[i].prs1 == wakeup_prd[w]) begin
+                            entries_wake[i].src1_ready = 1'b1;
                         end
-                        if (entries_next[i].prs2 == wakeup_prd[w]) begin
-                            entries_next[i].src2_ready = 1'b1;
+                        if (entries_wake[i].prs2 == wakeup_prd[w]) begin
+                            entries_wake[i].src2_ready = 1'b1;
                         end
                     end
                 end
@@ -88,33 +93,44 @@ module int_issue_queue
                 // register) so the value is NOT yet available -> they wake only on
                 // the completion wakeup above. spec_wake_prd is a freshly allocated
                 // dest (has_dest, prd != 0), so it never spuriously matches prs == 0.
-                if (entries_next[i].fu_class == FU_ALU) begin
+                if (entries_wake[i].fu_class == FU_ALU) begin
                     for (int w = 0; w < ALU_ISSUE_PORTS; w += 1) begin
                         if (spec_wake_valid[w]) begin
-                            if (entries_next[i].prs1 == spec_wake_prd[w]) begin
-                                entries_next[i].src1_ready = 1'b1;
+                            if (entries_wake[i].prs1 == spec_wake_prd[w]) begin
+                                entries_wake[i].src1_ready = 1'b1;
                             end
-                            if (entries_next[i].prs2 == spec_wake_prd[w]) begin
-                                entries_next[i].src2_ready = 1'b1;
+                            if (entries_wake[i].prs2 == spec_wake_prd[w]) begin
+                                entries_wake[i].src2_ready = 1'b1;
                             end
                         end
                     end
                 end
             end
         end
+    end
+
+    // ---- B: per-FU-class select -> issue ports + post-select entries ----
+    // Reads ONLY entries_wake (NOT insert_entry); this is what severs the false
+    // dispatch_issue_entries -> int_issue_entry loop edge.
+    always_comb begin
+        entries_sel = entries_wake;
+        issue_valid = '0;
+        for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
+            issue_entry[i] = '0;
+        end
 
         // ---- Per-FU-class eligibility (parallel over the post-wakeup entries) ----
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-            sel_rdy[i] = entries_next[i].valid &&
-                entries_next[i].src1_ready && entries_next[i].src2_ready;
-            sel_cf[i] = is_control_flow(entries_next[i]);
+            sel_rdy[i] = entries_wake[i].valid &&
+                entries_wake[i].src1_ready && entries_wake[i].src2_ready;
+            sel_cf[i] = is_control_flow(entries_wake[i]);
             // A control-flow op may issue only once every older branch it is
             // speculative under has resolved (branch_mask == 0).
-            sel_alu_cand[i] = sel_rdy[i] && (entries_next[i].fu_class == FU_ALU) &&
-                !(sel_cf[i] && (entries_next[i].branch_mask != '0));
-            sel_mul[i] = sel_rdy[i] && (entries_next[i].fu_class == FU_MUL);
-            sel_div[i] = sel_rdy[i] && (entries_next[i].fu_class == FU_DIV);
-            sel_fp[i]  = sel_rdy[i] && (entries_next[i].fu_class == FU_FP);
+            sel_alu_cand[i] = sel_rdy[i] && (entries_wake[i].fu_class == FU_ALU) &&
+                !(sel_cf[i] && (entries_wake[i].branch_mask != '0));
+            sel_mul[i] = sel_rdy[i] && (entries_wake[i].fu_class == FU_MUL);
+            sel_div[i] = sel_rdy[i] && (entries_wake[i].fu_class == FU_DIV);
+            sel_fp[i]  = sel_rdy[i] && (entries_wake[i].fu_class == FU_FP);
         end
 
         // ---- ALU 2-pick (ports 0,1) ----  a0 = lowest candidate; a1 = next lowest
@@ -135,41 +151,53 @@ module int_issue_queue
         div_idx = lowest_idx(sel_div);
         fp_idx  = lowest_idx(sel_fp);
 
-        // ---- Apply picks: drive the FU ports, clear the issued entries. The picked
-        // indices are distinct (a1 != a0; MUL/DIV/FP are different fu_class), so the
-        // clears never collide. ----
+        // ---- Apply picks: drive the FU ports, clear the issued entries in the
+        // post-select snapshot. The picked indices are distinct (a1 != a0;
+        // MUL/DIV/FP are different fu_class), so the clears never collide. ----
         if (alu0_found) begin
             issue_valid[ISSUE_ALU0] = 1'b1;
-            issue_entry[ISSUE_ALU0] = entries_next[alu0_idx];
-            entries_next[alu0_idx] = '0;
+            issue_entry[ISSUE_ALU0] = entries_wake[alu0_idx];
+            entries_sel[alu0_idx] = '0;
         end
         if (alu1_found) begin
             issue_valid[ISSUE_ALU1] = 1'b1;
-            issue_entry[ISSUE_ALU1] = entries_next[alu1_idx];
-            entries_next[alu1_idx] = '0;
+            issue_entry[ISSUE_ALU1] = entries_wake[alu1_idx];
+            entries_sel[alu1_idx] = '0;
         end
         if (issue_ready[ISSUE_MUL] && (sel_mul != '0)) begin
             issue_valid[ISSUE_MUL] = 1'b1;
-            issue_entry[ISSUE_MUL] = entries_next[mul_idx];
-            entries_next[mul_idx] = '0;
+            issue_entry[ISSUE_MUL] = entries_wake[mul_idx];
+            entries_sel[mul_idx] = '0;
         end
         if (issue_ready[ISSUE_DIV] && (sel_div != '0)) begin
             issue_valid[ISSUE_DIV] = 1'b1;
-            issue_entry[ISSUE_DIV] = entries_next[div_idx];
-            entries_next[div_idx] = '0;
+            issue_entry[ISSUE_DIV] = entries_wake[div_idx];
+            entries_sel[div_idx] = '0;
         end
         if (issue_ready[ISSUE_FP] && (sel_fp != '0)) begin
             issue_valid[ISSUE_FP] = 1'b1;
-            issue_entry[ISSUE_FP] = entries_next[fp_idx];
-            entries_next[fp_idx] = '0;
+            issue_entry[ISSUE_FP] = entries_wake[fp_idx];
+            entries_sel[fp_idx] = '0;
         end
 
-        // ---- Parallel insert ---- The incoming ops fill the lowest free slots, in
-        // lane order. free_mask is the post-squash/select occupancy; ins_free[k] is
-        // the k-th lowest free slot (priority encoders, each excluding the prior).
-        // A valid lane takes ins_free[its prefix rank] = the (#valid lanes before
-        // it)-th lowest free slot -- exactly the serial "first free, in lane order".
-        // !full guarantees >= OOO_WIDTH free slots, so all ins_free[] are valid.
+        if (flush) begin
+            issue_valid = '0;
+            for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
+                issue_entry[i] = '0;
+            end
+        end
+    end
+
+    // ---- C: parallel insert (lowest free slots) + flush + occupancy ----
+    always_comb begin
+        entries_next = entries_sel;
+
+        // The incoming ops fill the lowest free slots, in lane order. free_mask is
+        // the post-squash/select occupancy; ins_free[k] is the k-th lowest free slot
+        // (priority encoders, each excluding the prior). A valid lane takes
+        // ins_free[its prefix rank] = the (#valid lanes before it)-th lowest free
+        // slot -- exactly the serial "first free, in lane order". !full guarantees
+        // >= OOO_WIDTH free slots, so all ins_free[] are valid.
         if (!full) begin
             for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
                 ins_free_mask[i] = !entries_next[i].valid;
@@ -203,17 +231,11 @@ module int_issue_queue
             for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
                 entries_next[i] = '0;
             end
-            issue_valid = '0;
-            for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
-                issue_entry[i] = '0;
-            end
         end
 
         // Queue occupancy = popcount of the valid bits in the final next-state
-        // (flush zeroes every entry -> 0). Replaces the serial -1/+1 RMW that was
-        // threaded through squash/issue/insert, which put count_next on the deep
-        // serial select->count chain (the abort_mask -> count_q worst path). The
-        // sum of 1-bit valids synthesizes to a shallow popcount adder tree.
+        // (flush zeroes every entry -> 0). The sum of 1-bit valids synthesizes to a
+        // shallow popcount adder tree.
         count_next = '0;
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
             count_next += entries_next[i].valid;

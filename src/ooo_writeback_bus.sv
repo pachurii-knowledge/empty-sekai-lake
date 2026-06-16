@@ -45,7 +45,6 @@ module ooo_writeback_bus
         packets[3] = mul_writeback;
         packets[4] = div_writeback;
         packets[5] = fp_writeback;
-        branch_writeback = '0;
         source_valid = '0;
         source_accepted = '0;
 
@@ -95,9 +94,6 @@ module ooo_writeback_bus
                     writeback_exception[lane] = packets[source].exception;
                     writeback_exc_cause[lane] = packets[source].exc_cause;
                     writeback_halted[lane] = packets[source].halted;
-                    if (packets[source].branch_valid) begin
-                        branch_writeback = packets[source];
-                    end
                 end
             end
         end
@@ -108,6 +104,27 @@ module ooo_writeback_bus
             ((div_writeback.branch_mask & abort_mask_q) != '0);
         fp_writeback_ready = !fp_writeback.valid || source_accepted[5] ||
             ((fp_writeback.branch_mask & abort_mask_q) != '0);
+    end
+
+    // ---- branch_writeback (split out to break the false load_writeback ->
+    // branch_writeback loop edge). Only ALU ops carry branch_valid, and ALU sources
+    // 0/1 are top-priority in the arbitration above (the 4 lanes always seat them),
+    // so an ALU branch packet is always accepted onto the bus when valid and passing
+    // the abort_mask_q gate -- the same condition checked here. At most one
+    // control-flow op issues per cycle (IQ branch constraint), so alu0/alu1 are
+    // never both branches; the alu1 override mirrors the former in-loop last-write.
+    // Reads ONLY the ALU writebacks, so branch_writeback no longer whole-block-
+    // aliases load_writeback. Value-identical.
+    always_comb begin
+        branch_writeback = '0;
+        if (alu0_writeback.valid && alu0_writeback.branch_valid &&
+                ((alu0_writeback.branch_mask & abort_mask_q) == '0)) begin
+            branch_writeback = alu0_writeback;
+        end
+        if (alu1_writeback.valid && alu1_writeback.branch_valid &&
+                ((alu1_writeback.branch_mask & abort_mask_q) == '0)) begin
+            branch_writeback = alu1_writeback;
+        end
     end
 
 endmodule: ooo_writeback_bus
