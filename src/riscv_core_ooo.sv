@@ -64,6 +64,18 @@ module riscv_core_ooo
     input wire logic             hpm_l1d_wb,
 
     output logic             halted
+`ifdef FPGA_BUILD
+    ,
+    // ---- FB1: vUART byte streams (rerouted from the sim console) + a debug
+    // observability probe (pure tap off the commit stage). Both inert unless
+    // FPGA_BUILD; see niigo_soc.sv / cl_niigo.sv.
+    output logic             vuart_tx_valid,
+    output logic [7:0]       vuart_tx_byte,
+    input  wire logic        vuart_rx_valid,
+    input  wire logic [7:0]  vuart_rx_byte,
+    output logic             vuart_rx_pop,
+    output debug_probe_t     dbg_probe
+`endif
 );
 
     // Byte-address -> word-address shift for the word-granular memory bus.
@@ -691,6 +703,11 @@ module riscv_core_ooo
         .load_hit(uart_load_hit),
         .load_data(uart_load_data),
         .irq(uart_irq)
+`ifdef FPGA_BUILD
+        ,
+        .vuart_tx_valid, .vuart_tx_byte,
+        .vuart_rx_valid, .vuart_rx_byte, .vuart_rx_pop
+`endif
     );
 
     // ===================== Sv32 MMU (Phase 4) =====================
@@ -2686,6 +2703,32 @@ module riscv_core_ooo
                     ptw_fault, lsq_xlate_stall, lsq_xlate_fault, mem_data_load_en,
                     dmem_req_addr);
         end
+    end
+`endif
+
+`ifdef FPGA_BUILD
+    // FB1 debug observability probe: a pure combinational tap off the commit
+    // stage. No functional effect -- only wired out under FPGA_BUILD. The OCL
+    // debug block (ocl_csr.sv) clocks these into the PC ring / instret counter,
+    // the shadow architectural regfile, and the trap log.
+    always_comb begin
+        dbg_probe = '0;
+        for (int i = 0; i < OOO_WIDTH; i++) begin
+            dbg_probe.retire_valid[i] = retire_valid[i];
+            dbg_probe.retire_pc[i]    = active_commit_packet[i].pc;
+            dbg_probe.arch_we[i]      = arch_rd_we[i];
+            dbg_probe.arch_rd[i]      = arch_rd[i][ARCH_REG_BITS-1:0];
+            dbg_probe.arch_data[i]    = arch_rd_data[i];
+        end
+        dbg_probe.trap_valid  = commit_take_trap || commit_take_int;
+        dbg_probe.trap_is_int = tc_is_int;
+        dbg_probe.trap_cause  = tc_cause;
+        dbg_probe.trap_epc    = commit_take_int ? commit_int_epc : commit_trap_epc;
+        dbg_probe.trap_tval   = tc_is_int ? '0 : commit_exc_tval;
+        dbg_probe.halted      = halted_q;
+        dbg_probe.hpm_l1i_miss = hpm_l1i_miss;
+        dbg_probe.hpm_l1d_miss = hpm_l1d_miss;
+        dbg_probe.hpm_l1d_wb   = hpm_l1d_wb;
     end
 `endif
 

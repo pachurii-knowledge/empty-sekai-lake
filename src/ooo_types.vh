@@ -183,6 +183,29 @@ package OOO_Types;
         logic [4:0]    exc_cause;
     } commit_packet_t;
 
+    // FB1 debug-observability probe (FPGA bring-up). A pure tap off existing
+    // commit-stage signals -- zero functional change. Carried as one struct
+    // port from riscv_core_ooo up through niigo_soc to the OCL debug block,
+    // only wired under FPGA_BUILD. Feeds: committed-PC ring + instret counter
+    // (retire_*), a shadow architectural regfile (arch_*), and a trap log
+    // (trap_*). `halted` surfaces the ECALL/tohost halt for STATUS.
+    typedef struct packed {
+        logic [OOO_WIDTH-1:0]                    retire_valid; // per-lane actual retire
+        logic [OOO_WIDTH-1:0][XLEN-1:0]          retire_pc;    // committed PC per lane
+        logic [OOO_WIDTH-1:0]                    arch_we;      // committed arch-reg write
+        logic [OOO_WIDTH-1:0][ARCH_REG_BITS-1:0] arch_rd;      // destination arch reg
+        logic [OOO_WIDTH-1:0][XLEN-1:0]          arch_data;    // committed value
+        logic                                    trap_valid;   // precise trap taken
+        logic                                    trap_is_int;  // interrupt vs exception
+        logic [4:0]                              trap_cause;   // cause code
+        logic [XLEN-1:0]                         trap_epc;     // faulting/return PC
+        logic [XLEN-1:0]                         trap_tval;    // trap value
+        logic                                    halted;       // core quiesced
+        logic                                    hpm_l1i_miss; // cache event pulses
+        logic                                    hpm_l1d_miss; // (counted in ocl_csr)
+        logic                                    hpm_l1d_wb;
+    } debug_probe_t;
+
     function automatic logic is_mul_op(input alu_op_t op);
         is_mul_op = (op == ALU_MUL) || (op == ALU_MULH) ||
             (op == ALU_MULHSU) || (op == ALU_MULHU) || (op == ALU_MULW);

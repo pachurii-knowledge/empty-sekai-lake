@@ -28,6 +28,7 @@ module niigo_soc
     import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
     import NIIGO_Mem::*;
+    import OOO_Types::debug_probe_t;
 (
     input  wire logic                  clk,
     input  wire logic                  rst_l,
@@ -62,7 +63,17 @@ module niigo_soc
     input  wire logic [AXI_ID_W-1:0]   m_axi_rid,
     input  wire logic [AXI_DATA_W-1:0] m_axi_rdata,
     input  wire logic [1:0]            m_axi_rresp,
-    input  wire logic                  m_axi_rlast
+    input  wire logic                  m_axi_rlast,
+
+    // ---- FB1 control/observability taps to the OCL plane (cl_niigo) ----
+    // vUART byte streams (console) + the commit-stage debug probe. Device space
+    // (CLINT/PLIC/UART) stays inside the core; only these and the AXI master exit.
+    output logic                       vuart_tx_valid,
+    output logic [7:0]                 vuart_tx_byte,
+    input  wire logic                  vuart_rx_valid,
+    input  wire logic [7:0]            vuart_rx_byte,
+    output logic                       vuart_rx_pop,
+    output debug_probe_t               dbg_probe
 );
 
     // ---- core <-> memsys handshaked ports ----
@@ -97,7 +108,10 @@ module niigo_soc
         .ptw_mem_ack, .ptw_mem_rdata,
         .ifetch_inval, .dmem_req_device, .dcache_flush_req, .dcache_flush_done,
         .hpm_l1i_miss, .hpm_l1d_miss, .hpm_l1d_wb,
-        .halted
+        .halted,
+        .vuart_tx_valid, .vuart_tx_byte,
+        .vuart_rx_valid, .vuart_rx_byte, .vuart_rx_pop,
+        .dbg_probe
     );
 
     niigo_memsys MemSys (

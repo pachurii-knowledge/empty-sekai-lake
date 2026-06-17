@@ -23,3 +23,4 @@ vivado*.jou
 # Vivado GUI scratch (clock report + congestion dumps written to CWD)
 clockInfo.txt
 cong/
+fpga/synth/triage

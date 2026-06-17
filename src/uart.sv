@@ -64,6 +64,16 @@ module uart
 
     // Interrupt request (level) -> PLIC source
     output logic        irq
+`ifdef FPGA_BUILD
+    ,
+    // ---- vUART (FB1): real serial byte streams to/from the host, through the
+    // OCL TX/RX FIFOs in cl_niigo. Replaces the sim console ($write / +uart_in).
+    output logic        vuart_tx_valid,     // 1-cycle pulse: a THR byte was written
+    output logic [7:0]  vuart_tx_byte,
+    input  wire logic   vuart_rx_valid,     // host RX FIFO non-empty (byte at head)
+    input  wire logic [7:0] vuart_rx_byte,
+    output logic        vuart_rx_pop        // 1-cycle pulse: byte accepted into RBR
+`endif
 );
 
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
@@ -109,11 +119,19 @@ module uart
             ier_q <= 8'h0; fcr_q <= 8'h0; lcr_q <= 8'h0; mcr_q <= 8'h0;
             scr_q <= 8'h0; dll_q <= 8'h0; dlm_q <= 8'h0;
             rx_data_q <= 8'h0; rx_valid_q <= 1'b0; thre_pending_q <= 1'b0;
+`ifdef FPGA_BUILD
+            vuart_tx_valid <= 1'b0; vuart_tx_byte <= 8'h0; vuart_rx_pop <= 1'b0;
+`endif
 `ifndef SYNTHESIS
             rx_idx <= 0;
             if (!$value$plusargs("uart_in=%s", rx_str)) rx_str = "";
 `endif
         end else begin
+`ifdef FPGA_BUILD
+            // vUART pulses default low; the TX/RX events below re-assert them.
+            vuart_tx_valid <= 1'b0;
+            vuart_rx_pop   <= 1'b0;
+`endif
             // Register writes (committed stores), decoded per 32-bit subword.
             // The written byte is wsub[7:0] (a register is at a 4-byte-aligned
             // address, so a byte sb at offset 0 and a 32-bit writel agree).
@@ -136,6 +154,10 @@ module uart
                                         rx_data_q  <= wsub[7:0];
                                         rx_valid_q <= 1'b1;
                                     end else begin
+`ifdef FPGA_BUILD
+                                        vuart_tx_valid <= 1'b1;
+                                        vuart_tx_byte  <= wsub[7:0];
+`endif
 `ifndef SYNTHESIS
                                         $write("%c", wsub[7:0]);
                                         $fflush();
@@ -174,9 +196,16 @@ module uart
                     rx_valid_q <= 1'b0;
             end
 
-            // Deliver the next injected RX byte once the previous is consumed
-            // (not while looping back, which drives RBR itself). Simulation only;
-            // the FPGA vUART (FB1) injects RX through real serial logic.
+            // Deliver the next RX byte once the previous is consumed (not while
+            // looping back, which drives RBR itself). On FPGA the byte comes from
+            // the host RX FIFO; in simulation from the +uart_in plusarg.
+`ifdef FPGA_BUILD
+            if (!rx_valid_q && !mcr_q[4] && vuart_rx_valid) begin
+                rx_data_q    <= vuart_rx_byte;
+                rx_valid_q   <= 1'b1;
+                vuart_rx_pop <= 1'b1;   // advance the host RX FIFO (data latched above)
+            end
+`endif
 `ifndef SYNTHESIS
             if (!rx_valid_q && !mcr_q[4] && rx_idx < rx_str.len()) begin
                 rx_data_q  <= 8'(rx_str[rx_idx]);
