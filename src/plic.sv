@@ -102,16 +102,42 @@ module plic
     // Per-context best (highest priority, lowest id) eligible source.
     logic [5:0]  best_id  [NCTX];
     logic [2:0]  best_pri [NCTX];
+    // FB2b: parallel argmax replacing the serial NSOURCES-deep running-max scan
+    // (best_pri/best_id chained through all 31 sources -- the PLIC read worst-path
+    // cone feeding the LSQ device-read data_load, the post-R2' #1..#25 bottleneck).
+    // Value-identical: `elig` is the per-source eligibility; the leading-bits loop
+    // narrows `alive` to the eligible sources AT the max priority (each priority bit
+    // from MSB: if any alive source has that bit, drop the alive sources lacking it);
+    // best_pri is that priority and best_id the LOWEST surviving source (reverse scan,
+    // matching the old strict-> tie-break = lowest id wins). Same winner, ~log-depth.
     always_comb begin
         for (int c = 0; c < NCTX; c += 1) begin
-            best_id[c]  = 6'd0;
-            best_pri[c] = 3'd0;
+            logic [NSOURCES:0] elig;
+            logic [NSOURCES:0] alive;
+            logic [2:0]        bp;
+            logic              any_b;
+            elig = '0;
             for (int s = 1; s <= NSOURCES; s += 1) begin
-                if (gw_pending[s] && enable_q[c][s] &&
-                        (prio_q[s] > thresh_q[c]) && (prio_q[s] > best_pri[c])) begin
-                    best_pri[c] = prio_q[s];
-                    best_id[c]  = 6'(s);
+                elig[s] = gw_pending[s] && enable_q[c][s] &&
+                          (prio_q[s] > thresh_q[c]);
+            end
+            alive = elig;
+            for (int b = 2; b >= 0; b -= 1) begin
+                any_b = 1'b0;
+                for (int s = 1; s <= NSOURCES; s += 1) begin
+                    if (alive[s] && prio_q[s][b]) any_b = 1'b1;
                 end
+                bp[b] = any_b;
+                if (any_b) begin
+                    for (int s = 1; s <= NSOURCES; s += 1) begin
+                        if (!prio_q[s][b]) alive[s] = 1'b0;
+                    end
+                end
+            end
+            best_pri[c] = bp;   // 0 iff no eligible source (alive all clear)
+            best_id[c]  = 6'd0;
+            for (int s = NSOURCES; s >= 1; s -= 1) begin
+                if (alive[s]) best_id[c] = 6'(s);
             end
         end
     end
