@@ -612,9 +612,14 @@ module load_store_queue
     always_comb begin
         entries_wake = entries_q;
         for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
-            if ((entries_wake[i].entry.branch_mask & abort_mask) != '0) begin
-                entries_wake[i] = '0;
-            end else if (entries_wake[i].entry.valid) begin
+            // FB2b R3: defer the abort squash (the deep ~entry-wide zeroing) to block M,
+            // off the wakeup/rederive input cone (the rederive's format_store_split is the
+            // store_data worst-path tail -- it must read entries_q-based state, not the
+            // post-squash array). reset/wakeup apply to all valid entries; aborted entries
+            // are zeroed in M before the next state. The head-skip (HD) already excludes
+            // them via the shallow sq_valid, and the store-commit head is non-aborted, so
+            // an un-zeroed wrong-path entry here can neither issue/commit nor be counted.
+            if (entries_wake[i].entry.valid) begin
                 entries_wake[i].entry.branch_mask &= ~reset_mask;
                 for (int w = 0; w < OOO_WIDTH; w += 1) begin
                     if (wakeup_valid[w]) begin
@@ -691,6 +696,17 @@ module load_store_queue
     // and shallow -- no format_store_split recompute in the commit cone).
     always_comb begin
         entries_premerge = entries_wake;
+
+        // FB2b R3: apply the deferred abort squash (moved out of block W) -- zero every
+        // wrong-path entry. Off block W's wakeup/rederive input cones (the store_data
+        // worst-path tail). head_next_skip is non-aborted (head-skip uses sq_valid), so
+        // this never collides with the head_delta write below; entries_premerge
+        // (-> entries_next -> entries_q) is bit-identical to the old block-W squash.
+        for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
+            if ((entries_q[i].entry.branch_mask & abort_mask) != '0) begin
+                entries_premerge[i] = '0;
+            end
+        end
 
         // Apply HD's per-op head writes onto the head entry. Per-field write-enables
         // preserve any same-cycle wakeup update to fields the firing op does not
