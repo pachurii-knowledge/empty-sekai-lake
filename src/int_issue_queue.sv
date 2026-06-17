@@ -225,15 +225,25 @@ module int_issue_queue
             end
         end
 
-        // The incoming ops fill the lowest free slots, in lane order. free_mask is
-        // the post-squash/select occupancy; ins_free[k] is the k-th lowest free slot
-        // (priority encoders, each excluding the prior). A valid lane takes
-        // ins_free[its prefix rank] = the (#valid lanes before it)-th lowest free
-        // slot -- exactly the serial "first free, in lane order". !full guarantees
-        // >= OOO_WIDTH free slots, so all ins_free[] are valid.
+        // The incoming ops fill the lowest free slots, in lane order. ins_free[k] is
+        // the k-th lowest free slot (priority encoders, each excluding the prior). A
+        // valid lane takes ins_free[its prefix rank] = the (#valid lanes before it)-th
+        // lowest free slot. !full guarantees >= OOO_WIDTH free slots, so all ins_free[]
+        // are valid.
+        //
+        // FB2b R2': the free mask reads the REGISTERED occupancy (entries_q.valid), NOT
+        // the post-squash/post-select entries_next.valid. This takes the ins_free
+        // priority encoders OFF the abort_mask -> squash -> select -> ins_free worst
+        // path -- they now read registered state, parallel to the select. Correct
+        // because !full => count_q <= INT_IQ_SIZE - OOO_WIDTH => >= OOO_WIDTH registered
+        // -free slots, so the insert never fails; the inserted ops just land in slots
+        // that were free LAST cycle instead of also-this-cycle-freed (squashed/issued)
+        // slots. NOT bit-identical -- slot assignment differs -> issue priority among
+        // co-ready ops differs (architecturally correct OoO scheduling) -> needs
+        // usertests stress. No IPC (a dispatched op is still selectable the next cycle).
         if (!full) begin
             for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-                ins_free_mask[i] = !entries_next[i].valid;
+                ins_free_mask[i] = !entries_q[i].valid;
             end
             ins_free[0] = lowest_idx(ins_free_mask);
             for (int k = 1; k < OOO_WIDTH; k += 1) begin
