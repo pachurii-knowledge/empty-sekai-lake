@@ -103,9 +103,15 @@ module active_list
     // alias is false. Split: block C1 (squash + head-skip + present) writes commit_valid
     // + the post-squash/head-skip state below, reading NO commit_taken; block C2 (pop)
     // reads commit_taken and produces the final entries_premerge/head_next/count_next_c.
-    active_entry_t entries_squash [ACTIVE_LIST_SIZE]; // post-squash (pre-pop) entries
+    active_entry_t entries_squash [ACTIVE_LIST_SIZE]; // post-reset (pre-pop) entries
     active_id_t    head_postskip;                     // head after the leading-skip
     active_count_t count_postskip;                    // count after the leading-skip
+    // FB2b R3: per-slot post-squash validity (= entries_q.valid && not-wrong-path),
+    // a shallow function of registered state + abort_mask. The head-skip and commit
+    // present read THIS instead of the deep-zeroed entries_squash[i].valid, so the
+    // ~100-bit-per-entry squash leaves their input cones; the zeroing is deferred to
+    // entries_premerge (block C2). Equals the old entries_squash[i].valid exactly.
+    logic [ACTIVE_LIST_SIZE-1:0] sq_valid;
     logic [$clog2(OOO_WIDTH+1)-1:0] alloc_count;
     logic [$clog2(OOO_WIDTH+1)-1:0] commit_pop_count;
     // Dispatch->insert (D->Q) pipeline register: the tail/count RESERVE advances
@@ -155,10 +161,14 @@ module active_list
             commit_packet[i] = '0;
         end
 
+        // FB2b R3: compute sq_valid (post-squash validity) shallowly and apply
+        // reset_mask, but DEFER the deep wrong-path zeroing to entries_premerge
+        // (block C2). sq_valid[i] uses the ORIGINAL entries_q.branch_mask (pre-reset),
+        // matching the old squash decision; the head-skip / commit-present read it.
         for (int i = 0; i < ACTIVE_LIST_SIZE; i += 1) begin
-            if ((entries_squash[i].branch_mask & abort_mask) != '0) begin
-                entries_squash[i] = '0;
-            end else if (entries_squash[i].valid) begin
+            sq_valid[i] = entries_q[i].valid &&
+                ((entries_q[i].branch_mask & abort_mask) == '0);
+            if (entries_squash[i].valid) begin
                 entries_squash[i].branch_mask &= ~reset_mask;
             end
         end
@@ -200,8 +210,8 @@ module active_list
         head_skip_n = count_postskip;
         for (int k = ACTIVE_LIST_SIZE-1; k >= 0; k -= 1) begin
             if ((active_count_t'(k) < count_postskip) &&
-                    (entries_squash[head_postskip +
-                        ($clog2(ACTIVE_LIST_SIZE))'(k)].valid ||
+                    (sq_valid[head_postskip +
+                        ($clog2(ACTIVE_LIST_SIZE))'(k)] ||
                      inflight_mask[head_postskip +
                         ($clog2(ACTIVE_LIST_SIZE))'(k)])) begin
                 head_skip_n = active_count_t'(k);
@@ -241,7 +251,7 @@ module active_list
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             commit_idx = head_postskip + active_id_t'(i);
             commit_ready = (active_count_t'(i) < count_postskip) &&
-                entries_squash[commit_idx].valid && entries_q[commit_idx].done;
+                sq_valid[commit_idx] && entries_q[commit_idx].done;
             if (commit_go && commit_ready) begin
                 commit_valid[i] = 1'b1;
                 commit_packet[i].valid = 1'b1;
@@ -293,6 +303,18 @@ module active_list
         free_valid = '0;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             free_prd[i] = '0;
+        end
+
+        // FB2b R3: apply the deferred branch squash (moved out of C1) -- zero every
+        // wrong-path entry. Off the head-skip / commit-present input cones (which now
+        // read sq_valid); committed entries are never wrong-path (the present gates on
+        // sq_valid), so the pop's per-lane reads of entries_squash above are
+        // unaffected. entries_premerge (-> entries_next -> entries_q) is bit-identical
+        // to the old C1 squash.
+        for (int i = 0; i < ACTIVE_LIST_SIZE; i += 1) begin
+            if ((entries_q[i].branch_mask & abort_mask) != '0) begin
+                entries_premerge[i] = '0;
+            end
         end
 
         // Pop exactly the retired prefix. commit_taken is a contiguous prefix of the
