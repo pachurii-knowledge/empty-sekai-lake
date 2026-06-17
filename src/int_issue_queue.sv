@@ -79,9 +79,15 @@ module int_issue_queue
     always_comb begin
         entries_wake = entries_q;
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-            if ((entries_wake[i].branch_mask & abort_mask) != '0) begin
-                entries_wake[i] = '0;
-            end else if (entries_wake[i].valid) begin
+            // FB2b R3: the deep squash (zeroing every ~100-bit wrong-path entry) is
+            // DEFERRED to block C (applied before the free-slot insert), taking it OFF
+            // the select's input cone -- the front of the -12.x branch-recovery worst
+            // path. Wakeup + reset_mask still apply to all valid entries here; the
+            // select excludes wrong-path entries via a cheap 2-level abort gate
+            // (block B), and a wrong-path entry's stale fields are harmless (it is
+            // never picked, and is zeroed in block C before it can be reused by insert
+            // or counted). entries_next, count, and the issued set are bit-identical.
+            if (entries_wake[i].valid) begin
                 entries_wake[i].branch_mask &= ~reset_mask;
                 for (int w = 0; w < OOO_WIDTH; w += 1) begin
                     if (wakeup_valid[w]) begin
@@ -128,8 +134,15 @@ module int_issue_queue
 
         // ---- Per-FU-class eligibility (parallel over the post-wakeup entries) ----
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            // FB2b R3 abort gate: exclude wrong-path entries from selection without
+            // the deep squash (block A no longer zeroes them). Uses the ORIGINAL
+            // entries_q.branch_mask (pre-reset_mask) to match block A/C's squash
+            // decision exactly -- reset_mask clears the resolved-branch bit, which
+            // abort_mask also carries, so a post-reset mask could miss a wrong-path
+            // entry whose only abort bit was that branch. ~2 levels, parallel to wakeup.
             sel_rdy[i] = entries_wake[i].valid &&
-                entries_wake[i].src1_ready && entries_wake[i].src2_ready;
+                entries_wake[i].src1_ready && entries_wake[i].src2_ready &&
+                ((entries_q[i].branch_mask & abort_mask) == '0);
             sel_cf[i] = is_control_flow(entries_wake[i]);
             // A control-flow op may issue only once every older branch it is
             // speculative under has resolved (branch_mask == 0).
@@ -198,6 +211,19 @@ module int_issue_queue
     // ---- C: parallel insert (lowest free slots) + flush + occupancy ----
     always_comb begin
         entries_next = entries_sel;
+
+        // FB2b R3: apply the deferred branch squash here (moved from block A), BEFORE
+        // the free-slot insert -- so a wrong-path slot reads free for ins_free exactly
+        // as when the squash ran in block A. entries_sel already has the issued slots
+        // cleared by the select (which never picked a wrong-path entry, via the abort
+        // gate), so zeroing the wrong-path entries here yields a bit-identical
+        // entries_next. Wrong-path entries are zeroed before they can be counted
+        // (count reads entries_q + abort_mask directly) or reused.
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            if ((entries_q[i].branch_mask & abort_mask) != '0) begin
+                entries_next[i] = '0;
+            end
+        end
 
         // The incoming ops fill the lowest free slots, in lane order. free_mask is
         // the post-squash/select occupancy; ins_free[k] is the k-th lowest free slot
