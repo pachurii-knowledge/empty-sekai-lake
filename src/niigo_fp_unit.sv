@@ -21,13 +21,25 @@ module niigo_fp_unit
     output writeback_packet_t writeback
 );
 
+    // FB2b wall #2: after the LSQ head-translate pipeline cut, the binding placed
+    // path became the CVFPU FMA (ADDMUL) arithmetic -> arbiter (~83 levels, 24
+    // CARRY8). The FMA ran as ONE combinational block (PipeRegs=1, PipeConfig
+    // BEFORE = a single register in front of the whole mul+add). Split the FMA
+    // across 2 internal stages: ADDMUL PipeRegs=2 + PipeConfig DISTRIBUTED (spread
+    // the registers THROUGH the unit instead of all before it). Other opgroups stay
+    // at 1. FP is infrequent (xv6/Linux are integer-heavy), so the extra FMA
+    // latency is a negligible IPC cost. The wrapper's abort-at-output + flush_i
+    // (clears all internal stages) are pipeline-depth/structure agnostic.
     localparam fpnew_pkg::fpu_implementation_t NIIGO_CVFPU_IMPL = '{
-        PipeRegs:   '{default: 1},
+        PipeRegs:   '{'{default: 2},   // ADDMUL (FMA): 2 distributed stages
+                      '{default: 1},   // DIVSQRT
+                      '{default: 1},   // NONCOMP
+                      '{default: 1}},  // CONV
         UnitTypes:  '{'{default: fpnew_pkg::PARALLEL},
                       '{default: fpnew_pkg::MERGED},
                       '{default: fpnew_pkg::PARALLEL},
                       '{default: fpnew_pkg::MERGED}},
-        PipeConfig: fpnew_pkg::BEFORE
+        PipeConfig: fpnew_pkg::DISTRIBUTED
     };
 
     issue_entry_t req_entry_q;
