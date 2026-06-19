@@ -220,6 +220,27 @@ module load_store_queue
     // translated and verified before either word is written (store atomicity).
     logic        store_probe_hi_q, store_probe_hi_next;
 
+    // FB2b wall #2 -- registered head translation (the translate pipeline stage).
+    // The core translates mem_req_vaddr (= entries_q[head_q].addr, registered)
+    // combinationally through the DTLB + DataPMP; that result (xlate_pa/fault/
+    // stall/cause) feeding the head fault/issue/retire decision in the SAME cycle
+    // was the binding placed path (LSQ head -> DTLB -> DataPMP -> head_retire).
+    // Register the translate result here and consume it ONE cycle later, with a
+    // (head_q, store_probe_hi_q) validity tag so the registered translate is only
+    // used when it belongs to the head request currently presented -- never a
+    // stale translate from a different head or a walk transition. Cost: +1 cycle
+    // on the head translate (load issue / store complete / fault); the LSQ is
+    // latency-tolerant (single outstanding load via mem_inflight). mem_req_vaddr
+    // is a pure function of (head_q, store_probe_hi_q), so matching both is exact.
+    logic [XLEN-1:0] xlate_pa_q;
+    logic            xlate_fault_q;
+    logic            xlate_stall_q;
+    logic [4:0]      xlate_cause_q;
+    logic [$clog2(MEM_Q_SIZE)-1:0] xlate_head_q;  // head_q the translate was for
+    logic            xlate_probe_q;               // store_probe_hi_q ditto
+    logic            xlate_reqv_q;                // mem_req_valid ditto
+    logic            xlate_ready;                 // registered translate is current
+
     assign full = (count_q > MEM_Q_SIZE - OOO_WIDTH);
     assign store_port_busy = double_store_pending_q;
 
@@ -332,9 +353,18 @@ module load_store_queue
         // combinational src-ready a cycle before the fault becomes visible. With
         // paging off and no fault this matches the original (proceed to memory).
         head_match     = (head_next_skip == head_q);
-        head_xlate_ok  = !xlate_fault && mem_req_valid &&
-            (!paging_data || (head_match && !xlate_stall));
-        head_xlate_flt = head_match && mem_req_valid && xlate_fault;
+        // The registered translate (xlate_*_q) belongs to the current head request
+        // iff a request was valid both when it was registered (last cycle) and now,
+        // for the SAME head entry and probe phase. When the head advances or the
+        // probe toggles -- or on the first cycle a new head presents -- the tag
+        // mismatches and the head op waits one cycle for the fresh translate to
+        // register (the +1 translate latency). This also guarantees a stale
+        // translate from a different head (or a walk transition) is never consumed.
+        xlate_ready = xlate_reqv_q && mem_req_valid &&
+            (xlate_head_q == head_q) && (xlate_probe_q == store_probe_hi_q);
+        head_xlate_ok  = !xlate_fault_q && xlate_ready &&
+            (!paging_data || (head_match && !xlate_stall_q));
+        head_xlate_flt = head_match && xlate_ready && xlate_fault_q;
 
         // The per-op head blocks below write the single head entry via head_delta
         // (sparse per-field write-enables) instead of indexing entries_premerge,
@@ -354,7 +384,7 @@ module load_store_queue
             load_writeback.has_dest = headq.entry.has_dest;
             load_writeback.branch_mask = headq.entry.branch_mask;
             load_writeback.exception = 1'b1;
-            load_writeback.exc_cause = xlate_cause;
+            load_writeback.exc_cause = xlate_cause_q;
             load_writeback.data = headq.addr;   // mtval = VA
             head_delta.zero = 1'b1;
             head_retire = 1'b1;
@@ -406,7 +436,7 @@ module load_store_queue
             if (load_writeback.data == '0) begin
                 // SC succeeds: capture its PA for the commit write-back.
                 head_delta.we_store_lo_pa = 1'b1;
-                head_delta.store_lo_pa = xlate_pa;
+                head_delta.store_lo_pa = xlate_pa_q;
                 head_delta.we_issued_load = 1'b1;
                 head_delta.issued_load = 1'b1;
                 reservation_valid_mid = 1'b0;
@@ -430,7 +460,7 @@ module load_store_queue
             // Capture the PA for an AMO's write-back beat (same address it read);
             // harmless for a pure load.
             head_delta.we_store_lo_pa = 1'b1;
-            head_delta.store_lo_pa = xlate_pa;
+            head_delta.store_lo_pa = xlate_pa_q;
             head_delta.we_issued_load = 1'b1;
             head_delta.issued_load = 1'b1;
             mem_inflight_next = 1'b1;
@@ -454,7 +484,7 @@ module load_store_queue
                 // Single-beat store proven translatable: latch its PA and mark
                 // it complete. The commit write below uses this latched PA.
                 head_delta.we_store_lo_pa = 1'b1;
-                head_delta.store_lo_pa = xlate_pa;
+                head_delta.store_lo_pa = xlate_pa_q;
                 load_writeback.valid = 1'b1;
                 load_writeback.active_id = headq.entry.active_id;
                 load_writeback.branch_mask = headq.entry.branch_mask;
@@ -465,12 +495,12 @@ module load_store_queue
                 // Low word translated OK: capture its PA, then probe the high
                 // word next cycle.
                 head_delta.we_store_lo_pa = 1'b1;
-                head_delta.store_lo_pa = xlate_pa;
+                head_delta.store_lo_pa = xlate_pa_q;
                 store_probe_hi_next = 1'b1;
             end else begin
                 // High word translated OK; capture its PA and complete.
                 head_delta.we_store_hi_pa = 1'b1;
-                head_delta.store_hi_pa = xlate_pa;
+                head_delta.store_hi_pa = xlate_pa_q;
                 load_writeback.valid = 1'b1;
                 load_writeback.active_id = headq.entry.active_id;
                 load_writeback.branch_mask = headq.entry.branch_mask;
@@ -1095,6 +1125,13 @@ module load_store_queue
             store_probe_hi_q <= 1'b0;
             mem_inflight_q <= 1'b0;
             mem_inflight_kill_q <= 1'b0;
+            xlate_pa_q <= '0;
+            xlate_fault_q <= 1'b0;
+            xlate_stall_q <= 1'b0;
+            xlate_cause_q <= 5'd0;
+            xlate_head_q <= '0;
+            xlate_probe_q <= 1'b0;
+            xlate_reqv_q <= 1'b0;
             for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
                 entries_q[i] <= '0;
             end
@@ -1111,6 +1148,17 @@ module load_store_queue
             store_probe_hi_q <= store_probe_hi_next;
             mem_inflight_q <= mem_inflight_next;
             mem_inflight_kill_q <= mem_inflight_kill_next;
+            // Register this cycle's head translation (combinational from the core's
+            // DTLB+DataPMP on mem_req_vaddr) + the (head_q, store_probe_hi_q,
+            // mem_req_valid) tag identifying which head request it is for. Consumed
+            // next cycle via xlate_ready (the translate pipeline stage).
+            xlate_pa_q <= xlate_pa;
+            xlate_fault_q <= xlate_fault;
+            xlate_stall_q <= xlate_stall;
+            xlate_cause_q <= xlate_cause;
+            xlate_head_q <= head_q;
+            xlate_probe_q <= store_probe_hi_q;
+            xlate_reqv_q <= mem_req_valid;
             entries_q <= entries_next;
         end
     end
