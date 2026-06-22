@@ -13,6 +13,16 @@ module niigo_fp_unit
     input wire logic [XLEN-1:0]   rs1_data,
     input wire logic [2:0]        frm,
     input wire branch_mask_t      abort_mask,
+    // Resolved-branch checkpoint bits to clear from the in-flight op's mask each
+    // cycle. The op's branch_mask lives partly inside the opaque cvfpu tag
+    // pipeline (held across the long FDIV/FSQRT latency), which we cannot age in
+    // place; instead this unit runs ONE FP op end-to-end (serialized issue) and
+    // tracks that single op's mask in req_entry_q (dormant once the op enters
+    // cvfpu), aged here by reset_mask, with a sticky-abort bit. See the deadlock
+    // rationale in ooo_div_unit.sv: a stale mask either false-aborts a live op
+    // (ROB-head deadlock) or fails to drop a wrong-path op (reused-slot
+    // corruption); serialization removes the cross-op active-id-reuse hazard.
+    input wire branch_mask_t      reset_mask,
     // Precise-trap full flush: drop the pending request, the cvfpu internal
     // pipeline, and the output buffer so no stale writeback lands on a reused
     // active-list id after the pipeline is reset.
@@ -47,6 +57,15 @@ module niigo_fp_unit
     logic         req_valid_q;
     logic         req_is_simple;
     logic         req_aborted;
+    // Single-op tracking: req_entry_q.branch_mask is the authoritative, aged mask
+    // for the one in-flight FP op throughout its life (it is written only on
+    // issue, and serialized issue means no new op overwrites it until this one
+    // drains). fp_aborted_q makes the abort decision sticky so a wrong-path op
+    // that is still inside cvfpu when its branch's abort pulse passes is still
+    // dropped when it finally emerges. fp_kill = the op is on the wrong path.
+    logic         fp_aborted_q;
+    logic         fp_kill;
+    logic         cvfpu_busy;
 
     logic [2:0][63:0]         fpnew_operands;
     fpnew_pkg::roundmode_e    fpnew_rnd_mode;
@@ -72,16 +91,24 @@ module niigo_fp_unit
     writeback_packet_t        fpnew_writeback;
     logic                     simple_writeback_valid;
 
-    assign issue_ready = !req_valid_q;
+    // Serialized issue: accept a new FP op only when the unit is fully empty (no
+    // pending request, cvfpu idle, output buffer empty). This guarantees a single
+    // FP op is in flight at a time, so no second op can ever share the lingering
+    // op's (reused) active_id -- the corruption hazard that an opaque cvfpu tag
+    // makes otherwise unavoidable. FP is infrequent (xv6/Linux are integer-heavy),
+    // so the lost FP pipelining is a negligible IPC cost.
+    assign issue_ready = !req_valid_q && !cvfpu_busy && !fpnew_buffer_valid_q;
     assign req_is_simple = is_simple_op(req_entry_q);
-    assign req_aborted = req_valid_q && ((req_entry_q.branch_mask & abort_mask) != '0);
+    // The wrong-path decision for the single in-flight op: its aged mask intersects
+    // a live abort this cycle, or it was already marked aborted (sticky). Used
+    // uniformly wherever the op might be (request / cvfpu output / buffer).
+    assign fp_kill = fp_aborted_q || ((req_entry_q.branch_mask & abort_mask) != '0);
+    assign req_aborted = req_valid_q && fp_kill;
     assign simple_writeback_valid = req_valid_q && req_is_simple && !req_aborted;
 
     assign fpnew_in_valid = req_valid_q && !req_is_simple && !req_aborted;
-    assign fpnew_output_aborted = fpnew_out_valid &&
-        ((fpnew_tag.branch_mask & abort_mask) != '0);
-    assign fpnew_buffer_aborted = fpnew_buffer_valid_q &&
-        ((fpnew_buffer_tag_q.branch_mask & abort_mask) != '0);
+    assign fpnew_output_aborted = fpnew_out_valid && fp_kill;
+    assign fpnew_buffer_aborted = fpnew_buffer_valid_q && fp_kill;
     assign fpnew_out_ready = !fpnew_buffer_valid_q || fpnew_buffer_aborted ||
         (writeback_ready && !simple_writeback_valid);
 
@@ -109,13 +136,16 @@ module niigo_fp_unit
         .simd_mask_i   ( '1                 ),
         .in_valid_i    ( fpnew_in_valid     ),
         .in_ready_o    ( fpnew_in_ready     ),
-        .flush_i       ( flush              ),
+        // Drop the in-flight op from cvfpu the moment it is known wrong-path
+        // (fp_kill), freeing the serialized unit immediately instead of waiting
+        // out its latency. Harmless when the op is not inside cvfpu (empty flush).
+        .flush_i       ( flush || fp_kill   ),
         .result_o      ( fpnew_result       ),
         .status_o      ( fpnew_status       ),
         .tag_o         ( fpnew_tag          ),
         .out_valid_o   ( fpnew_out_valid    ),
         .out_ready_i   ( fpnew_out_ready    ),
-        .busy_o        ( /* unused */       ),
+        .busy_o        ( cvfpu_busy         ),
         .early_valid_o ( /* unused */       )
     );
 
@@ -123,6 +153,11 @@ module niigo_fp_unit
         simple_writeback = packet_for_simple(req_entry_q, req_int_src_q);
         fpnew_writeback = packet_for_fpnew(fpnew_buffer_tag_q,
             fpnew_buffer_result_q, fpnew_buffer_status_q);
+        // The cvfpu tag carries a STALE branch_mask (frozen at issue, not aged
+        // through the cvfpu pipeline). Drive the writeback-bus mask from the
+        // authoritative aged copy in req_entry_q (same single op) so a resolved-
+        // then-reused checkpoint bit can't make the bus drop this writeback.
+        fpnew_writeback.branch_mask = req_entry_q.branch_mask;
         writeback = '0;
         if (flush) begin
             writeback = '0;
@@ -142,10 +177,21 @@ module niigo_fp_unit
             fpnew_buffer_result_q <= '0;
             fpnew_buffer_status_q <= '0;
             fpnew_buffer_tag_q <= '0;
+            fp_aborted_q <= 1'b0;
         end else if (flush) begin
             req_valid_q <= 1'b0;
             fpnew_buffer_valid_q <= 1'b0;
+            fp_aborted_q <= 1'b0;
         end else begin
+            // Age the single in-flight op's authoritative mask by this cycle's
+            // resolved-branch bits, and latch the wrong-path decision stickily
+            // (so an op still inside cvfpu when its abort pulse passes is dropped
+            // on emergence). Overridden below on a fresh issue.
+            req_entry_q.branch_mask <= req_entry_q.branch_mask & ~reset_mask;
+            if (fp_kill) begin
+                fp_aborted_q <= 1'b1;
+            end
+
             if (fpnew_buffer_valid_q &&
                     (fpnew_buffer_aborted ||
                      (writeback_ready && !simple_writeback_valid))) begin
@@ -170,7 +216,11 @@ module niigo_fp_unit
                     ((issue_entry.branch_mask & abort_mask) == '0)) begin
                 req_valid_q <= 1'b1;
                 req_entry_q <= issue_entry;
+                // Fresh op: seed its aged mask (clearing any same-cycle resolved
+                // bit) and clear the sticky-abort -- overrides the aging above.
+                req_entry_q.branch_mask <= issue_entry.branch_mask & ~reset_mask;
                 req_int_src_q <= rs1_data;
+                fp_aborted_q <= 1'b0;
             end
 
         end

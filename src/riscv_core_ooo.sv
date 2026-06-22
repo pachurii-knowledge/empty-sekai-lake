@@ -1337,6 +1337,7 @@ module riscv_core_ooo
         .rs1_data(phys_rs1_data[ISSUE_FP]),
         .frm(csr_frm),
         .abort_mask,
+        .reset_mask,
         .flush(trap_take),
         .writeback_ready(fp_writeback_ready),
         .writeback(fp_writeback)
