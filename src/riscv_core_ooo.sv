@@ -1307,6 +1307,7 @@ module riscv_core_ooo
         .rs1_data(phys_rs1_data[ISSUE_MUL]),
         .rs2_data(phys_rs2_data[ISSUE_MUL]),
         .abort_mask,
+        .reset_mask,
         .flush(trap_take),
         .writeback_ready(mul_writeback_ready),
         .writeback(mul_writeback)
@@ -1321,6 +1322,7 @@ module riscv_core_ooo
         .rs1_data(phys_rs1_data[ISSUE_DIV]),
         .rs2_data(phys_rs2_data[ISSUE_DIV]),
         .abort_mask,
+        .reset_mask,
         .flush(trap_take),
         .writeback_ready(div_writeback_ready),
         .writeback(div_writeback)

@@ -13,6 +13,12 @@ module ooo_mul_unit
     input wire logic [XLEN-1:0]   rs1_data,
     input wire logic [XLEN-1:0]   rs2_data,
     input wire branch_mask_t      abort_mask,
+    // Resolved-branch checkpoint bits to clear from every in-flight stage's
+    // branch_mask each cycle (see ooo_div_unit for the full rationale): a
+    // multiply held across a branch resolution + a later reuse of that freed
+    // checkpoint bit would otherwise carry a stale mask and be spuriously
+    // aborted on the reused branch, dropping its writeback -> ROB-head deadlock.
+    input wire branch_mask_t      reset_mask,
     // Precise-trap full flush: squash every in-flight stage so no stale
     // writeback lands after the pipeline is reset (the active-list id this op
     // targets may be reused by a younger instruction next cycle).
@@ -76,11 +82,15 @@ module ooo_mul_unit
             pipe_q[MUL_LATENCY-1] <= pipe_q[MUL_LATENCY-2];
             pipe_q[MUL_LATENCY-1].data <=
                 mul_select(s1_op_q, s1_neg_q, s1_prod_mag_q);
+            // Age the advancing mask by this cycle's resolved-branch bits.
+            pipe_q[MUL_LATENCY-1].branch_mask <=
+                pipe_q[MUL_LATENCY-2].branch_mask & ~reset_mask;
             valid_q[MUL_LATENCY-1] <= valid_q[MUL_LATENCY-2] &&
                 ((pipe_q[MUL_LATENCY-2].branch_mask & abort_mask) == '0);
             // Stage 1 <- Stage 0: magnitude multiply (zero-extended operands -> a
             // 2*XLEN unsigned product; Vivado infers a pipelined DSP cascade).
             pipe_q[1] <= pipe_q[0];
+            pipe_q[1].branch_mask <= pipe_q[0].branch_mask & ~reset_mask;
             s1_prod_mag_q <= {{XLEN{1'b0}}, s0_lhs_mag_q} *
                              {{XLEN{1'b0}}, s0_rhs_mag_q};
             s1_neg_q <= s0_neg_q;
@@ -89,6 +99,7 @@ module ooo_mul_unit
                 ((pipe_q[0].branch_mask & abort_mask) == '0);
             // Stage 0 <- issue: capture operand magnitudes + product sign.
             pipe_q[0] <= meta_for(issue_entry);
+            pipe_q[0].branch_mask <= issue_entry.branch_mask & ~reset_mask;
             s0_lhs_mag_q <= operand_mag(issue_entry.ctrl.alu_op, rs1_data, 1'b1);
             s0_rhs_mag_q <= operand_mag(issue_entry.ctrl.alu_op, rs2_data, 1'b0);
             s0_neg_q     <= product_negative(issue_entry.ctrl.alu_op,
@@ -96,6 +107,15 @@ module ooo_mul_unit
             s0_op_q      <= issue_entry.ctrl.alu_op;
             valid_q[0] <= issue_valid &&
                 ((issue_entry.branch_mask & abort_mask) == '0);
+        end else begin
+            // Stalled (a completed output is waiting for a writeback slot): the
+            // stages hold, but the held branch_masks must still be aged by
+            // reset_mask -- a 1-cycle reset pulse missed here leaves the output's
+            // mask permanently stale and it would later false-abort on a reused
+            // checkpoint bit (the same deadlock as the div unit).
+            for (int i = 0; i < MUL_LATENCY; i += 1) begin
+                pipe_q[i].branch_mask <= pipe_q[i].branch_mask & ~reset_mask;
+            end
         end
     end
 

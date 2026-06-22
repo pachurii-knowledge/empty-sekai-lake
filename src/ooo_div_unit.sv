@@ -13,6 +13,16 @@ module ooo_div_unit
     input wire logic [XLEN-1:0]   rs1_data,
     input wire logic [XLEN-1:0]   rs2_data,
     input wire branch_mask_t      abort_mask,
+    // Resolved-branch checkpoint bits to clear from the in-flight packet's
+    // branch_mask each cycle. A division can be in flight for many cycles
+    // (DIV_ITERS + the DIV_DONE writeback wait), spanning a branch resolution
+    // that frees a checkpoint bit AND a later reuse of that bit by a younger
+    // mispredicting branch. Without aging the held mask by reset_mask (exactly
+    // as the ROB/issue-queue do), the stale bit makes `aborted` fire on the
+    // reused branch's abort_mask and the writeback is dropped -- the ROB head
+    // then waits forever for a `done` that never comes (a deadlock the riscv-dv
+    // privileged random test exposed).
+    input wire branch_mask_t      reset_mask,
     // Precise-trap full flush: abandon any in-flight division so no stale
     // writeback lands on a reused active-list id after the pipeline is reset.
     input wire logic              flush,
@@ -154,6 +164,12 @@ module ooo_div_unit
                 end
             endcase
         end
+
+        // Age the in-flight packet's branch_mask by this cycle's resolved-branch
+        // bits (every path: hold keeps packet_q's mask fresh; a same-cycle issue
+        // clears a just-resolved bit from the captured entry mask; the zeroed
+        // abort/flush/pop paths are unaffected). Mirrors active_list/issue-queue.
+        packet_next.branch_mask &= ~reset_mask;
     end
 
     always_ff @(posedge clk or negedge rst_l) begin
