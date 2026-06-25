@@ -545,7 +545,7 @@ module riscv_core_scalar
     priv_csr_file CSRFile (
         .clk,
         .rst_l,
-        .retire(gate_E && valid_E && !take_trap_E),
+        .retire_cnt((gate_E && valid_E && !take_trap_E) ? 3'd1 : 3'd0),
         .mtime(clint_mtime),
         .read_addr(csr_addr_E),
         .read_data(csr_read_data_E),

@@ -23,7 +23,7 @@ module priv_csr_file
     input wire logic        rst_l,
 
     // Retirement / counters
-    input wire logic        retire,            // an instruction retired this cycle
+    input wire logic [2:0]  retire_cnt,        // # instructions retired this cycle (0..4)
     input wire logic [63:0] mtime,             // CLINT time for the TIME CSR
 
     // CSR read port (combinational). Port 0 is used by the scalar core; the
@@ -444,8 +444,11 @@ module priv_csr_file
         end else begin
             // Free-running counters, gated by mcountinhibit (CY bit0 / IR bit2).
             if (!mcountinhibit_q[0]) mcycle_q <= mcycle_q + 64'd1;
-            if (retire && !mcountinhibit_q[2])
-                minstret_q <= minstret_q + 64'd1;
+            // minstret counts EVERY retired instruction, so on a multi-retire
+            // (up to 4-wide) commit it must advance by the retire count -- a flat
+            // +1 per cycle undercounts and diverges from the ISS golden models.
+            if (!mcountinhibit_q[2])
+                minstret_q <= minstret_q + 64'(retire_cnt);
             // Cache event counters HPM3-5 (phase C3), gated by mcountinhibit[3-5].
             if (cache_ev_l1i_miss && !mcountinhibit_q[3]) hpm3_q <= hpm3_q + 64'd1;
             if (cache_ev_l1d_miss && !mcountinhibit_q[4]) hpm4_q <= hpm4_q + 64'd1;

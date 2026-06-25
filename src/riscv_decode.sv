@@ -319,6 +319,16 @@ module riscv_decode
                         FUNCT3_SLLI: begin
                             ctrl_signals.rd_source = RD_ALU;
                             ctrl_signals.alu_op = ALU_SLL;
+                            // Reserved upper bits: RV64 SLLI funct6 (instr[31:26])
+                            // must be 0; RV32 funct7 (instr[31:25]) must be 0 (so
+                            // shamt[5]=instr[25] is reserved on RV32). Else illegal.
+`ifdef RV64
+                            if (instr[31:26] != 6'b000000)
+                                ctrl_signals.illegal_instr = 1'b1;
+`else
+                            if (instr[31:25] != 7'b0000000)
+                                ctrl_signals.illegal_instr = 1'b1;
+`endif
                         end
 
                         FUNCT3_SRLI_SRAI: begin
@@ -330,6 +340,19 @@ module riscv_decode
                             // funct7 (RV32) and funct6 (RV64) encodings alike.
                             ctrl_signals.rd_source = RD_ALU;
                             ctrl_signals.alu_op = instr[30] ? ALU_SRA : ALU_SRL;
+                            // Reserved upper bits: valid funct is 000000 (SRLI) or
+                            // 010000 (SRAI) -- over instr[31:26] on RV64, instr[31:25]
+                            // on RV32. Anything else (instr[26]=1 on RV64, shamt[5]=1
+                            // on RV32) is a reserved encoding -> illegal.
+`ifdef RV64
+                            if ((instr[31:26] != 6'b000000) &&
+                                (instr[31:26] != 6'b010000))
+                                ctrl_signals.illegal_instr = 1'b1;
+`else
+                            if ((instr[31:25] != 7'b0000000) &&
+                                (instr[31:25] != 7'b0100000))
+                                ctrl_signals.illegal_instr = 1'b1;
+`endif
                         end
 
                         default: begin
@@ -660,6 +683,10 @@ module riscv_decode
                         OP_NMSUB: ctrl_signals.fp_op = FP_NMSUB;
                         default:  ctrl_signals.fp_op = FP_NMADD;
                     endcase
+                    // FMA ops always round; reserved static rm (101/110) is illegal.
+                    if (instr[14:12] == 3'b101 || instr[14:12] == 3'b110) begin
+                        ctrl_signals.illegal_instr = 1'b1;
+                    end
                     if ((instr[26:25] != 2'b00) && (instr[26:25] != 2'b01)) begin
                         ctrl_signals.illegal_instr = 1'b1;
                     end
@@ -760,6 +787,16 @@ module riscv_decode
                         end
                         default: ctrl_signals.illegal_instr = 1'b1;
                     endcase
+                    // Reserved static rounding modes rm=101/110 are illegal for FP
+                    // ops that round (arith, sqrt, all fcvt). rm=111 (DYN) is legal
+                    // (uses frm). Ops that reuse instr[14:12] as a funct3 selector
+                    // (sgnj/minmax/cmp/class/move) validate that field in their own
+                    // case arm above and are excluded here.
+                    if ((instr[14:12] == 3'b101 || instr[14:12] == 3'b110) &&
+                        (instr[31:27] inside {5'b00000, 5'b00001, 5'b00010,
+                             5'b00011, 5'b01011, 5'b01000, 5'b11000, 5'b11010})) begin
+                        ctrl_signals.illegal_instr = 1'b1;
+                    end
                     if ((instr[26:25] != 2'b00) && (instr[26:25] != 2'b01)) begin
                         ctrl_signals.illegal_instr = 1'b1;
                     end
@@ -844,9 +881,25 @@ module riscv_decode
                         ctrl_signals.rd_source = RD_ALU;
                         unique case (instr[14:12])
                             3'b000: ctrl_signals.alu_op = ALU_ADDW;            // ADDIW
-                            3'b001: ctrl_signals.alu_op = ALU_SLLW;            // SLLIW
-                            3'b101: ctrl_signals.alu_op = instr[30] ? ALU_SRAW // SRAIW
-                                                                    : ALU_SRLW;// SRLIW
+                            3'b001: begin                                       // SLLIW
+                                ctrl_signals.alu_op = ALU_SLLW;
+                                // W-form shamt is 5 bits (instr[24:20]); the
+                                // funct7 instr[31:25] is fixed 0000000, so any
+                                // set bit there (incl. shamt[5]=instr[25]) is a
+                                // reserved encoding -> illegal instruction.
+                                if (instr[31:25] != 7'b0000000)
+                                    ctrl_signals.illegal_instr = 1'b1;
+                            end
+                            3'b101: begin                                       // SRLIW/SRAIW
+                                ctrl_signals.alu_op = instr[30] ? ALU_SRAW
+                                                                : ALU_SRLW;
+                                // funct7 must be 0000000 (SRLIW) or 0100000
+                                // (SRAIW); any other bit set (incl. shamt[5])
+                                // is reserved -> illegal.
+                                if ((instr[31:25] != 7'b0000000) &&
+                                    (instr[31:25] != 7'b0100000))
+                                    ctrl_signals.illegal_instr = 1'b1;
+                            end
                             default: ctrl_signals.illegal_instr = 1'b1;
                         endcase
                     end else if (instr[6:0] == 7'h3B) begin   // OP-32
@@ -892,6 +945,31 @@ module riscv_decode
 
             // Only assert the illegal instruction exception after reset
             ctrl_signals.illegal_instr &= rst_l;
+
+            // An illegal instruction must not engage a blocking functional unit.
+            // The FP pipe issues serially, so an illegal FP op routed to FU_FP
+            // (then squashed and never executed) deadlocks the FP queue and stalls
+            // older ops behind it; the same applies to FU_MEM/MUL/DIV. Re-route
+            // every illegal op to the single-cycle ALU (FU_ALU): it raises the
+            // illegal-instruction trap at commit with no writeback and no FU
+            // dependence. (fu_class_for: clear mem -> not FU_MEM; EXEC_INT with a
+            // non-mul/div alu_op -> FU_ALU, not FU_FP/MUL/DIV.)
+            if (ctrl_signals.illegal_instr) begin
+                ctrl_signals.exec_class    = EXEC_INT;
+                ctrl_signals.alu_op        = ALU_ADD;
+                ctrl_signals.memRead       = 1'b0;
+                ctrl_signals.memWrite      = 1'b0;
+                ctrl_signals.fp_op         = FP_NONE;
+                ctrl_signals.fp_uses_rs1   = 1'b0;
+                ctrl_signals.fp_uses_rs2   = 1'b0;
+                ctrl_signals.fp_uses_rs3   = 1'b0;
+                ctrl_signals.fp_writes_fpr = 1'b0;
+                ctrl_signals.fp_writes_gpr = 1'b0;
+                ctrl_signals.rfWrite       = 1'b0;
+                ctrl_signals.csr_op        = CSR_NONE;
+                ctrl_signals.csr_write     = 1'b0;
+                ctrl_signals.serializing   = 1'b0;
+            end
         end
 
 

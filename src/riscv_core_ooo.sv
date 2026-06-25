@@ -311,7 +311,7 @@ module riscv_core_ooo
     logic csr_fp_fflags_valid;
     logic [4:0] csr_fp_fflags;
     logic [2:0] csr_frm;
-    logic csr_retire;
+    logic [2:0] retire_count;   // # instructions retired this cycle (0..OOO_WIDTH)
 
     // --- Privileged-ISA / trap state (Phase 3) ---
     // Architectural privilege + CSR state exposed by priv_csr_file.
@@ -389,8 +389,15 @@ module riscv_core_ooo
     branch_id_t branch_resolve_id;
     logic branch_resolve_mispredict;
     branch_mask_t reset_mask;
-    branch_mask_t abort_mask;
-    branch_mask_t abort_mask_q;
+    // FB2b routed-WNS fix: abort_mask / abort_mask_q are the branch-recovery squash
+    // broadcast -- they fan out to every speculative structure (IQ/LSQ/ROB/branch_
+    // stack/FUs) across the die. The OOC route showed abort_mask_q -> DivUnit at 39 ns
+    // route (90%), the routed worst path. max_fanout makes synth REPLICATE the driver
+    // into local copies so Quick-place can put each near its consumers (short routes),
+    // instead of one global net the router stretches across the chip. Synthesis-only
+    // attribute -- Verilator ignores it, so the functional design is unchanged.
+    (* max_fanout = 64 *) branch_mask_t abort_mask;
+    (* max_fanout = 64 *) branch_mask_t abort_mask_q;
     branch_mask_t dispatch_branch_mask;
 
     logic mem_queue_full;
@@ -536,7 +543,7 @@ module riscv_core_ooo
     priv_csr_file CSRFile (
         .clk,
         .rst_l,
-        .retire(csr_retire),
+        .retire_cnt(retire_count),
         .mtime(clint_mtime),
         // ALU ports read CSRs in S2 (the execute stage), so the read address comes
         // from the registered issue entry, matching the ALU pipe's csr_rdata use.
@@ -2079,7 +2086,7 @@ module riscv_core_ooo
     always_comb begin
         fp_regs_next = fp_regs_q;
         serial_pending_next = serial_pending_q;
-        csr_retire = 1'b0;
+        retire_count = '0;
         csr_commit_write = 1'b0;
         csr_commit_addr = '0;
         csr_commit_wdata = '0;
@@ -2200,7 +2207,7 @@ module riscv_core_ooo
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (retire_valid[i]) begin
-                csr_retire = 1'b1;
+                retire_count = retire_count + 3'd1;
                 if (active_commit_packet[i].fp_write) begin
                     fp_regs_next[active_commit_packet[i].fp_rd] =
                         active_commit_packet[i].fp_data;
