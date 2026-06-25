@@ -66,10 +66,20 @@ b :=
 u :=
 
 .PHONY: all clean assemble assemble-clean check-lab-number-valid \
-		check-test-defined check-riscv-toolchain $(TEST_OUTPUT_BIN) \
+		check-test-defined check-riscv-toolchain ccd-m1-test $(TEST_OUTPUT_BIN) \
 		$(TEST_OUTPUT_HEX)
 
 all: verilator-build
+
+# ---- M1 two-core MOESI CCD coherence test (standalone; independent of the single-core build) ----
+# Builds + runs tb_niigo_ccd_m1 (2 niigo_l1d_moesi agents + niigo_dir via niigo_ccd_top + an NMI
+# memory) — a cross-core coherence program (expect "ALL CHECKS PASSED"). Verilator's -I doubles as
+# the module search path (-y), so it auto-finds the CCD modules under src/mem.
+ccd-m1-test:
+	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/ccd-m1 --top-module tb_niigo_ccd_m1 \
+		-Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT -Wno-ASCRANGE \
+		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_m1.sv
+	$(OUTPUT_BASE_DIR)/ccd-m1/Vtb_niigo_ccd_m1
 
 $(OUTPUT):
 	@mkdir -p $@
