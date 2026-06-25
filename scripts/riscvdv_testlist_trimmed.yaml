@@ -1,0 +1,92 @@
+# Trimmed riscv-dv testlist for the niigo OoO trace-compare flow.
+#
+# pyflow's pure-Python constraint solver is slow; the upstream testlists use
+# instr_cnt=10000 + num_of_sub_program=5, which can take many minutes per
+# program. These entries cut the work right down (a few hundred instructions,
+# no sub-programs) so privileged/random generation completes in seconds while
+# still exercising the trap/CSR/mret machinery and a broad instruction mix.
+#
+# Use with: TESTLIST=scripts/riscvdv_testlist_trimmed.yaml scripts/run_riscvdv.sh <test> <iters>
+
+# Machine-mode privileged random test: boots into M-mode, installs trap
+# handlers, and issues random instructions incl. CSR accesses + traps.
+- test: riscv_machine_mode_rand_test
+  description: >
+    Machine mode random test (trimmed for pyflow)
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=400
+    +num_of_sub_program=0
+    +boot_mode=m
+  rtl_test: core_base_test
+
+# Privileged-mode random test (M-mode only on this target, since the rv32imafd
+# core setting declares supported_privileged_mode = {MACHINE_MODE}).
+- test: riscv_privileged_mode_rand_test
+  description: >
+    Privileged mode random test (trimmed for pyflow)
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=400
+    +num_of_sub_program=0
+  rtl_test: core_base_test
+
+# General random instruction mix (the upstream one is too slow at 10000/5).
+- test: riscv_rand_instr_test
+  description: >
+    Random instruction test (trimmed for pyflow)
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=400
+    +num_of_sub_program=0
+  rtl_test: core_base_test
+
+# Floating-point random test: FP ops interleaved with loads/loops/jumps, so FP
+# ops are issued speculatively under branch checkpoints -- the trigger for the
+# FP stale-branch_mask bug.
+- test: riscv_floating_point_rand_test
+  description: >
+    Floating point random test (trimmed for pyflow)
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  # Loops + jumps create the speculative branch shadows that interleave with FP
+  # ops (the bug trigger). The FP load/store directed stream is omitted: pyflow
+  # mis-generates it as `fld ft0, none(zero)` (a gen bug, unrelated to the DUT).
+  gen_opts: >
+    +instr_cnt=500
+    +num_of_sub_program=0
+    +directed_instr_1=riscv_loop_instr,4
+    +directed_instr_4=riscv_jal_instr,4
+    +enable_floating_point=1
+  rtl_test: core_base_test
+
+# FP + branches with NO directed streams: the base random generator already
+# interleaves FP ops with conditional branches/jumps, so FP ops issue under
+# speculative branch checkpoints (the stale-mask bug trigger) -- without the
+# directed streams that pyflow mis-generates as `none` operands.
+- test: riscv_fp_branch_test
+  description: >
+    FP + speculative branches (base random gen, FP enabled)
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=600
+    +num_of_sub_program=0
+    +enable_floating_point=1
+  rtl_test: core_base_test
+
+# FP arithmetic test (straight FP, fewer branches).
+- test: riscv_floating_point_arithmetic_test
+  description: >
+    Floating point arithmetic test (trimmed for pyflow)
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=400
+    +num_of_sub_program=0
+    +no_branch_jump=1
+    +enable_floating_point=1
+  rtl_test: core_base_test

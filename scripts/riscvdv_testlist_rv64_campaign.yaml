@@ -1,0 +1,90 @@
+# Beefed-up rv64 lockstep random campaign (vs Sail + Spike), v2.
+#
+# Tuned after the v1 run: (a) pyflow's pure-Python solver times out above
+# ~instr_cnt 800 with sub-programs, so sizes are kept ~600; (b) load/store-heavy
+# + unaligned configs diverge from the ISS not on a core bug but on the sim
+# memory model (niigo main_memory is sparse flat DRAM that returns 0 for any
+# address, where Sail/Spike fault out-of-range) and on misaligned handling
+# (niigo splits in the LSQ, the ISS traps) -- so the LSQ is left to the directed
+# tests + ACT, and this campaign targets the OoO PIPELINE (branch recovery,
+# RAS/ITTAGE, rename/ROB pressure, long-latency mul/div/FP, trap-flush) which is
+# clean vs both goldens. Run one SEED per program, fan out across cores:
+#   TESTLIST=scripts/riscvdv_testlist_rv64_campaign.yaml SEED=<n> ISS=sail|spike \
+#   scripts/run_riscvdv.sh <test> 1
+
+# mul/div numeric corners (2^31/2^63/min/max/0/-1 operands) -- PASSED in v1.
+- test: niigo_int_numeric_corner
+  description: mul/div boundary operands
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=600 +num_of_sub_program=0 +boot_mode=m
+    +directed_instr_0=riscv_int_numeric_corner_stream,8
+    +no_branch_jump=1 +no_fence=1
+  rtl_test: core_base_test
+
+# RAS / indirect-call / ITTAGE / branch recovery: deep sub-programs + jumps +
+# loops. No data page -> no memory-model divergence.
+- test: niigo_branch_ras
+  description: deep sub-programs + jumps + loops (RAS/ITTAGE/recovery)
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=600 +num_of_sub_program=5 +boot_mode=m
+    +directed_instr_0=riscv_jal_instr,8
+    +directed_instr_1=riscv_loop_instr,6
+    +no_data_page=1 +no_load_store=1
+  rtl_test: core_base_test
+
+# nested branch shadows over long-latency mul/div/FP (the stale-branch_mask
+# deadlock trigger that riscv-dv found before).
+- test: niigo_nested_longlat
+  description: dense branch shadows over mul/div/FP
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=700 +num_of_sub_program=3 +boot_mode=m
+    +directed_instr_0=riscv_loop_instr,10
+    +directed_instr_1=riscv_int_numeric_corner_stream,4
+    +enable_floating_point=1
+    +no_data_page=1 +no_load_store=1
+  rtl_test: core_base_test
+
+# FP arithmetic + conversions (integer-dest FP ops appear in the trace).
+- test: niigo_fp
+  description: FP arithmetic + conversions + numeric corners
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=600 +num_of_sub_program=0 +boot_mode=m
+    +enable_floating_point=1 +no_branch_jump=1
+    +directed_instr_0=riscv_int_numeric_corner_stream,4
+    +no_data_page=1 +no_load_store=1
+  rtl_test: core_base_test
+
+# high-ILP numeric + FP: free-list / ROB pressure with no memory ops.
+- test: niigo_freelist_highilp
+  description: high-ILP numeric + FP, rename/ROB pressure
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=600 +num_of_sub_program=0 +boot_mode=m
+    +directed_instr_0=riscv_int_numeric_corner_stream,8
+    +directed_instr_1=riscv_loop_instr,4
+    +enable_floating_point=1
+    +no_data_page=1 +no_load_store=1
+  rtl_test: core_base_test
+
+# illegal-instruction stream: stresses the decode illegal path + the new
+# illegal-op neutralizer (illegal ops must trap at commit, not deadlock a FU).
+# The ISS + niigo both trap to the handler, which resumes.
+- test: niigo_illegal_trap
+  description: illegal-instr traps + loops (neutralizer path)
+  iterations: 1
+  gen_test: riscv_instr_base_test
+  gen_opts: >
+    +instr_cnt=600 +num_of_sub_program=2 +boot_mode=m
+    +directed_instr_0=riscv_loop_instr,4
+    +illegal_instr_ratio=12
+    +no_data_page=1 +no_load_store=1
+  rtl_test: core_base_test

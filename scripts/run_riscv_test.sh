@@ -5,6 +5,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ELF="${1:?usage: run_riscv_test.sh ELF [OUTPUT_DIR]}"
 OUTPUT="${2:-$ROOT/output/riscv-tests/$(basename "$ELF" .elf)}"
 SIM="$ROOT/output/simulation"
+# VTOP: override the simulator binary (default = the in-tree build). The parallel
+# verification flows point every run at a private, immutable copy so a stray
+# `make` in one worker can't clobber the shared binary mid-run.
+VTOP_BIN="${VTOP:-$SIM/verilator_obj/Vtop}"
 TIMEOUT="${NIIGO_TEST_TIMEOUT:-120}"
 BOOTSTRAP="${NIIGO_BOOTSTRAP:-0}"
 
@@ -12,8 +16,8 @@ mkdir -p "$OUTPUT"
 python3 "$ROOT/scripts/load_elf_mem.py" "$ELF" -o "$OUTPUT" \
   $( [[ "$BOOTSTRAP" == "0" ]] && echo --no-bootstrap )
 
-if [[ ! -x "$SIM/verilator_obj/Vtop" ]]; then
-  echo "error: Verilator executable missing; run 'make OOO=1 verilator-build' first" >&2
+if [[ ! -x "$VTOP_BIN" ]]; then
+  echo "error: Verilator executable missing ($VTOP_BIN); run 'make OOO=1 verilator-build' first" >&2
   exit 2
 fi
 
@@ -22,7 +26,7 @@ fi
   # NIIGO_VTOP_ARGS: extra plusargs forwarded to the simulator (e.g.
   # "+mem_fuzz +mem_seed=2026" for the niigo_memsys latency fuzzer).
   # shellcheck disable=SC2086
-  timeout "$TIMEOUT" "$SIM/verilator_obj/Vtop" ${NIIGO_VTOP_ARGS:-}
+  timeout "$TIMEOUT" "$VTOP_BIN" ${NIIGO_VTOP_ARGS:-}
 ) > "$OUTPUT/sim.log" 2>&1 || {
   code=$?
   if [[ $code -eq 124 ]]; then
