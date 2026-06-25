@@ -40,6 +40,18 @@ package NIIGO_Mem;
     localparam int L1_WAY_BITS   = $clog2(L1_WAYS);            // 2
     localparam int L1_TAG_BITS   = MEMORY_ADDR_WIDTH - L1_INDEX_BITS - LINE_WORD_BITS;
 
+    // ---- VIPT alias-free invariant (M2; plans/multicore-ccd.md §V "DD-CCD-VIPT") ----
+    // The L1s are virtually-indexed, physically-tagged. For VIPT to be SYNONYM-FREE the index
+    // must lie entirely within the page offset, i.e. way_size <= page_size. Then for every VA
+    // that maps a PA under 4 KiB paging, VA[index] == PA[index]: a core's (VA-sourced) index and
+    // a coherence snoop's (PA-sourced) index select the SAME set, with no synonym search. This is
+    // the single load-bearing invariant of the whole CCD L1 — `L1_VIPT_ALIAS_FREE` makes it a
+    // machine-checked property (the caches `initial assert` it), so growing L1_SETS/LINE_BYTES
+    // past a page can never silently break VIPT or coherence. way_size = SETS*LINE (total/ways).
+    localparam int PAGE_BYTES         = 4096;                  // Sv32/Sv39 base page
+    localparam int L1_WAY_BYTES       = L1_SETS * LINE_BYTES;  // = 4096 (== one page, exactly)
+    localparam bit L1_VIPT_ALIAS_FREE = (L1_WAY_BYTES <= PAGE_BYTES);
+
     // Word-address field extraction (a word address is MEMORY_ADDR_WIDTH bits):
     //   [ tag | index | line_word_offset ]
     function automatic logic [L1_INDEX_BITS-1:0]

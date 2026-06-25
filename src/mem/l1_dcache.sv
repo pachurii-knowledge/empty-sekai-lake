@@ -112,12 +112,25 @@ module l1_dcache
     logic [WB_W-1:0]               op_wdata_q;
     logic [WBY-1:0]                op_wmask_q;
 
-    logic [L1_INDEX_BITS-1:0]  op_idx;
-    logic [L1_TAG_BITS-1:0]    op_tag;
+    // VIPT seam (M2; plans/multicore-ccd.md §V): the set index is taken from the page-offset
+    // bits, which are translation-invariant (VA[idx] == PA[idx], alias-free per L1_VIPT_ALIAS_FREE
+    // below), so it is a VA-sourced index in all but name; the tag compare is physical (op_tag, a PA
+    // tag). A coherence snoop/probe indexes with the PA over the same bits -> the SAME set, no synonym
+    // search (see the C4a probe port). In the single core, translation is upstream of the cache so the
+    // request address already carries the resolved PA; true VA-early indexing (TLB-overlap) is a
+    // descoped FPGA-perf lever, not needed here. The L1D coherence state (MOESI) + a 2nd snoop-data
+    // port + the CMI interface are the M3 coherence-integration step.
+    logic [L1_INDEX_BITS-1:0]  op_idx;   // VIPT index  (page-offset bits -> translation-invariant)
+    logic [L1_TAG_BITS-1:0]    op_tag;   // physical tag (PA)
     logic [LINE_WORD_BITS-1:0] op_woff;
     assign op_idx  = l1_index(op_addr_q);
     assign op_tag  = l1_tag(op_addr_q);
     assign op_woff = l1_word_off(op_addr_q);
+
+    // The whole VIPT/PA-snoop correctness rests on the index lying within the page offset.
+    initial assert (L1_VIPT_ALIAS_FREE)
+        else $fatal(1, "l1_dcache: VIPT alias-free invariant violated (way_size %0d B > page %0d B)",
+                    L1_WAY_BYTES, PAGE_BYTES);
 
     typedef enum logic [3:0] {
         S_IDLE, S_LOOKUP, S_WB_REQ, S_WB_WAIT, S_FILL_REQ, S_FILL_WAIT, S_INSTALL,

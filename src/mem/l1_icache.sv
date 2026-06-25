@@ -91,12 +91,21 @@ module l1_icache
     logic                          p_valid_q, p_valid_n;
     logic [MEMORY_ADDR_WIDTH-1:0]  p_addr_q,  p_addr_n;
 
-    logic [L1_INDEX_BITS-1:0]  p_idx;
-    logic [L1_TAG_BITS-1:0]    p_tag;
+    // VIPT seam (M2; plans/multicore-ccd.md §V): the set index uses page-offset bits, which are
+    // translation-invariant (VA[idx] == PA[idx], alias-free per L1_VIPT_ALIAS_FREE) -> a VA-sourced
+    // index in all but name; the tag (p_tag) is physical. The C4b snoop port indexes with the PA over
+    // the same bits, hitting the SAME set with no synonym search. True VA-early indexing (TLB-overlap)
+    // is a descoped FPGA-perf lever; per-line coherence state + the CMI interface are the M3 step.
+    logic [L1_INDEX_BITS-1:0]  p_idx;   // VIPT index  (page-offset bits -> translation-invariant)
+    logic [L1_TAG_BITS-1:0]    p_tag;   // physical tag (PA)
     logic [LINE_WORD_BITS-1:0] p_loff;
     assign p_idx  = l1_index(p_addr_q);
     assign p_tag  = l1_tag(p_addr_q);
     assign p_loff = l1_word_off(p_addr_q);
+
+    initial assert (L1_VIPT_ALIAS_FREE)
+        else $fatal(1, "l1_icache: VIPT alias-free invariant violated (way_size %0d B > page %0d B)",
+                    L1_WAY_BYTES, PAGE_BYTES);
 
     typedef enum logic [2:0] {
         S_SERVE, S_MISS_REQ, S_MISS_WAIT, S_INSTALL, S_REPLAY
