@@ -1,0 +1,6 @@
+# CMurphi-generated build artifacts
+*.cpp
+*.log
+# compiled verifier binaries (no extension) — keep the .m sources, README, run.sh
+moesi_ccd*
+!moesi_ccd*.m
