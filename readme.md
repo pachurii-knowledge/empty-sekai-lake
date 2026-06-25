@@ -35,12 +35,16 @@ infrastructures of the same course.
   enough paging and interrupt pressure to expose out-of-order edge cases the architectural
   tests do not: several were found and fixed in store-commit handshaking, load-return
   matching under paging, and page-walk result attribution.
-- **FPGA emulation**: Synth/P&R infra exists for AMD Virtex UltraScale+ HBM VU47P FPGA (AWS F2 instances). Currently achieving **~60MHz post-route**, target frequency is 125MHz.
+- **FPGA emulation**: The full core and the full SoC (`niigo_soc` = core + L1 caches + memory subsystem + AXI4-512 master) synthesize in Vivado for the AMD Virtex UltraScale+ HBM VU47P (AWS F2 instances), and are wrapped into the F2 Custom Logic shell (`fpga/rtl/cl_niigo.sv`) with an OCL control plane, a virtual UART console, and a post-mortem debug window for on-card bring-up. Timing closure (tracked as FB2b) currently clears **62.5 MHz at Quick-place** (worst negative slack ≈ −7.7 ns ⇒ 63.7 MHz) after three targeted pipeline cuts — a 2-stage ROB commit, a registered LSQ head-translate, and a 2-stage CVFPU FMA — versus an earlier **~60MHz post-route** measurement; the routed/on-card confirmation is the next build. Target frequency is 125MHz.
 
 ## Future Roadmap
 
 - **Linux boot support on FPGA**: The immediate goal after successful synth and P&R on the VU47P is booting a minimal Linux kernel.
   Required ISA extensions and peripherals are already implemented.
+- **IPC Optimization**: Microarchitecturally, the identified bottlenecks are as follows:
+  - TAGE-SC-L correctness: The current branch predictor (`src/tage_sc_l_predictor.sv`) is only an approximation of the structure proposed in Seznec14. The goal is to implement the 32Kb variant after complete validation on VU47P at target frequency.
+  - VIPT L1D/I caches: Currently both caches are PIPT, requiring a TLB lookup and then PMP permission check before cache access. The caching and VM paging geometries allow alias-free L1$ indexing using virtual addresses instead of physical addresses, thus parallelizing the TLB lookup with L1$ access and saving one cycle off L1 hits. This will become the next critical path after the current LSQ path is broken up.
+  - Cache parameter sweep: Self-explanatory.
 - **Multicore SoC**: The next goal is to build a 2-core or 4-core cluster with a shared L2 cache and a dedicated cache/memory controller.
   The Niigo Memory Interface (NMI) is partially defined in src/mem/ (subject to heavy revision) and serves as the protocol for intra-CCD memory transactions.
   However, a CCD containing more than 2 cores may not fit on a single VU47P FPGA, and AWS F2 instances do not support PCIe P2P communication, so this step may change the target FPGA model.
@@ -181,6 +185,12 @@ available, and the RV64 build additionally exposes the 64-bit integer conversion
 moves. The wrapper includes small request/result buffers to decouple the core
 issue/writeback handshakes from CVFPU's valid-ready interface.
 
+For timing closure on FPGA the CVFPU FMA (ADDMUL) datapath is configured with two
+distributed pipeline registers, splitting the multiply-add across two stages (one extra
+cycle of FMA latency); FP is infrequent in the integer-heavy OS workloads, so the cost is
+negligible. FP issue is serialized to a single in-flight operation so that an in-flight FP
+op's speculative branch mask is aged correctly on branch recovery.
+
 The project also vendors small compatibility cells under `src/common_cells/`:
 
 - `registers.svh`
@@ -197,7 +207,8 @@ and produces load writebacks through the common writeback bus. Stores are made
 architecturally visible only after the commit unit authorizes the active-list entry,
 preserving precise state. The queue works in virtual addresses; the head access is
 translated by the MMU (see below) and the resolved physical word address is applied at
-the memory port.
+the memory port; the head access's translation (DTLB + data-PMP) result is registered
+and consumed on the following cycle to shorten the FPGA critical path.
 
 Misaligned loads and stores are supported without trapping (`MISALIGNED_LDST`). The queue
 classifies each access from its size and byte offset and, when an access crosses a
