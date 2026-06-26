@@ -23,7 +23,9 @@ module tb_niigo_ccd_gg
     logic [MEMORY_ADDR_WIDTH-1:0] creq_wa[2]; logic [XLEN-1:0] creq_wd[2];
     logic        creq_rdy [2];  logic [XLEN-1:0] cresp_rd[2]; logic cresp_sc[2];
 
-    niigo_ccd_gg_direct #(.NACTIVE(2), .DIR_SETS(8), .L1_SETS(8), .RESP_DLY(4)) dut (
+    // DIR_SETS >> L1_SETS so an L1 conflict-evict does not also evict the directory entry (a NINE
+    // directory-capacity / backup-dir concern, OPEN-3, out of M3c scope).
+    niigo_ccd_gg_direct #(.NACTIVE(2), .DIR_SETS(64), .L1_SETS(8), .RESP_DLY(4)) dut (
         .clk, .rst_l,
         .c_req_valid(creq_v), .c_req_ready(creq_rdy), .c_req_op(creq_op), .c_req_amo(creq_amo),
         .c_req_waddr(creq_wa), .c_req_wdata(creq_wd),
@@ -49,7 +51,7 @@ module tb_niigo_ccd_gg
     end
 
     // deferred-snoop firing monitor (a snoop recorded into an agent's MSHR defer slot)
-    int defer_cnt=0, c1d=0, c7d=0;
+    int defer_cnt=0, c1d=0, c7d=0, c3d=0;
     always_ff @(posedge clk) if (rst_l) begin
         if (dut.G_AGENT[0].L1D.d_val_n && !dut.G_AGENT[0].L1D.d_val_q) defer_cnt<=defer_cnt+1;
         if (dut.G_AGENT[1].L1D.d_val_n && !dut.G_AGENT[1].L1D.d_val_q) defer_cnt<=defer_cnt+1;
@@ -158,6 +160,29 @@ module tb_niigo_ccd_gg
         join
         cload(0, 'h30, r); chkv(r, 8, "C7: concurrent AMO_ADD final = 0+5+3");
         chk(defer_cnt - c7d >= 1, "C7: a FwdGetM was deferred during an AMO acquire");
+
+        // ---- C2 (DIR-1 regression): a clean PutS from an S-sharer must NOT drop a dirty owner.
+        //      core0 owns L dirty (O); core1 shares (S); core1 evicts L (clean PutS via a set
+        //      conflict). The dir must stay DIR_O(owner=core0) so a re-read forwards the dirty
+        //      value -- not demote to DIR_S and serve stale memory. ----
+        $display("== C2: clean PutS preserves a dirty owner (DIR_O not demoted) ==");
+        cstore(0, 'h50, 50);                 // core0 -> M(50)
+        cload (1, 'h50, r); chkv(r, 50, "C2: core1 shares (core0 M->O, dir DIR_O)");
+        cload (1, 'hD0, r);                  // core1 LOAD an L1 set-5 conflict -> clean PutS of 0x50
+        cload (1, 'h50, r); chkv(r, 50, "C2: re-read forwards dirty 50 (owner preserved, not stale mem)");
+
+        // ---- C3 (AGT-1 regression): an LR reservation must die when a deferred remote write
+        //      (FwdGetM) takes the line mid-acquire; a later SC must FAIL. ----
+        $display("== C3: LR reservation killed by a deferred remote write (SC must fail) ==");
+        c3d = defer_cnt;
+        fork
+            clr   (0, 'h60, r);              // core0 LR (grant-and-go E), DATA held by RESP_DLY
+            cstore(1, 'h60, 99);             // core1 STORE -> FwdGetM to core0 mid-IS_D -> deferred
+        join
+        cload(0, 'h60, r);                   // core0 re-fetches; the LR's reservation must be dead
+        csc  (0, 'h60, 77, ok); chk(ok==1'b0, "C3: SC fails (reservation killed by remote write)");
+        cload(1, 'h60, r);      chkv(r, 99, "C3: core1's store stands");
+        chk(defer_cnt - c3d >= 1, "C3: a FwdGetM was deferred during the LR's acquire");
 
         $display("");
         if (errors==0) $display("==== tb_niigo_ccd_gg: ALL CHECKS PASSED ====");

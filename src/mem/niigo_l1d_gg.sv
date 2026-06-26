@@ -107,7 +107,8 @@ module niigo_l1d_gg
     // ---- next-state vars ----
     logic cw_we; logic [IDX-1:0] cw_idx; cmi_state_e cw_st; logic [TAG-1:0] cw_tag; logic [LINE_BITS-1:0] cw_line;
     logic cww_we; logic [IDX-1:0] cww_idx; logic [LINE_WORD_BITS-1:0] cww_off; logic [XLEN-1:0] cww_val;
-    logic cs_we; logic [IDX-1:0] cs_idx; cmi_state_e cs_val;
+    logic cs_we; logic [IDX-1:0] cs_idx; cmi_state_e cs_val;       // demand-side state write
+    logic css_we; logic [IDX-1:0] css_idx; cmi_state_e css_val;    // DLK-1: snoop-side state write (2nd port)
     logic m_val_n; tstate_e m_ts_n;
     logic [MEMORY_ADDR_WIDTH-1:0] m_lad_n, m_vlad_n; cmi_state_e m_vst_n;
     logic signed [AKW-1:0] m_acks_n; logic m_data_n;
@@ -158,6 +159,7 @@ module niigo_l1d_gg
         cw_we=0; cw_idx='0; cw_st=CMI_I; cw_tag='0; cw_line='0;
         cww_we=0; cww_idx='0; cww_off='0; cww_val='0;
         cs_we=0; cs_idx='0; cs_val=CMI_I;
+        css_we=0; css_idx='0; css_val=CMI_I;
         m_val_n=m_val_q; m_ts_n=m_ts_q; m_lad_n=m_lad_q; m_vlad_n=m_vlad_q; m_vst_n=m_vst_q;
         m_acks_n=m_acks_q; m_data_n=m_data_q; m_rop_n=m_rop_q; m_ramo_n=m_ramo_q;
         m_woff_n=m_woff_q; m_wd_n=m_wd_q; m_atom_n=m_atom_q; m_issued_n=m_issued_q;
@@ -230,12 +232,12 @@ module niigo_l1d_gg
                     OP_FWD_GETS: begin
                         sr_pend_n=1; sr_dst_n=cnode(snoop_msg.req);
                         sr_msg_n=umsg(OP_DATA,CMI_S,(cs==CMI_E)?ON_S:ON_O,snoop_msg.req,'0,data_q[si],snoop_msg.laddr);
-                        cs_we=1; cs_idx=si; cs_val=(cs==CMI_E)?CMI_S:CMI_O;
+                        css_we=1; css_idx=si; css_val=(cs==CMI_E)?CMI_S:CMI_O;
                     end
                     OP_FWD_GETM: begin
                         sr_pend_n=1; sr_dst_n=cnode(snoop_msg.req);
                         sr_msg_n=umsg(OP_DATA,CMI_M,ON_NA,snoop_msg.req,snoop_msg.acks,data_q[si],snoop_msg.laddr);
-                        cs_we=1; cs_idx=si; cs_val=CMI_I;
+                        css_we=1; css_idx=si; css_val=CMI_I;
                     end
                     OP_INV: begin
                         sr_pend_n=1; sr_dst_n=cnode(snoop_msg.req);
@@ -243,7 +245,7 @@ module niigo_l1d_gg
                         // INV in SM_AD/OM_A demotes to IM_AD (lost the shared copy); else invalidate
                         if (m_val_q && m_lad_q==snoop_msg.laddr && (m_ts_q==T_SM_AD||m_ts_q==T_OM_A)) begin
                             m_ts_n=T_IM_AD; m_data_n=0; m_issued_n=0;   // re-fetch as GetM
-                        end else begin cs_we=1; cs_idx=si; cs_val=CMI_I; end
+                        end else begin css_we=1; css_idx=si; css_val=CMI_I; end
                     end
                     default: ;
                 endcase
@@ -264,7 +266,13 @@ module niigo_l1d_gg
                 serve_deferred(ix, (resp_msg.gst==CMI_E)?CMI_E:CMI_S, m_lad_q, resp_msg.line);
                 // a deferred snoop served this cycle downgrades the just-installed line: fold its
                 // state into the install (cw_we has seq priority over cs_we, so cs_we would be lost)
-                if (cs_we) begin cw_st=cs_val; cs_we=1'b0; end
+                if (cs_we) begin
+                    cw_st=cs_val; cs_we=1'b0;
+                    // AGT-1: a deferred FwdGetM/INV drove the line non-readable -> the LR reservation
+                    // just set above must be killed (post-ServeDeferred pre-switch, §4.5/§4.10), else a
+                    // later SC to a line handed to a remote writer would wrongly succeed.
+                    if (cs_val==CMI_I) rsv_v_n=1'b0;
+                end
                 // completion: UNBLOCK (echo onext from the data); refresh WB if ON_S/ON_I
                 m_unon_n=resp_msg.onext; m_uwb_n=resp_msg.line;
                 m_ts_n=T_UNBLK; m_issued_n=0;
@@ -407,6 +415,10 @@ module niigo_l1d_gg
             sr_pend_q<=sr_pend_n; sr_msg_q<=sr_msg_n; sr_dst_q<=sr_dst_n;
             if (cw_we) begin state_q[cw_idx]<=cw_st; tag_q[cw_idx]<=cw_tag; data_q[cw_idx]<=cw_line; end
             else if (cs_we) state_q[cs_idx]<=cs_val;
+            // DLK-1: the snoop FSM has its own state-write port; apply it independently of the
+            // demand-side write unless they target the SAME set (demand write wins that collision).
+            if (css_we && !(cw_we && css_idx==cw_idx) && !(cs_we && !cw_we && css_idx==cs_idx))
+                state_q[css_idx]<=css_val;
             if (cww_we) data_q[cww_idx][cww_off*XLEN +: XLEN]<=cww_val;
         end
     end

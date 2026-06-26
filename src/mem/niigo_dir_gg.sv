@@ -173,18 +173,21 @@ module niigo_dir_gg
             // (1) WB_DATA: eviction drain OR S_D refresh pairing
             if (wb_valid) begin
                 wb_rdy_c = 1'b1;
-                if (busy_q && bkind_q==K_DRAINPUT && wb_msg.laddr==blad_q) begin
-                    // eviction writeback -> memory, then ack + finalize
-                    gline_n = wb_msg.line; st_n = S_MEMWR;
-                end else if (busy_q && bkind_q==K_SD && wb_msg.laddr==blad_q) begin
+                // match the busy transaction by REQUESTER (src==breq_q) AND line, not line alone:
+                // a stale same-line WB from a different core must not pair with this transaction.
+                if (busy_q && bkind_q==K_DRAINPUT && wb_msg.laddr==blad_q && wb_msg.src==breq_q) begin
+                    gline_n = wb_msg.line; st_n = S_MEMWR;             // eviction writeback -> memory
+                end else if (busy_q && bkind_q==K_SD && wb_msg.laddr==blad_q && wb_msg.src==breq_q) begin
                     brefresh_val_n = wb_msg.line; bwb_seen_n = 1'b1;  // pair for the S_D refresh
                 end
-                // (stray WB to a non-busy line: accept + drop, memory already current)
+                // (stray WB to a non-busy / wrong-requester line: accept + drop)
             end
-            // (2) UNBLOCK finalize
+            // (2) UNBLOCK finalize -- must come from THIS transaction's requester (breq_q), else a
+            //     stale same-line UNBLOCK from another core (e.g. a delayed grant-and-go UNBLOCK)
+            //     would corrupt the finalize (wrong onext / premature).
             else if (unblk_valid) begin
                 unblk_rdy_c = 1'b1;
-                if (busy_q && unblk_msg.laddr==blad_q) begin
+                if (busy_q && unblk_msg.laddr==blad_q && unblk_msg.src==breq_q) begin
                     bub_seen_n  = 1'b1;
                     bub_onext_n = unblk_msg.onext;
                 end
@@ -296,12 +299,17 @@ module niigo_dir_gg
                         end
                     end
                     // ---------- PutE / PutS (clean, no line) ----------
+                    // DIR-1 fix: a clean Put only clears R's sharer bit; it must NOT demote a line
+                    // that has a dirty owner (DIR_O, or DIR_EM owned by some core != R) -- that would
+                    // drop the owner and a later cold reader would get stale memory (v3 PutE/PutS;
+                    // I1/I2/I5). Only DIR_EM&&owner==R (PutE of the sole copy) or the last DIR_S
+                    // sharer leaving collapses the line to DIR_I; everything else is unchanged.
                     OP_PUTE, OP_PUTS: begin
                         automatic logic [CORES-1:0] sh2 = e.sharers & ~bitR;
                         gmsg_n=mkmsg(OP_ACK,R,CMI_I,'0,'0,m.laddr); gdst_n=cnode(R);
-                        if (e.dstate==DIR_EM && e.owner==R) nds_n=DIR_I;
-                        else if (sh2==0)                    nds_n=DIR_I;
-                        else                                nds_n=DIR_S;
+                        if (e.dstate==DIR_EM && e.owner==R)    nds_n=DIR_I;   // sole clean owner left
+                        else if (e.dstate==DIR_S && sh2==0)    nds_n=DIR_I;   // last shared sharer left
+                        else                                   nds_n=e.dstate;// DIR_O / DIR_EM(other) unchanged
                         nsh_n=sh2; nown_n=e.owner; nset_n=1'b0;
                         st_n=S_EMIT;
                     end
