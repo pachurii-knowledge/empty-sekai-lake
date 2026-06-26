@@ -18,6 +18,11 @@
 
 module priv_csr_file
     import RISCV_Priv::*;
+#(
+    // M4: per-core hart id read back by the mhartid CSR. Default 0 == the single-core build,
+    // so mhartid stays 0 and the baseline is bit-identical; an SMP top sets 0,1,2,3 per core.
+    parameter logic [MXLEN-1:0] HART_ID = '0
+)
 (
     input wire logic        clk,
     input wire logic        rst_l,
@@ -301,7 +306,7 @@ module priv_csr_file
             CSR_MVENDORID: data = '0;
             CSR_MARCHID:   data = '0;
             CSR_MIMPID:    data = '0;
-            CSR_MHARTID:   data = '0;
+            CSR_MHARTID:   data = HART_ID;
 
             // Machine trap setup
             CSR_MSTATUS:   data = mstatus_v;

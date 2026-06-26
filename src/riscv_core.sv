@@ -19,6 +19,9 @@
 module riscv_core
     import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
+#(
+    parameter logic [XLEN-1:0] HART_ID = '0   // M4: per-core mhartid (OoO build; default 0 = single core)
+)
 `ifdef OOO_4WIDE
 (
     input wire logic             clk, rst_l,
@@ -59,7 +62,7 @@ module riscv_core
     output logic             halted
 );
 
-    riscv_core_ooo OoOCore (
+    riscv_core_ooo #(.HART_ID(HART_ID)) OoOCore (
         .clk,
         .rst_l,
         .ifetch_req_valid,

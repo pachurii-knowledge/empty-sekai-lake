@@ -22,6 +22,9 @@ module riscv_core_ooo
     import OOO_Types::*;
     import RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
+#(
+    parameter logic [XLEN-1:0] HART_ID = '0   // M4: per-core mhartid (default 0 = single core; XLEN via OOO_Types)
+)
 (
     input wire logic             clk, rst_l,
 
@@ -560,7 +563,7 @@ module riscv_core_ooo
         .src2_ready(busy_src2_ready)
     );
 
-    priv_csr_file CSRFile (
+    priv_csr_file #(.HART_ID(HART_ID)) CSRFile (
         .clk,
         .rst_l,
         .retire_cnt(retire_count),
