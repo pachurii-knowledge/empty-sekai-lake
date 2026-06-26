@@ -40,6 +40,7 @@ module niigo_l1d_gg
     input  wire l1_amo_op_e                    c_req_amo,
     input  wire logic [MEMORY_ADDR_WIDTH-1:0]  c_req_waddr,
     input  wire logic [XLEN-1:0]               c_req_wdata,
+    input  wire logic [XLEN/8-1:0]             c_req_wmask,   // M3d: per-byte write-enable (sub-word stores)
     output logic [XLEN-1:0]                     c_resp_rdata,
     output logic                               c_resp_sc_ok,
     // ---- demand uplink (to dir): GetS/GetM/Upgrade/Put*/UNBLOCK/WB_DATA ----
@@ -55,6 +56,7 @@ module niigo_l1d_gg
     localparam int IDX = $clog2(SETS);
     localparam int TAG = MEMORY_ADDR_WIDTH - IDX - LINE_WORD_BITS;
     localparam int AKW = ACK_CNT_W+2;   // signed ack down-counter with slack
+    localparam int XBY = XLEN/8;        // bytes per word
     /* verilator lint_off ENUMVALUE */
 
     function automatic logic [IDX-1:0] ixf(input logic [MEMORY_ADDR_WIDTH-1:0] wa); ixf=wa[LINE_WORD_BITS +: IDX]; endfunction
@@ -65,6 +67,10 @@ module niigo_l1d_gg
     function automatic logic [XLEN-1:0] wrd(input logic [LINE_BITS-1:0] l, input logic [LINE_WORD_BITS-1:0] o); wrd=l[o*XLEN +: XLEN]; endfunction
     function automatic logic [LINE_BITS-1:0] wmrg(input logic [LINE_BITS-1:0] l, input logic [LINE_WORD_BITS-1:0] o, input logic [XLEN-1:0] w);
         wmrg=l; wmrg[o*XLEN +: XLEN]=w; endfunction
+    // masked merge: write only the byte-enabled lanes of word `o` (sub-word stores, M3d)
+    function automatic logic [LINE_BITS-1:0] wmrgm(input logic [LINE_BITS-1:0] l, input logic [LINE_WORD_BITS-1:0] o,
+                                                  input logic [XLEN-1:0] w, input logic [XBY-1:0] be);
+        wmrgm=l; for (int b=0;b<XBY;b++) if (be[b]) wmrgm[o*XLEN + b*8 +: 8] = w[b*8 +: 8]; endfunction
     function automatic logic [XLEN-1:0] amo(input l1_amo_op_e a, input logic [XLEN-1:0] od, input logic [XLEN-1:0] o);
         unique case(a) AMO_ADD:amo=od+o; AMO_SWAP:amo=o; AMO_OR:amo=od|o; AMO_AND:amo=od&o; AMO_XOR:amo=od^o; default:amo=o; endcase
     endfunction
@@ -92,7 +98,7 @@ module niigo_l1d_gg
     logic signed [AKW-1:0] m_acks_q;
     logic                  m_data_q;
     l1_core_op_e           m_rop_q; l1_amo_op_e m_ramo_q;
-    logic [LINE_WORD_BITS-1:0] m_woff_q; logic [XLEN-1:0] m_wd_q;
+    logic [LINE_WORD_BITS-1:0] m_woff_q; logic [XLEN-1:0] m_wd_q; logic [XBY-1:0] m_be_q;
     atom_e                 m_atom_q;
     logic                  m_issued_q;
     cmi_owner_next_e       m_unon_q;              // onext to echo in UNBLOCK
@@ -106,13 +112,13 @@ module niigo_l1d_gg
 
     // ---- next-state vars ----
     logic cw_we; logic [IDX-1:0] cw_idx; cmi_state_e cw_st; logic [TAG-1:0] cw_tag; logic [LINE_BITS-1:0] cw_line;
-    logic cww_we; logic [IDX-1:0] cww_idx; logic [LINE_WORD_BITS-1:0] cww_off; logic [XLEN-1:0] cww_val;
+    logic cww_we; logic [IDX-1:0] cww_idx; logic [LINE_WORD_BITS-1:0] cww_off; logic [XLEN-1:0] cww_val; logic [XBY-1:0] cww_be;
     logic cs_we; logic [IDX-1:0] cs_idx; cmi_state_e cs_val;       // demand-side state write
     logic css_we; logic [IDX-1:0] css_idx; cmi_state_e css_val;    // DLK-1: snoop-side state write (2nd port)
     logic m_val_n; tstate_e m_ts_n;
     logic [MEMORY_ADDR_WIDTH-1:0] m_lad_n, m_vlad_n; cmi_state_e m_vst_n;
     logic signed [AKW-1:0] m_acks_n; logic m_data_n;
-    l1_core_op_e m_rop_n; l1_amo_op_e m_ramo_n; logic [LINE_WORD_BITS-1:0] m_woff_n; logic [XLEN-1:0] m_wd_n;
+    l1_core_op_e m_rop_n; l1_amo_op_e m_ramo_n; logic [LINE_WORD_BITS-1:0] m_woff_n; logic [XLEN-1:0] m_wd_n; logic [XBY-1:0] m_be_n;
     atom_e m_atom_n; logic m_issued_n; cmi_owner_next_e m_unon_n; logic [LINE_BITS-1:0] m_uwb_n;
     logic d_val_n; cmi_op_e d_op_n; logic [CORE_ID_W-1:0] d_req_n; logic [ACK_CNT_W-1:0] d_acks_n;
     logic rsv_v_n; logic [MEMORY_ADDR_WIDTH-1:0] rsv_l_n; logic [XLEN-1:0] rsv_val_n;
@@ -157,12 +163,12 @@ module niigo_l1d_gg
 
     always_comb begin
         cw_we=0; cw_idx='0; cw_st=CMI_I; cw_tag='0; cw_line='0;
-        cww_we=0; cww_idx='0; cww_off='0; cww_val='0;
+        cww_we=0; cww_idx='0; cww_off='0; cww_val='0; cww_be='1;   // default full-word (AMO/SC sites)
         cs_we=0; cs_idx='0; cs_val=CMI_I;
         css_we=0; css_idx='0; css_val=CMI_I;
         m_val_n=m_val_q; m_ts_n=m_ts_q; m_lad_n=m_lad_q; m_vlad_n=m_vlad_q; m_vst_n=m_vst_q;
         m_acks_n=m_acks_q; m_data_n=m_data_q; m_rop_n=m_rop_q; m_ramo_n=m_ramo_q;
-        m_woff_n=m_woff_q; m_wd_n=m_wd_q; m_atom_n=m_atom_q; m_issued_n=m_issued_q;
+        m_woff_n=m_woff_q; m_wd_n=m_wd_q; m_be_n=m_be_q; m_atom_n=m_atom_q; m_issued_n=m_issued_q;
         m_unon_n=m_unon_q; m_uwb_n=m_uwb_q;
         d_val_n=d_val_q; d_op_n=d_op_q; d_req_n=d_req_q; d_acks_n=d_acks_q;
         rsv_v_n=rsv_v_q; rsv_l_n=rsv_l_q; rsv_val_n=rsv_val_q;
@@ -298,8 +304,8 @@ module niigo_l1d_gg
             automatic logic [LINE_BITS-1:0] postline=data_q[ix];   // line after this cycle's write
             cs_we=1; cs_idx=ix; cs_val=CMI_M;
             unique case (m_atom_q)
-                AT_NONE: begin cww_we=1; cww_idx=ix; cww_off=o; cww_val=m_wd_q; creq_rdy_c=1; rsv_v_n=0;
-                               postline=wmrg(data_q[ix],o,m_wd_q); end
+                AT_NONE: begin cww_we=1; cww_idx=ix; cww_off=o; cww_val=m_wd_q; cww_be=m_be_q; creq_rdy_c=1; rsv_v_n=0;
+                               postline=wmrgm(data_q[ix],o,m_wd_q,m_be_q); end   // sub-word store-MISS merge
                 AT_SC: begin
                     creq_rdy_c=1;
                     if (rsv_v_q && rsv_l_q==m_lad_q) begin cww_we=1; cww_idx=ix; cww_off=o; cww_val=m_wd_q; csc_c=1;
@@ -344,7 +350,7 @@ module niigo_l1d_gg
             automatic logic wrable=(cs==CMI_M)||(cs==CMI_E);
             automatic logic occ=(cs!=CMI_I)&&(tag_q[ix]!=tgf(c_req_waddr));
             // common MSHR allocate fields
-            m_lad_n=lbase(c_req_waddr); m_woff_n=o; m_wd_n=c_req_wdata; m_rop_n=c_req_op; m_ramo_n=c_req_amo;
+            m_lad_n=lbase(c_req_waddr); m_woff_n=o; m_wd_n=c_req_wdata; m_be_n=c_req_wmask; m_rop_n=c_req_op; m_ramo_n=c_req_amo;
             m_issued_n=0; m_data_n=0; m_acks_n=0; d_val_n=0;
             // fill tstate selection helper
             unique case (c_req_op)
@@ -359,8 +365,8 @@ module niigo_l1d_gg
                 end
             end
             COP_STORE: begin
-                if (hit && cs==CMI_M) begin creq_rdy_c=1; cww_we=1; cww_idx=ix; cww_off=o; cww_val=c_req_wdata; if(rsv_v_q&&rsv_l_q==lbase(c_req_waddr))rsv_v_n=0; end
-                else if (hit && cs==CMI_E) begin creq_rdy_c=1; cww_we=1; cww_idx=ix; cww_off=o; cww_val=c_req_wdata; cs_we=1; cs_idx=ix; cs_val=CMI_M; if(rsv_v_q&&rsv_l_q==lbase(c_req_waddr))rsv_v_n=0; end
+                if (hit && cs==CMI_M) begin creq_rdy_c=1; cww_we=1; cww_idx=ix; cww_off=o; cww_val=c_req_wdata; cww_be=c_req_wmask; if(rsv_v_q&&rsv_l_q==lbase(c_req_waddr))rsv_v_n=0; end
+                else if (hit && cs==CMI_E) begin creq_rdy_c=1; cww_we=1; cww_idx=ix; cww_off=o; cww_val=c_req_wdata; cww_be=c_req_wmask; cs_we=1; cs_idx=ix; cs_val=CMI_M; if(rsv_v_q&&rsv_l_q==lbase(c_req_waddr))rsv_v_n=0; end
                 else if (hit && (cs==CMI_S||cs==CMI_O)) begin m_val_n=1; m_data_n=1; m_atom_n=AT_NONE; m_ts_n=(cs==CMI_O)?T_OM_A:T_SM_AD; end
                 else begin
                     m_val_n=1; m_atom_n=AT_NONE;
@@ -409,7 +415,7 @@ module niigo_l1d_gg
         end else begin
             m_val_q<=m_val_n; m_ts_q<=m_ts_n; m_lad_q<=m_lad_n; m_vlad_q<=m_vlad_n; m_vst_q<=m_vst_n;
             m_acks_q<=m_acks_n; m_data_q<=m_data_n; m_rop_q<=m_rop_n; m_ramo_q<=m_ramo_n;
-            m_woff_q<=m_woff_n; m_wd_q<=m_wd_n; m_atom_q<=m_atom_n; m_issued_q<=m_issued_n; m_unon_q<=m_unon_n; m_uwb_q<=m_uwb_n;
+            m_woff_q<=m_woff_n; m_wd_q<=m_wd_n; m_be_q<=m_be_n; m_atom_q<=m_atom_n; m_issued_q<=m_issued_n; m_unon_q<=m_unon_n; m_uwb_q<=m_uwb_n;
             d_val_q<=d_val_n; d_op_q<=d_op_n; d_req_q<=d_req_n; d_acks_q<=d_acks_n;
             rsv_v_q<=rsv_v_n; rsv_l_q<=rsv_l_n; rsv_val_q<=rsv_val_n;
             sr_pend_q<=sr_pend_n; sr_msg_q<=sr_msg_n; sr_dst_q<=sr_dst_n;
@@ -419,7 +425,8 @@ module niigo_l1d_gg
             // demand-side write unless they target the SAME set (demand write wins that collision).
             if (css_we && !(cw_we && css_idx==cw_idx) && !(cs_we && !cw_we && css_idx==cs_idx))
                 state_q[css_idx]<=css_val;
-            if (cww_we) data_q[cww_idx][cww_off*XLEN +: XLEN]<=cww_val;
+            if (cww_we) for (int b=0;b<XBY;b++)
+                if (cww_be[b]) data_q[cww_idx][cww_off*XLEN + b*8 +: 8]<=cww_val[b*8 +: 8];
         end
     end
 

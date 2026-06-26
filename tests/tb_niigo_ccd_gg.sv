@@ -20,7 +20,7 @@ module tb_niigo_ccd_gg
     nmi_req_t mreq; logic mreq_ready; nmi_resp_t mresp;
 
     logic        creq_v   [2];  l1_core_op_e creq_op [2]; l1_amo_op_e creq_amo[2];
-    logic [MEMORY_ADDR_WIDTH-1:0] creq_wa[2]; logic [XLEN-1:0] creq_wd[2];
+    logic [MEMORY_ADDR_WIDTH-1:0] creq_wa[2]; logic [XLEN-1:0] creq_wd[2]; logic [XLEN/8-1:0] creq_wm[2];
     logic        creq_rdy [2];  logic [XLEN-1:0] cresp_rd[2]; logic cresp_sc[2];
 
     // DIR_SETS >> L1_SETS so an L1 conflict-evict does not also evict the directory entry (a NINE
@@ -28,7 +28,7 @@ module tb_niigo_ccd_gg
     niigo_ccd_gg_direct #(.NACTIVE(2), .DIR_SETS(64), .L1_SETS(8), .RESP_DLY(4)) dut (
         .clk, .rst_l,
         .c_req_valid(creq_v), .c_req_ready(creq_rdy), .c_req_op(creq_op), .c_req_amo(creq_amo),
-        .c_req_waddr(creq_wa), .c_req_wdata(creq_wd),
+        .c_req_waddr(creq_wa), .c_req_wdata(creq_wd), .c_req_wmask(creq_wm),
         .c_resp_rdata(cresp_rd), .c_resp_sc_ok(cresp_sc),
         .mem_req_o(mreq), .mem_req_ready_i(mreq_ready), .mem_resp_i(mresp));
 
@@ -68,8 +68,13 @@ module tb_niigo_ccd_gg
     endtask
 
     task automatic cstore(input int ci, input logic [MEMORY_ADDR_WIDTH-1:0] wa, input logic [XLEN-1:0] wd);
-        @(negedge clk); creq_v[ci]=1; creq_op[ci]=COP_STORE; creq_wa[ci]=wa; creq_wd[ci]=wd;
+        @(negedge clk); creq_v[ci]=1; creq_op[ci]=COP_STORE; creq_wa[ci]=wa; creq_wd[ci]=wd; creq_wm[ci]='1;
         do @(posedge clk); while(!creq_rdy[ci]); @(negedge clk); creq_v[ci]=0;
+    endtask
+    // sub-word store: only the byte-enabled lanes of `wd` are written (M3d c_req_wmask)
+    task automatic cstoreb(input int ci, input logic [MEMORY_ADDR_WIDTH-1:0] wa, input logic [XLEN-1:0] wd, input logic [XLEN/8-1:0] be);
+        @(negedge clk); creq_v[ci]=1; creq_op[ci]=COP_STORE; creq_wa[ci]=wa; creq_wd[ci]=wd; creq_wm[ci]=be;
+        do @(posedge clk); while(!creq_rdy[ci]); @(negedge clk); creq_v[ci]=0; creq_wm[ci]='1;
     endtask
     task automatic cload(input int ci, input logic [MEMORY_ADDR_WIDTH-1:0] wa, output logic [XLEN-1:0] rd);
         @(negedge clk); creq_v[ci]=1; creq_op[ci]=COP_LOAD; creq_wa[ci]=wa;
@@ -95,7 +100,7 @@ module tb_niigo_ccd_gg
 
     initial begin
         for (int i=0;i<MEMLINES;i++) MEM[i]='0;
-        for (int c=0;c<2;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wa[c]='0; creq_wd[c]='0; end
+        for (int c=0;c<2;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wa[c]='0; creq_wd[c]='0; creq_wm[c]='1; end
         rst_l=0; repeat(4) @(posedge clk); rst_l=1; repeat(2) @(posedge clk);
 
         $display("== S1: core0 store V=100, core1 load V (cross-core coherence over the grant-and-go direct interconnect) ==");
@@ -183,6 +188,15 @@ module tb_niigo_ccd_gg
         csc  (0, 'h60, 77, ok); chk(ok==1'b0, "C3: SC fails (reservation killed by remote write)");
         cload(1, 'h60, r);      chkv(r, 99, "C3: core1's store stands");
         chk(defer_cnt - c3d >= 1, "C3: a FwdGetM was deferred during the LR's acquire");
+
+        // ---- C8 (M3d): sub-word store byte-merge via c_req_wmask (needed for the real core's
+        //      byte/half stores). Hit-merge + miss-merge (store-MISS install path). ----
+        $display("== C8: sub-word store byte-merge (c_req_wmask) ==");
+        cstore (0, 'h70, 32'hAABBCCDD);              // full word
+        cstoreb(0, 'h70, 32'h00000011, 4'b0001);     // byte0 <- 0x11, bytes 1..3 preserved
+        cload  (0, 'h70, r); chkv(r, 32'hAABBCC11, "C8: hit byte-store merges (AABBCC11)");
+        cstoreb(1, 'h80, 32'h0000EE00, 4'b0010);     // MISS + byte1 <- 0xEE onto a fresh (0) line
+        cload  (1, 'h80, r); chkv(r, 32'h0000EE00, "C8: miss byte-store merges onto fresh line");
 
         $display("");
         if (errors==0) $display("==== tb_niigo_ccd_gg: ALL CHECKS PASSED ====");
