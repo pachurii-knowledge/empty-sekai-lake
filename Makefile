@@ -95,6 +95,13 @@ ccd-gg-test:
 		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_gg.sv
 	$(OUTPUT_BASE_DIR)/ccd-gg/Vtb_niigo_ccd_gg
 
+# ---- M3c-D grant-and-go MOESI coherence over the real wheel NoC (dir/agent on the hub-funnel + ring) ----
+ccd-gg-wheel-test:
+	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/ccd-gg-wheel --top-module tb_niigo_ccd_gg_wheel \
+		-Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT -Wno-ASCRANGE \
+		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_gg_wheel.sv
+	$(OUTPUT_BASE_DIR)/ccd-gg-wheel/Vtb_niigo_ccd_gg_wheel
+
 # ---- M3b two-core MOESI coherence over the wheel NoC (agents + dir + SerDes + routers) ----
 ccd-wheel-coh-test:
 	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/ccd-wheel-coh --top-module tb_niigo_ccd_wheel \
