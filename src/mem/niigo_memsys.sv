@@ -749,9 +749,14 @@ module niigo_memsys
         .c_req_waddr(c_req_waddr), .c_req_wdata(c_req_wdata), .c_req_wmask(c_req_wmask),
         .c_resp_rdata(c_resp_rdata), .c_resp_sc_ok(c_resp_sc_ok),
         .flush_req(ccd_flush_req), .flush_done(dcache_flush_done),
-        .snoop_kill_valid(dmem_snoop_kill_valid), .snoop_kill_laddr(dmem_snoop_kill_laddr),
+        // M4 S1: the wrapper exposes a per-agent snoop_kill array; single-core uses index [0].
+        .snoop_kill_valid(ccd_sk_v), .snoop_kill_laddr(ccd_sk_la),
         .mem_req_o(ccd_nmi_req), .mem_req_ready_i(ccd_nmi_ready), .mem_resp_i(ccd_nmi_resp)
     );
+    logic                          ccd_sk_v [1];
+    logic [MEMORY_ADDR_WIDTH-1:0]  ccd_sk_la[1];
+    assign dmem_snoop_kill_valid = ccd_sk_v[0];
+    assign dmem_snoop_kill_laddr = ccd_sk_la[0];
 
     // PTW main_memory port retired (PTW now flows through the agent).
     assign mem_ptw_addr  = '0;

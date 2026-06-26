@@ -98,7 +98,7 @@ module top
     logic        creq_v   [2];  l1_core_op_e creq_op [2]; l1_amo_op_e creq_amo[2];
     logic [MEMORY_ADDR_WIDTH-1:0] creq_wa[2]; logic [XLEN-1:0] creq_wd[2]; logic [XLEN_BYTES-1:0] creq_wm[2];
     logic        creq_rdy [2];  logic [XLEN-1:0] cresp_rd[2]; logic cresp_sc[2];
-    logic        ccd_snoop_kill_v; logic [MEMORY_ADDR_WIDTH-1:0] ccd_snoop_kill_la;
+    logic        ccd_snoop_kill_v [2]; logic [MEMORY_ADDR_WIDTH-1:0] ccd_snoop_kill_la [2];
     nmi_req_t    mreq; logic mreq_ready; nmi_resp_t mresp;
 
     niigo_ccd_gg_direct #(.NACTIVE(2), .L1_SETS(64), .DIR_SETS(256), .RESP_DLY(4)) CCD (
@@ -110,9 +110,10 @@ module top
         .snoop_kill_valid(ccd_snoop_kill_v), .snoop_kill_laddr(ccd_snoop_kill_la),
         .mem_req_o(mreq), .mem_req_ready_i(mreq_ready), .mem_resp_i(mresp));
 
-    // snoop-kill from core 0's agent -> the real core's LSQ (the path under test)
-    assign dmem_snoop_kill_valid = ccd_snoop_kill_v;
-    assign dmem_snoop_kill_laddr = ccd_snoop_kill_la;
+    // snoop-kill from core 0's agent -> the real core's LSQ (the path under test). M4 S1: the
+    // wrapper now exposes a per-agent array; the real core is agent [0].
+    assign dmem_snoop_kill_valid = ccd_snoop_kill_v[0];
+    assign dmem_snoop_kill_laddr = ccd_snoop_kill_la[0];
 
     // ===== replicated dmem launch adapter (core 0's dmem <-> c_req[0]) =====
     // Faithful copy of the niigo_memsys CCD arm (device-bypass + PTW dropped). Registered launch
