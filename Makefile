@@ -109,6 +109,20 @@ ccd-wheel-coh-test:
 		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_wheel.sv
 	$(OUTPUT_BASE_DIR)/ccd-wheel-coh/Vtb_niigo_ccd_wheel
 
+# ---- M3d Stage 3 reservation-coherence-kill validation: ONE real riscv_core_ooo (core 0) + a
+#      behavioural peer (core 1) over niigo_ccd_gg_direct #(.NACTIVE(2)). Builds the FULL OoO core
+#      (top overridden to tb_ccd_stage3) + serves the assembled litmus via a behavioural ifetch. ----
+ccd-stage3-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-stage3 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_stage3.sv)
+	@echo "--- contended (peer writes the reserved line -> sc.w must FAIL) ---"
+	$(OUTPUT_BASE_DIR)/ccd-stage3/Vtop
+	@echo "--- negative control (peer writes a different line -> sc.w must SUCCEED) ---"
+	$(OUTPUT_BASE_DIR)/ccd-stage3/Vtop +nokill
+
 $(OUTPUT):
 	@mkdir -p $@
 
