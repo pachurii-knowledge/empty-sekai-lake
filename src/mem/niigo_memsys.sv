@@ -106,6 +106,10 @@ module niigo_memsys
     input wire logic [MEMORY_ADDR_WIDTH-1:0]  dmem_req_addr,
     input wire logic [XLEN-1:0]               dmem_req_wdata,
     input wire logic [XLEN_BYTES-1:0]         dmem_req_wmask,
+    // M3d Stage 2: typed memory-op code (LOAD/STORE/LR/AMO_RD) from the LSQ. Only
+    // the CCD agent arm consumes it; the L1D/passthrough arms derive load vs store
+    // from dmem_req_write and sink this port as unused.
+    input wire logic [2:0]                    dmem_req_op,
     output logic                          dmem_resp_valid,
     output logic [MEMORY_ADDR_WIDTH-1:0]  dmem_resp_addr,
     output logic [XLEN-1:0]               dmem_resp_data,
@@ -181,6 +185,12 @@ module niigo_memsys
     // Response queue depth. The core bounds itself to 2 outstanding fetches
     // and 1 outstanding load, so 4 never fills; pushes guard on it anyway.
     localparam int QD = 4;
+
+    // M3d Stage 2: dmem_req_op is consumed only by the CCD agent arm. Sink it
+    // unconditionally so the L1D/passthrough builds don't flag it unused (the extra
+    // read is harmless where the CCD arm also uses it functionally).
+    logic unused_dmem_op;
+    assign unused_dmem_op = |dmem_req_op;
 
     // ------------------------------------------------------------------
     // Fuzz configuration (plusargs, read once) and LCG streams.
@@ -601,6 +611,19 @@ module niigo_memsys
     localparam int CCD_L1_SETS  = 64;    // direct-mapped agent; sized up vs L1D to limit conflict thrash
     localparam int CCD_DIR_SETS = 256;   // directory >> L1 sets (avoid dir-capacity eviction, OPEN-3)
 
+    // M3d Stage 2: decode the LSQ's 3-bit dmem_req_op into the agent's l1_core_op_e.
+    // The 3-bit contract MUST match the DMEM_OP_* localparams in load_store_queue.sv.
+    // SC is not routed (the LSQ owns the eviction-immune reservation single-core; its
+    // commit write is a plain STORE). AMO_RD acquires M and returns old (no agent RMW).
+    function automatic l1_core_op_e map_dmem_op(input logic [2:0] c);
+        unique case (c)
+            3'd1:    map_dmem_op = COP_STORE;
+            3'd2:    map_dmem_op = COP_LR;
+            3'd3:    map_dmem_op = COP_AMO_RD;
+            default: map_dmem_op = COP_LOAD;   // 3'd0
+        endcase
+    endfunction
+
     // ---- device-bypass response generator (1 outstanding; the LSQ serialises) ----
     logic                          dev_pend_q;
     logic [MEMORY_ADDR_WIDTH-1:0]  dev_addr_q;
@@ -670,7 +693,11 @@ module niigo_memsys
                 ad_busy_q    <= 1'b1;
                 ad_is_ptw_q  <= present_ptw;
                 ad_is_load_q <= present_dmem ? !dmem_req_write : !ptw_req_we;
-                ad_op_q      <= (present_dmem ? dmem_req_write : ptw_req_we) ? COP_STORE : COP_LOAD;
+                // M3d Stage 2: dmem ops carry their LSQ type (LOAD/STORE/LR/AMO_RD); the
+                // PTW is a plain read or A/D write. ad_is_load_q above stays correct: LR /
+                // AMO_RD arrive on the read path (!dmem_req_write), so they latch a response.
+                ad_op_q      <= present_dmem ? map_dmem_op(dmem_req_op)
+                                             : (ptw_req_we ? COP_STORE : COP_LOAD);
                 ad_addr_q    <= present_dmem ? dmem_req_addr  : ptw_req_addr;
                 ad_wdata_q   <= present_dmem ? dmem_req_wdata : ptw_req_wdata;
                 ad_wmask_q   <= present_dmem ? dmem_req_wmask : {XLEN_BYTES{1'b1}};

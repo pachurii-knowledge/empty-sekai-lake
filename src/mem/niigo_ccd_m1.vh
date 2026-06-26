@@ -79,8 +79,16 @@ package NIIGO_CCD_M1;
     endfunction
 
     // ---- the L1D agent's core-side request interface (a simplified LSQ port) ----
+    // COP_AMO_RD (M3d Stage 2): an AMO read-with-write-intent. The agent acquires
+    // the line in M (GetM) and returns the OLD word, but performs NO RMW -- the LSQ
+    // owns the AMO ALU (amo_result, incl. MIN/MAX/.W the agent's amo() lacks) and
+    // writes the result back via the commit COP_STORE, which hits the held-M line,
+    // keeping the write at commit (B8: no speculative coherent writes). This puts the
+    // line in M for the read->commit-write window; ENFORCING atomicity across that
+    // window under contention (snoop-defer/replay the amo-locked M line) is Stage 3
+    // and needs >=2 cores -- single core there are no snoops, so the M-hold is inert.
     typedef enum logic [2:0] {
-        COP_LOAD, COP_STORE, COP_LR, COP_SC, COP_AMO
+        COP_LOAD, COP_STORE, COP_LR, COP_SC, COP_AMO, COP_AMO_RD
     } l1_core_op_e;
 
     typedef enum logic [2:0] {            // AMO sub-op (the RMW the cache applies atomically)

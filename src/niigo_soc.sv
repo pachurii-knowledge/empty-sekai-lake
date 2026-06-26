@@ -86,6 +86,7 @@ module niigo_soc
     logic [MEMORY_ADDR_WIDTH-1:0]            dmem_req_addr;
     logic [XLEN-1:0]                         dmem_req_wdata;
     logic [XLEN_BYTES-1:0]                   dmem_req_wmask;
+    logic [2:0]                              dmem_req_op;   // M3d Stage 2: typed op (CCD agent)
     logic                                    dmem_resp_valid;
     logic [MEMORY_ADDR_WIDTH-1:0]            dmem_resp_addr;
     logic [XLEN-1:0]                         dmem_resp_data;
@@ -102,7 +103,7 @@ module niigo_soc
         .ifetch_req_valid, .ifetch_req_ready, .ifetch_req_addr,
         .ifetch_resp_valid, .ifetch_resp_data, .ifetch_resp_excpt,
         .dmem_req_valid, .dmem_req_ready, .dmem_req_write, .dmem_req_addr,
-        .dmem_req_wdata, .dmem_req_wmask,
+        .dmem_req_wdata, .dmem_req_wmask, .dmem_req_op,
         .dmem_resp_valid, .dmem_resp_addr, .dmem_resp_data,
         .ptw_mem_req, .ptw_mem_we, .ptw_mem_addr_w, .ptw_mem_wdata,
         .ptw_mem_ack, .ptw_mem_rdata,
@@ -121,7 +122,7 @@ module niigo_soc
         .ifetch_inval, .dmem_req_device, .dcache_flush_req, .dcache_flush_done,
         .hpm_l1i_miss, .hpm_l1d_miss, .hpm_l1d_wb,
         .dmem_req_valid, .dmem_req_ready, .dmem_req_write, .dmem_req_addr,
-        .dmem_req_wdata, .dmem_req_wmask,
+        .dmem_req_wdata, .dmem_req_wmask, .dmem_req_op,
         .dmem_resp_valid, .dmem_resp_addr, .dmem_resp_data,
         .ptw_req_valid(ptw_mem_req), .ptw_req_we(ptw_mem_we),
         .ptw_req_addr(ptw_mem_addr_w), .ptw_req_wdata(ptw_mem_wdata),

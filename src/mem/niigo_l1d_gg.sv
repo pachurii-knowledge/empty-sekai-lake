@@ -88,7 +88,9 @@ module niigo_l1d_gg
         T_NONE, T_IS_D, T_IM_AD, T_IM_A, T_SM_AD, T_OM_A,
         T_UNBLK, T_UNBLK_WB, T_EVICT, T_EI_WAIT
     } tstate_e;
-    typedef enum logic [2:0] { AT_NONE, AT_SC, AT_AMO_ACQ, AT_AMO_LOCKED, AT_AMO_REPLAY } atom_e;
+    // AT_AMO_RD (M3d Stage 2): a COP_AMO_RD in flight -- acquire M, return the OLD word,
+    // NO RMW (the LSQ owns the AMO ALU and writes the result via the commit COP_STORE).
+    typedef enum logic [2:0] { AT_NONE, AT_SC, AT_AMO_ACQ, AT_AMO_LOCKED, AT_AMO_REPLAY, AT_AMO_RD } atom_e;
     typedef enum logic [1:0] { FL_IDLE, FL_SCAN, FL_PUT, FL_DONE } flst_e;   // M3d flush walker
 
     // ---- cache + agent registers ----
@@ -329,6 +331,11 @@ module niigo_l1d_gg
                     crd_c=old; creq_rdy_c=1; rsv_v_n=0; m_atom_n=AT_NONE;
                     postline=wmrg(data_q[ix],o,amo(m_ramo_q,old,m_wd_q));
                 end
+                AT_AMO_RD: begin
+                    // COP_AMO_RD reaches M: return the OLD word, NO write. The line is now M
+                    // (cs_val=CMI_M set above); the LSQ writes amo_result via the commit COP_STORE.
+                    crd_c=wrd(data_q[ix],o); creq_rdy_c=1; m_atom_n=AT_NONE;
+                end
                 default: ;
             endcase
             serve_deferred(ix, CMI_M, m_lad_q, postline);
@@ -403,6 +410,20 @@ module niigo_l1d_gg
                 else if (hit && (cs==CMI_S||cs==CMI_O)) begin m_val_n=1; m_data_n=1; m_atom_n=AT_AMO_ACQ; m_ts_n=(cs==CMI_O)?T_OM_A:T_SM_AD; end
                 else begin
                     m_val_n=1; m_atom_n=AT_AMO_ACQ;
+                    if (occ) begin m_ts_n=T_EVICT; m_vlad_n=lbase({tag_q[ix],ix,{LINE_WORD_BITS{1'b0}}}); m_vst_n=cs; end
+                    else m_ts_n=T_IM_AD;
+                end
+            end
+            COP_AMO_RD: begin
+                // AMO read-with-write-intent (M3d Stage 2): acquire M, return the OLD word, NO RMW.
+                // The line is held M for the LSQ's commit COP_STORE (which writes amo_result).
+                if (hit && wrable) begin
+                    creq_rdy_c=1; crd_c=wrd(data_q[ix],o);
+                    if (cs==CMI_E) begin cs_we=1; cs_idx=ix; cs_val=CMI_M; end   // E->M silent upgrade (no write)
+                end
+                else if (hit && (cs==CMI_S||cs==CMI_O)) begin m_val_n=1; m_data_n=1; m_atom_n=AT_AMO_RD; m_ts_n=(cs==CMI_O)?T_OM_A:T_SM_AD; end
+                else begin
+                    m_val_n=1; m_atom_n=AT_AMO_RD;
                     if (occ) begin m_ts_n=T_EVICT; m_vlad_n=lbase({tag_q[ix],ix,{LINE_WORD_BITS{1'b0}}}); m_vst_n=cs; end
                     else m_ts_n=T_IM_AD;
                 end

@@ -56,6 +56,12 @@ module load_store_queue
     output logic [MEMORY_ADDR_WIDTH-1:0] data_addr,
     output logic [XLEN-1:0]      data_store,
     output logic [XLEN_BYTES-1:0] data_store_mask,
+    // M3d Stage 2: typed memory-op code for the current data-port transaction.
+    // Consumed by the CCD L1D agent adapter in niigo_memsys (mapped to l1_core_op_e);
+    // ignored by the L1D/passthrough arms (they derive load/store from the write mask).
+    // A load issue carries LOAD/LR/AMO_RD; a store write (commit / second beat) carries
+    // STORE. The 3-bit contract MUST match the decode in niigo_memsys.sv's CCD arm.
+    output logic [2:0]           dmem_req_op,
     // High while driving the second beat of a split store: the data_addr output
     // already carries the captured physical word address, so the core port must
     // bypass the (head-VA based) translation mux.
@@ -103,6 +109,13 @@ module load_store_queue
 
     // Byte-address -> word-address shift for the word-granular memory bus.
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
+
+    // M3d Stage 2: dmem_req_op codes (see the port comment). The CCD adapter maps
+    // these to l1_core_op_e; keep the two in lockstep.
+    localparam logic [2:0] DMEM_OP_LOAD   = 3'd0;
+    localparam logic [2:0] DMEM_OP_STORE  = 3'd1;
+    localparam logic [2:0] DMEM_OP_LR     = 3'd2;
+    localparam logic [2:0] DMEM_OP_AMO_RD = 3'd3;
 
     // FB2b false-loop break (LSQ wakeup<->load_writeback): the per-op head blocks
     // (HD) write the single head entry via sparse per-field write-enables instead
@@ -152,6 +165,9 @@ module load_store_queue
     // store-commit), and HD's post-head-op reservation (M applies store-commit clear).
     logic                          head_data_load_en;
     logic [MEMORY_ADDR_WIDTH-1:0]  load_data_addr;
+    // M3d Stage 2: op code for the head load issue (LOAD / LR / AMO_RD), forwarded
+    // by the data-port mux in block M when a load (not a store write) is driven.
+    logic [2:0]                    head_load_op;
     logic                          reservation_valid_mid;
     logic [XLEN-1:0]               reservation_addr_mid;
     // M locals: head after the deferred retire advance, and whether a store
@@ -275,6 +291,7 @@ module load_store_queue
         head_delta = '0;
         head_data_load_en = 1'b0;
         load_data_addr = '0;
+        head_load_op = DMEM_OP_LOAD;
         store_probe_hi_next = 1'b0;
         mem_inflight_next = mem_inflight_q;
         mem_inflight_kill_next = mem_inflight_kill_q;
@@ -457,6 +474,12 @@ module load_store_queue
             head_done = 1'b1;
             head_data_load_en = 1'b1;
             load_data_addr = headq.addr[XLEN-1:ADDR_SHIFT];
+            // M3d Stage 2: tag the read beat so the CCD agent acquires the right
+            // coherence state -- AMO_RD acquires M (held for the commit write),
+            // LR sets the agent reservation, a plain load gets S/E.
+            head_load_op = (headq.entry.ctrl.exec_class == EXEC_AMO)
+                ? ((headq.entry.ctrl.amo_op == AMO_LR) ? DMEM_OP_LR : DMEM_OP_AMO_RD)
+                : DMEM_OP_LOAD;
             // Capture the PA for an AMO's write-back beat (same address it read);
             // harmless for a pure load.
             head_delta.we_store_lo_pa = 1'b1;
@@ -836,6 +859,10 @@ module load_store_queue
         data_store = '0;
         data_store_mask = '0;
         store_second_beat = 1'b0;
+        // M3d Stage 2: the typed op follows the same priority as the data fields
+        // (double-store beat / store-commit are STORE; a head load issue carries its
+        // LOAD/LR/AMO_RD tag). Idle -> don't-care (the port is invalid).
+        dmem_req_op = DMEM_OP_LOAD;
         if (double_store_pending_q) begin
             data_addr = double_store_addr_q;
             data_store = double_store_data_q;
@@ -843,14 +870,17 @@ module load_store_queue
             // data_addr already holds the captured physical word address; tell
             // the core port to use it directly (skip the head-VA translation).
             store_second_beat = 1'b1;
+            dmem_req_op = DMEM_OP_STORE;
         end else if (store_commit_fires) begin
             // First (low) beat: written at the captured physical address.
             data_addr = entries_q[head_after_retire].store_lo_pa[XLEN-1:ADDR_SHIFT];
             data_store = entries_q[head_after_retire].store_data;
             data_store_mask = entries_q[head_after_retire].store_mask;
             store_second_beat = 1'b1;
+            dmem_req_op = DMEM_OP_STORE;
         end else if (head_data_load_en) begin
             data_addr = load_data_addr;
+            dmem_req_op = head_load_op;
         end
 
         // Precise-trap flush: discard the queued head; suppress the load issue.

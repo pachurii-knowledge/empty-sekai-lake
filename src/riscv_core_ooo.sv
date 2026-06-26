@@ -45,6 +45,9 @@ module riscv_core_ooo
     output logic [MEMORY_ADDR_WIDTH-1:0] dmem_req_addr,
     output logic [XLEN-1:0]  dmem_req_wdata,
     output logic [XLEN_BYTES-1:0]        dmem_req_wmask,
+    // M3d Stage 2: typed memory-op code (LOAD/STORE/LR/AMO_RD) for the CCD L1D
+    // agent; ignored by the L1D/passthrough memsys arms. See load_store_queue.sv.
+    output logic [2:0]       dmem_req_op,
     input wire logic             dmem_resp_valid,
     input wire logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
     input wire logic [XLEN-1:0]  dmem_resp_data,
@@ -417,6 +420,7 @@ module riscv_core_ooo
     logic [MEMORY_ADDR_WIDTH-1:0] mem_data_addr;
     logic [XLEN-1:0] mem_data_store;
     logic [XLEN_BYTES-1:0] mem_data_store_mask;
+    logic [2:0] mem_dmem_op;            // M3d Stage 2: LSQ typed op -> dmem_req_op
     logic lsq_store_second_beat;
     logic lsq_store_port_busy;
     logic commit_store;
@@ -1398,6 +1402,7 @@ module riscv_core_ooo
         .data_addr(mem_data_addr),
         .data_store(mem_data_store),
         .data_store_mask(mem_data_store_mask),
+        .dmem_req_op(mem_dmem_op),
         .store_second_beat(lsq_store_second_beat),
         .store_port_busy(lsq_store_port_busy),
         .head_load_off(dev_load_off),
@@ -2090,6 +2095,7 @@ module riscv_core_ooo
                                                                 : mem_data_addr;
         dmem_req_wdata = mem_data_store;
         dmem_req_wmask = mem_data_store_mask;
+        dmem_req_op    = mem_dmem_op;
     end
 
     // ---- B7: frontend control + commit-driven redirects (pc_next,
