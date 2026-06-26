@@ -43,6 +43,11 @@ module niigo_l1d_gg
     input  wire logic [XLEN/8-1:0]             c_req_wmask,   // M3d: per-byte write-enable (sub-word stores)
     output logic [XLEN-1:0]                     c_resp_rdata,
     output logic                               c_resp_sc_ok,
+    // ---- M3d writeback-all flush (fence.i + halt): drain the demand MSHR, then Put every
+    //      dirty (M/O) line so memory is current, then assert flush_done. Held by the core
+    //      behind dcache_flush_req; c_req_ready stays low for the duration of the walk. ----
+    input  wire logic                          flush_req,
+    output logic                               flush_done,
     // ---- demand uplink (to dir): GetS/GetM/Upgrade/Put*/UNBLOCK/WB_DATA ----
     output logic       dmd_valid,  output ccd_msg_t dmd_msg,  input wire logic dmd_ready,
     // ---- snoop-response uplink (to a peer core): Data-forward / InvAck ----
@@ -84,6 +89,7 @@ module niigo_l1d_gg
         T_UNBLK, T_UNBLK_WB, T_EVICT, T_EI_WAIT
     } tstate_e;
     typedef enum logic [2:0] { AT_NONE, AT_SC, AT_AMO_ACQ, AT_AMO_LOCKED, AT_AMO_REPLAY } atom_e;
+    typedef enum logic [1:0] { FL_IDLE, FL_SCAN, FL_PUT, FL_DONE } flst_e;   // M3d flush walker
 
     // ---- cache + agent registers ----
     cmi_state_e            state_q [SETS];
@@ -109,6 +115,8 @@ module niigo_l1d_gg
     logic                  rsv_v_q; logic [MEMORY_ADDR_WIDTH-1:0] rsv_l_q; logic [XLEN-1:0] rsv_val_q;
     // pending snoop-response (consume snoop now, drive answer next cycle)
     logic                  sr_pend_q; ccd_msg_t sr_msg_q; logic [NODE_ID_W-1:0] sr_dst_q;
+    // M3d flush walker: fl_s_q is the scan index (IDX+1 bits to represent 0..SETS)
+    flst_e                 fl_q; logic [IDX:0] fl_s_q; logic fl_issued_q;
 
     // ---- next-state vars ----
     logic cw_we; logic [IDX-1:0] cw_idx; cmi_state_e cw_st; logic [TAG-1:0] cw_tag; logic [LINE_BITS-1:0] cw_line;
@@ -123,6 +131,8 @@ module niigo_l1d_gg
     logic d_val_n; cmi_op_e d_op_n; logic [CORE_ID_W-1:0] d_req_n; logic [ACK_CNT_W-1:0] d_acks_n;
     logic rsv_v_n; logic [MEMORY_ADDR_WIDTH-1:0] rsv_l_n; logic [XLEN-1:0] rsv_val_n;
     logic sr_pend_n; ccd_msg_t sr_msg_n; logic [NODE_ID_W-1:0] sr_dst_n;
+    flst_e fl_n; logic [IDX:0] fl_s_n; logic fl_issued_n;
+    logic flush_done_c;
     logic dmd_v_c; ccd_msg_t dmd_m_c;
     logic creq_rdy_c; logic [XLEN-1:0] crd_c; logic csc_c;
     logic snoop_rdy_c, resp_rdy_c, ack_rdy_c;
@@ -173,6 +183,7 @@ module niigo_l1d_gg
         d_val_n=d_val_q; d_op_n=d_op_q; d_req_n=d_req_q; d_acks_n=d_acks_q;
         rsv_v_n=rsv_v_q; rsv_l_n=rsv_l_q; rsv_val_n=rsv_val_q;
         sr_pend_n=sr_pend_q; sr_msg_n=sr_msg_q; sr_dst_n=sr_dst_q;
+        fl_n=fl_q; fl_s_n=fl_s_q; fl_issued_n=fl_issued_q; flush_done_c=1'b0;
         dmd_v_c=0; dmd_m_c='{default:'0};
         snp_valid=0; snp_msg='{default:'0}; snp_dst='0;
         creq_rdy_c=0; crd_c='0; csc_c=0;
@@ -340,8 +351,10 @@ module niigo_l1d_gg
             end
         end
 
-        // (H) core request: only when no MSHR busy + no pending snoop-resp + no inbound snoop for this line
-        if (!m_val_q && c_req_valid && !sr_pend_q &&
+        // (H) core request: only when no MSHR busy + no pending snoop-resp + no inbound snoop for this
+        //     line + no flush in progress (the core holds flush_req high across the whole walk and
+        //     quiesces behind it, so c_req_ready stays low for the duration -- R3/§3.1e).
+        if (!m_val_q && c_req_valid && !sr_pend_q && !flush_req &&
             !(snoop_valid && snoop_msg.laddr==lbase(c_req_waddr))) begin
             automatic logic [IDX-1:0] ix=ixf(c_req_waddr);
             automatic logic [LINE_WORD_BITS-1:0] o=off(c_req_waddr);
@@ -406,11 +419,41 @@ module niigo_l1d_gg
                 default:          m_ts_n=T_IM_AD;   // store/amo/sc-miss
             endcase
         end
+
+        // (F) writeback-all flush walker (fence.i + halt). Start only once the demand MSHR has
+        //     drained (R3); walk every set and Put each dirty (M/O) line on the demand uplink
+        //     (the dir K_DRAINPUT path writes it back to memory + acks), set the line I, advance.
+        //     Block H is held off (!flush_req), so the dmd uplink and the cs_we state port (idle
+        //     while m_val_q==0) are free for the walk. Clean (E/S) lines already match memory.
+        unique case (fl_q)
+            FL_IDLE: if (flush_req && !m_val_q && !sr_pend_q) begin fl_n=FL_SCAN; fl_s_n='0; fl_issued_n=1'b0; end
+            FL_SCAN: begin
+                if (fl_s_q == (IDX+1)'(SETS)) fl_n=FL_DONE;
+                else if (state_q[fl_s_q[IDX-1:0]]==CMI_M || state_q[fl_s_q[IDX-1:0]]==CMI_O)
+                    begin fl_n=FL_PUT; fl_issued_n=1'b0; end
+                else fl_s_n = fl_s_q + 1'b1;
+            end
+            FL_PUT: begin
+                automatic logic [IDX-1:0] fi = fl_s_q[IDX-1:0];
+                automatic logic [MEMORY_ADDR_WIDTH-1:0] fla = {tag_q[fi], fi, {LINE_WORD_BITS{1'b0}}};
+                if (!fl_issued_q) begin
+                    dmd_v_c=1'b1;
+                    dmd_m_c=umsg(put_for(state_q[fi]), CMI_I, ON_NA, CORE_ID[CORE_ID_W-1:0], '0, data_q[fi], fla);
+                    if (dmd_ready) fl_issued_n=1'b1;
+                end else if (ack_valid && ack_msg.op==OP_ACK) begin
+                    cs_we=1'b1; cs_idx=fi; cs_val=CMI_I;       // demand-side state port (free during flush)
+                    fl_s_n = fl_s_q + 1'b1; fl_n=FL_SCAN; fl_issued_n=1'b0;
+                end
+            end
+            FL_DONE: begin flush_done_c=1'b1; if (!flush_req) fl_n=FL_IDLE; end
+            default: fl_n=FL_IDLE;
+        endcase
     end
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             m_val_q<=0; m_issued_q<=0; d_val_q<=0; rsv_v_q<=0; sr_pend_q<=0; m_atom_q<=AT_NONE; m_ts_q<=T_NONE;
+            fl_q<=FL_IDLE; fl_s_q<='0; fl_issued_q<=1'b0;
             for (int s=0;s<SETS;s++) begin state_q[s]<=CMI_I; tag_q[s]<='0; end
         end else begin
             m_val_q<=m_val_n; m_ts_q<=m_ts_n; m_lad_q<=m_lad_n; m_vlad_q<=m_vlad_n; m_vst_q<=m_vst_n;
@@ -419,6 +462,7 @@ module niigo_l1d_gg
             d_val_q<=d_val_n; d_op_q<=d_op_n; d_req_q<=d_req_n; d_acks_q<=d_acks_n;
             rsv_v_q<=rsv_v_n; rsv_l_q<=rsv_l_n; rsv_val_q<=rsv_val_n;
             sr_pend_q<=sr_pend_n; sr_msg_q<=sr_msg_n; sr_dst_q<=sr_dst_n;
+            fl_q<=fl_n; fl_s_q<=fl_s_n; fl_issued_q<=fl_issued_n;
             if (cw_we) begin state_q[cw_idx]<=cw_st; tag_q[cw_idx]<=cw_tag; data_q[cw_idx]<=cw_line; end
             else if (cs_we) state_q[cs_idx]<=cs_val;
             // DLK-1: the snoop FSM has its own state-write port; apply it independently of the
@@ -432,6 +476,7 @@ module niigo_l1d_gg
 
     assign dmd_valid=dmd_v_c; assign dmd_msg=dmd_m_c;
     assign c_req_ready=creq_rdy_c; assign c_resp_rdata=crd_c; assign c_resp_sc_ok=csc_c;
+    assign flush_done=flush_done_c;
     assign snoop_ready=snoop_rdy_c; assign resp_ready=resp_rdy_c; assign ack_ready=ack_rdy_c;
     /* verilator lint_on ENUMVALUE */
 endmodule

@@ -40,6 +40,9 @@ module niigo_ccd_gg_wheel
     input  wire logic [XLEN/8-1:0]             c_req_wmask [NACTIVE],
     output logic [XLEN-1:0]                     c_resp_rdata[NACTIVE],
     output logic                               c_resp_sc_ok[NACTIVE],
+    // M3d writeback-all flush (drives the core-0 agent; idle cores never own dirty lines)
+    input  wire logic                          flush_req,
+    output logic                               flush_done,
     output nmi_req_t   mem_req_o,
     input  wire logic  mem_req_ready_i,
     input  nmi_resp_t  mem_resp_i
@@ -79,6 +82,9 @@ module niigo_ccd_gg_wheel
         .dst_node(dout_d), .out(int_in), .credit_in(int_in_cr));
 
     // ---- core tiles (active cores get an agent + uplink/downlink; idle cores tie off) ----
+    logic fl_done_a [NACTIVE];
+    assign flush_done = fl_done_a[0];
+
     genvar gi;
     generate
         for (gi=0; gi<NACTIVE; gi++) begin : G_AGENT
@@ -93,6 +99,7 @@ module niigo_ccd_gg_wheel
                 .c_req_op(c_req_op[gi]), .c_req_amo(c_req_amo[gi]),
                 .c_req_waddr(c_req_waddr[gi]), .c_req_wdata(c_req_wdata[gi]), .c_req_wmask(c_req_wmask[gi]),
                 .c_resp_rdata(c_resp_rdata[gi]), .c_resp_sc_ok(c_resp_sc_ok[gi]),
+                .flush_req((gi==0) ? flush_req : 1'b0), .flush_done(fl_done_a[gi]),
                 .dmd_valid(a_dmd_v), .dmd_msg(a_dmd_m), .dmd_ready(a_dmd_r),
                 .snp_valid(a_snp_v), .snp_msg(a_snp_m), .snp_dst(a_snp_d), .snp_ready(a_snp_r),
                 .snoop_valid(a_sn_v), .snoop_msg(a_sn_m), .snoop_ready(a_sn_r),

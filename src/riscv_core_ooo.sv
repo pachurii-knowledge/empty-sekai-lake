@@ -4,6 +4,18 @@
 `include "memory_segments.vh"
 `include "riscv_priv.vh"
 
+// The fence.i / halt write-back D-side flush handshake (defer the pc+4 redirect,
+// raise dcache_flush_req, hold the frontend until dcache_flush_done, then
+// invalidate the L1I and refetch) is needed by ANY write-back D-side: the L1D
+// cache (L1D_CACHE) and the M3d grant-and-go MOESI agent (CCD_AGENT). Derive one
+// guard so both get byte-identical behavior; the L1=0 / passthrough builds keep
+// the immediate fence.i redirect. (undef'd after endmodule to avoid leakage.)
+`ifdef L1D_CACHE
+  `define NIIGO_DSIDE_WB
+`elsif CCD_AGENT
+  `define NIIGO_DSIDE_WB
+`endif
+
 `default_nettype none
 
 module riscv_core_ooo
@@ -633,7 +645,7 @@ module riscv_core_ooo
     // only then does it invalidate the L1I and refetch -- so the modified code is
     // in memory before the I-side refills it. On C1/L1=0 the fence.i path keeps
     // its immediate redirect and this is inert.
-`ifdef L1D_CACHE
+`ifdef NIIGO_DSIDE_WB
     logic        fencei_pending_q, fencei_pending_next;
     logic [XLEN-1:0] fencei_pc_q, fencei_pc_next;
     assign dcache_flush_req = fencei_pending_q;
@@ -641,7 +653,7 @@ module riscv_core_ooo
     assign dcache_flush_req = 1'b0;
 `endif
     logic fencei_block;
-`ifdef L1D_CACHE
+`ifdef NIIGO_DSIDE_WB
     assign fencei_block = fencei_pending_q;
 `else
     assign fencei_block = 1'b0;
@@ -2099,7 +2111,7 @@ module riscv_core_ooo
         fetch_consume = 1'b0;
         fetch_issue = 1'b0;
         ifetch_inval = 1'b0;
-`ifdef L1D_CACHE
+`ifdef NIIGO_DSIDE_WB
         fencei_pending_next = fencei_pending_q;
         fencei_pc_next = fencei_pc_q;
 `endif
@@ -2227,7 +2239,7 @@ module riscv_core_ooo
                 end
                 if ((active_commit_packet[i].instr[6:0] == RISCV_ISA::OP_MISC_MEM) &&
                         (active_commit_packet[i].instr[14:12] == 3'b001)) begin
-`ifdef L1D_CACHE
+`ifdef NIIGO_DSIDE_WB
                     // Defer the redirect: first write back the L1D (the modified
                     // code may be dirty there), then invalidate the L1I and
                     // refetch (handled in the fence.i-hold block below).
@@ -2281,7 +2293,7 @@ module riscv_core_ooo
             fetch_flush = 1'b1;
         end
 
-`ifdef L1D_CACHE
+`ifdef NIIGO_DSIDE_WB
         // fence.i L1D-writeback hold (highest priority while active; fence.i is
         // serializing and interrupts are gated above, so nothing competes).
         // Hold pc + keep the fetch pipe flushed until the memsys finishes
@@ -2395,7 +2407,7 @@ module riscv_core_ooo
             serial_pending_q <= 1'b0;
             irq_drain_q <= 1'b0;
             wfi_wait_q <= 1'b0;
-`ifdef L1D_CACHE
+`ifdef NIIGO_DSIDE_WB
             fencei_pending_q <= 1'b0;
             fencei_pc_q <= '0;
 `endif
@@ -2435,7 +2447,7 @@ module riscv_core_ooo
             serial_pending_q <= serial_pending_next;
             irq_drain_q <= irq_drain_next;
             wfi_wait_q <= wfi_wait_next;
-`ifdef L1D_CACHE
+`ifdef NIIGO_DSIDE_WB
             fencei_pending_q <= fencei_pending_next;
             fencei_pc_q <= fencei_pc_next;
 `endif
@@ -2743,3 +2755,7 @@ module riscv_core_ooo
 `endif
 
 endmodule: riscv_core_ooo
+
+`ifdef NIIGO_DSIDE_WB
+`undef NIIGO_DSIDE_WB
+`endif

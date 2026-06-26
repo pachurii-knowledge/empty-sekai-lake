@@ -52,6 +52,18 @@
 `include "riscv_isa.vh"
 `include "riscv_uarch.vh"
 `include "niigo_mem.vh"
+`ifdef CCD_AGENT
+`include "niigo_ccd_m1.vh"   // l1_core_op_e / l1_amo_op_e / COP_* / AMO_* (M3d agent core port)
+`endif
+
+// A write-back D-side (the C2 L1D cache OR the M3d grant-and-go MOESI agent) shares
+// the device-bypass response gen, the adapter line-write onto main_memory's D port,
+// and the exclusion of the L1=0 passthrough D/PTW block. Derive one guard for both.
+`ifdef L1D_CACHE
+  `define NIIGO_AGENT_DSIDE
+`elsif CCD_AGENT
+  `define NIIGO_AGENT_DSIDE
+`endif
 
 `default_nettype none
 
@@ -59,6 +71,9 @@ module niigo_memsys
     import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
     import NIIGO_Mem::*;
+`ifdef CCD_AGENT
+    import NIIGO_CCD_M1::*;
+`endif
 (
     input wire logic clk,
     input wire logic rst_l,
@@ -272,6 +287,11 @@ module niigo_memsys
 `ifdef L1D_CACHE
     assign l1i_snoop_valid = present_dmem && dmem_req_write && l1d_req_fire;
     assign l1i_snoop_waddr = l1d_req_waddr;
+`elsif CCD_AGENT
+    // C4 I/D-coherence (committed-store -> L1I snoop) is deferred for M3d Stage 1;
+    // fence.i drives the agent writeback flush + ifetch_inval, which covers SMC.
+    assign l1i_snoop_valid = 1'b0;
+    assign l1i_snoop_waddr = '0;
 `else
     assign l1i_snoop_valid = dmem_store_fire;
     assign l1i_snoop_waddr = dmem_req_addr;
@@ -335,13 +355,13 @@ module niigo_memsys
     end
 `endif /* L1_CACHES */
 
-`ifndef L1D_CACHE
+`ifndef NIIGO_AGENT_DSIDE
     // ------------------------------------------------------------------
-    // Data port: loads sample memory in the acceptance cycle and ride the
-    // same kind of in-order response queue (with the request word address
-    // echoed for the device decode at delivery). Stores forward to the
-    // memory write port in the acceptance cycle and apply at the next
-    // clock edge; they produce no response.
+    // Data port (L1=0 / no write-back D-side): loads sample memory in the
+    // acceptance cycle and ride the same kind of in-order response queue (with
+    // the request word address echoed for the device decode at delivery). Stores
+    // forward to the memory write port in the acceptance cycle and apply at the
+    // next clock edge; they produce no response.
     // ------------------------------------------------------------------
     logic dmem_load_fire, dmem_store_fire;
     assign dmem_req_ready  = (d_cnt_q < 3'(QD)) && (!fz_en || drdy_rand);
@@ -441,7 +461,7 @@ module niigo_memsys
     assign dcache_flush_done = dcache_flush_req;
     logic unused_dmem_dev;
     assign unused_dmem_dev = dmem_req_device;
-`endif /* !L1D_CACHE */
+`endif /* !NIIGO_AGENT_DSIDE */
 
 `ifdef L1D_CACHE
     // ==================================================================
@@ -564,6 +584,143 @@ module niigo_memsys
     assign unused_c2 = (|mem_ptw_rdata) | mem_d_excpt | l1d_ev_access;
 `endif /* L1D_CACHE */
 
+`ifdef CCD_AGENT
+    // ==================================================================
+    // M3d data side: the grant-and-go MOESI L1D agent (niigo_l1d_gg, instanced via
+    // niigo_ccd_gg_direct #(.NACTIVE(1)) + niigo_dir_gg) replaces the C2 L1D. Single
+    // core: coherence is inert (cores 1..3 never become sharers, so the directory
+    // yields ack_count==0 and broadcasts no INV -- R12). Cacheable dmem + PTW are
+    // muxed (LSQ priority) onto the agent's one c_req port through a REGISTERED launch
+    // adapter that converts the agent's grant-and-go handshake (c_req_ready *is*
+    // completion, same-cycle c_resp_rdata) into the core's decoupled dmem/ptw ports.
+    // The register is mandatory: the agent's c_req_ready is combinational on
+    // c_req_valid, so wiring it straight to the LSQ issue gate would form the same
+    // comb loop the L1D path avoids. Devices bypass the agent exactly as at L1D=1.
+    // C4 I/D-coherence is deferred; fence.i drives the agent flush + ifetch_inval.
+    // ------------------------------------------------------------------
+    localparam int CCD_L1_SETS  = 64;    // direct-mapped agent; sized up vs L1D to limit conflict thrash
+    localparam int CCD_DIR_SETS = 256;   // directory >> L1 sets (avoid dir-capacity eviction, OPEN-3)
+
+    // ---- device-bypass response generator (1 outstanding; the LSQ serialises) ----
+    logic                          dev_pend_q;
+    logic [MEMORY_ADDR_WIDTH-1:0]  dev_addr_q;
+    logic [63:0]                   dev_due_q;
+    logic                          dev_ready, dev_load_fire, dev_resp_valid;
+    assign dev_ready      = !dev_pend_q && (!fz_en || drdy_rand);
+    assign dev_load_fire  = dmem_req_valid && dmem_req_device && dev_ready && !dmem_req_write;
+    assign dev_resp_valid = dev_pend_q && (cyc_q >= dev_due_q);
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin dev_pend_q <= 1'b0; dev_addr_q <= '0; dev_due_q <= '0; end
+        else begin
+            if (dev_load_fire) begin
+                dev_pend_q <= 1'b1; dev_addr_q <= dmem_req_addr;
+                dev_due_q  <= cyc_q + 64'(fz_en ? lcg_range(dlat_lcg, fz_min, fz_max) : D_RESP_DELAY);
+                if (fz_en) dlat_lcg <= lcg_next(dlat_lcg);
+            end else if (dev_resp_valid) dev_pend_q <= 1'b0;
+        end
+    end
+
+    // ---- request select (LSQ dmem priority over PTW), device-bypassed ----
+    logic present_dmem, present_ptw;
+    assign present_dmem = dmem_req_valid && !dmem_req_device;
+    assign present_ptw  = !present_dmem && ptw_req_valid;
+
+    // ---- registered launch adapter (breaks the c_req_ready comb loop) ----
+    logic                          ad_busy_q, ad_is_ptw_q, ad_is_load_q;
+    l1_core_op_e                   ad_op_q;
+    logic [MEMORY_ADDR_WIDTH-1:0]  ad_addr_q;
+    logic [XLEN-1:0]               ad_wdata_q;
+    logic [XLEN_BYTES-1:0]         ad_wmask_q;
+    logic                          ad_resp_pend_q;
+    logic [XLEN-1:0]               ad_resp_data_q;
+    logic [MEMORY_ADDR_WIDTH-1:0]  ad_resp_addr_q;
+
+    wire ad_can_accept  = !ad_busy_q && !ad_resp_pend_q;       // single-outstanding gate
+    wire ad_launch_fire = (present_dmem || present_ptw) && ad_can_accept;
+
+    // loop-free, loss-free ready: mirror the L1D arm (AND of registered-derived terms;
+    // NEITHER operand is in the dmem_req_valid fan-in). A load cannot be accepted until
+    // the prior store's ad_busy clears (its cww_we cycle) -> store-visibility safe (R2).
+    assign dmem_req_ready = dev_ready && ad_can_accept;
+
+    // agent core-side request arrays (length-1: NACTIVE=1)
+    logic                          c_req_valid [1];
+    logic                          c_req_ready [1];
+    l1_core_op_e                   c_req_op    [1];
+    l1_amo_op_e                    c_req_amo   [1];
+    logic [MEMORY_ADDR_WIDTH-1:0]  c_req_waddr [1];
+    logic [XLEN-1:0]               c_req_wdata [1];
+    logic [XLEN_BYTES-1:0]         c_req_wmask [1];
+    logic [XLEN-1:0]               c_resp_rdata[1];
+    logic                          c_resp_sc_ok[1];
+
+    assign c_req_valid[0] = ad_busy_q;
+    assign c_req_op[0]    = ad_op_q;
+    assign c_req_amo[0]   = AMO_ADD;     // Stage-1 don't-care: the LSQ owns AMO RMW
+    assign c_req_waddr[0] = ad_addr_q;
+    assign c_req_wdata[0] = ad_wdata_q;
+    assign c_req_wmask[0] = ad_wmask_q;
+
+    wire ad_done = ad_busy_q && c_req_ready[0];   // grant-and-go completion pulse
+
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin ad_busy_q <= 1'b0; ad_resp_pend_q <= 1'b0; end
+        else begin
+            if (ad_launch_fire) begin
+                ad_busy_q    <= 1'b1;
+                ad_is_ptw_q  <= present_ptw;
+                ad_is_load_q <= present_dmem ? !dmem_req_write : !ptw_req_we;
+                ad_op_q      <= (present_dmem ? dmem_req_write : ptw_req_we) ? COP_STORE : COP_LOAD;
+                ad_addr_q    <= present_dmem ? dmem_req_addr  : ptw_req_addr;
+                ad_wdata_q   <= present_dmem ? dmem_req_wdata : ptw_req_wdata;
+                ad_wmask_q   <= present_dmem ? dmem_req_wmask : {XLEN_BYTES{1'b1}};
+            end else if (ad_done) ad_busy_q <= 1'b0;
+            // 1-deep response latch (dmem load only; PTW acks via ptw_req_ack below)
+            if (ad_done && ad_is_load_q && !ad_is_ptw_q) begin
+                ad_resp_pend_q <= 1'b1; ad_resp_data_q <= c_resp_rdata[0]; ad_resp_addr_q <= ad_addr_q;
+            end else if (ad_resp_pend_q) ad_resp_pend_q <= 1'b0;
+        end
+    end
+
+    // dmem response: device dummy (core overrides data) OR the registered agent load
+    assign dmem_resp_valid = dev_resp_valid || ad_resp_pend_q;
+    assign dmem_resp_addr  = dev_resp_valid ? dev_addr_q : ad_resp_addr_q;
+    assign dmem_resp_data  = dev_resp_valid ? '0         : ad_resp_data_q;
+
+    // PTW ack regenerated from the registered completion (read or A/D write both ack once)
+    assign ptw_req_ack    = ad_done && ad_is_ptw_q;
+    assign ptw_resp_rdata = c_resp_rdata[0];
+
+    // ---- the grant-and-go CCD subsystem (agent + directory + behavioural interconnect) ----
+    nmi_req_t  ccd_nmi_req;
+    logic      ccd_nmi_ready;
+    nmi_resp_t ccd_nmi_resp;
+
+    // Hold the agent's flush off until the launch adapter has drained the in-flight op
+    // (ad_can_accept) -- otherwise the agent gates block H on flush_req and the last
+    // (often code-writing) store stuck in ad_busy never lands in data_q before the walk
+    // Puts its line. The core holds dcache_flush_req and quiesces behind it, so the
+    // adapter drains, then ccd_flush_req stays high for the whole walk (no new ops arrive).
+    wire ccd_flush_req = dcache_flush_req && ad_can_accept;
+
+    niigo_ccd_gg_direct #(.NACTIVE(1), .L1_SETS(CCD_L1_SETS), .DIR_SETS(CCD_DIR_SETS)) CCD (
+        .clk, .rst_l,
+        .c_req_valid(c_req_valid), .c_req_ready(c_req_ready),
+        .c_req_op(c_req_op), .c_req_amo(c_req_amo),
+        .c_req_waddr(c_req_waddr), .c_req_wdata(c_req_wdata), .c_req_wmask(c_req_wmask),
+        .c_resp_rdata(c_resp_rdata), .c_resp_sc_ok(c_resp_sc_ok),
+        .flush_req(ccd_flush_req), .flush_done(dcache_flush_done),
+        .mem_req_o(ccd_nmi_req), .mem_req_ready_i(ccd_nmi_ready), .mem_resp_i(ccd_nmi_resp)
+    );
+
+    // PTW main_memory port retired (PTW now flows through the agent).
+    assign mem_ptw_addr  = '0;
+    assign mem_ptw_we    = 1'b0;
+    assign mem_ptw_wdata = '0;
+    logic unused_ccd;
+    assign unused_ccd = (|mem_ptw_rdata) | mem_d_excpt | c_resp_sc_ok[0];
+`endif /* CCD_AGENT */
+
 `ifdef L1_CACHES
     // ==================================================================
     // Shared NMI backend: arbiter (L1D priority over L1I) + sim adapter onto
@@ -587,8 +744,17 @@ module niigo_memsys
     assign l1i_refill_gate = l1d_probe_valid && !l1d_probe_clean;
     assign arb_m_req[1]  = l1i_refill_gate ? '0 : l1i_nmi_req;
     assign l1i_nmi_ready = l1i_refill_gate ? 1'b0 : arb_m_ready[1];
+`elsif CCD_AGENT
+    // M3d: the grant-and-go directory's NMI master takes the L1D arbiter slot.
+    assign arb_m_req[0]  = ccd_nmi_req;
+    assign ccd_nmi_ready = arb_m_ready[0];
+    assign ccd_nmi_resp  = arb_m_resp[0];
+    // No clean-before-refill probe (C4 deferred): the L1I refills freely; fence.i
+    // writeback-flush + ifetch_inval covers self-modifying code.
+    assign arb_m_req[1]  = l1i_nmi_req;
+    assign l1i_nmi_ready = arb_m_ready[1];
 `else
-    assign arb_m_req[0] = '0;          // L1D attaches here at L1D=1
+    assign arb_m_req[0] = '0;          // L1D / CCD agent attaches here at L1D=1 / CCD=1
     assign arb_m_req[1]  = l1i_nmi_req;
     assign l1i_nmi_ready = arb_m_ready[1];
 `endif
@@ -713,8 +879,9 @@ module niigo_memsys
     );
 `endif
 
-`ifdef L1D_CACHE
-    // Line writes drive main_memory's D write port (port 1).
+`ifdef NIIGO_AGENT_DSIDE
+    // Write-back D-side (L1D cache or M3d agent): line writebacks drive
+    // main_memory's D write port (port 1) via the adapter/AXI shim.
     assign mem_d_addr       = adp_wr_addr;
     assign mem_d_store_mask = adp_wr_en ? adp_wr_mask : '0;
     assign mem_d_store_data = adp_wr_data;
@@ -769,3 +936,7 @@ module niigo_memsys
 `endif
 
 endmodule: niigo_memsys
+
+`ifdef NIIGO_AGENT_DSIDE
+`undef NIIGO_AGENT_DSIDE
+`endif

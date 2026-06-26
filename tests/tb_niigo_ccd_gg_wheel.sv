@@ -30,6 +30,7 @@ module tb_niigo_ccd_gg_wheel
         .c_req_valid(creq_v), .c_req_ready(creq_rdy), .c_req_op(creq_op), .c_req_amo(creq_amo),
         .c_req_waddr(creq_wa), .c_req_wdata(creq_wd), .c_req_wmask(creq_wm),
         .c_resp_rdata(cresp_rd), .c_resp_sc_ok(cresp_sc),
+        .flush_req(1'b0), .flush_done(),
         .mem_req_o(mreq), .mem_req_ready_i(mreq_ready), .mem_resp_i(mresp));
 
     // ---- behavioural NMI memory ----

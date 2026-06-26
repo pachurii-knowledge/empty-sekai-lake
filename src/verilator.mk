@@ -88,6 +88,14 @@ ifeq ($(L1D),1)
 	VERILATOR_CFLAGS += -DL1_CACHES -DL1D_CACHE
 endif
 
+# CCD=1 (M3d) puts the grant-and-go MOESI L1D agent (niigo_l1d_gg via
+# niigo_ccd_gg_direct #(.NACTIVE(1)) + niigo_dir_gg) on the OoO core's D-side in
+# place of the C2 L1D. Reuses the L1I + shared-NMI backend (-DL1_CACHES). Single
+# core; coherence inert. Mutually exclusive with L1D=1 (do NOT also set L1D).
+ifeq ($(CCD),1)
+	VERILATOR_CFLAGS += -DCCD_AGENT -DL1_CACHES
+endif
+
 ifeq ($(AXI),1)
 	VERILATOR_CFLAGS += -DAXI_MEMSYS
 endif
