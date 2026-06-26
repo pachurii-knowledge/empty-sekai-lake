@@ -82,7 +82,7 @@ module tb_cmi_wheel
     endtask
 
     int errors=0;
-    int t6base;   // module-scope (a declaration-initializer inside `initial` is static @t0)
+    int t6base, t7b0;   // module-scope (a declaration-initializer inside `initial` is static @t0)
     task automatic chk(input bit ok, input string what);
         if (!ok) begin $display("  [FAIL] %s", what); errors++; end
         else        $display("  [ ok ] %s", what);
@@ -91,6 +91,7 @@ module tb_cmi_wheel
     logic [VW-1:0] vc_c0 = VW'(C0_REQ);   // 0
     logic [VW-1:0] vc_c1 = VW'(C1_FWD);   // 1
     logic [VW-1:0] vc_c2 = VW'(C2_DATA);  // 2
+    logic [VW-1:0] vc_c4 = VW'(cmi_vc(C4_ACK)); // 3
 
     initial begin
         for (int c=0;c<NUM_CORES;c++) loc_in[c]='{default:'0};
@@ -154,6 +155,15 @@ module tb_cmi_wheel
             rxd[1][t6base+3]==128'h3333_3333_3333_3333_3333_3333_3333_3333 &&
             rxd[1][t6base+4]==128'h4444_4444_4444_4444_4444_4444_4444_4444,
             "T6: body flits in order, contiguous");
+
+        // ---- T7: non-C2 peer-dst (InvAck class) takes the SPOKE->hub->spoke path, not the ring ----
+        $display("== T7: peer-dst C4 ack (core2 -> core0) routes via spoke/hub, not the ring ==");
+        t7b0 = rxn[0];
+        tx(2, vc_c4, FLIT_HEADTAIL, mk_head(cmi_core_node(2'd0), 2'd2, C4_ACK, 32'h7A));
+        repeat(40) @(posedge clk);
+        chk(rxn[0]-t7b0==1 && rxv[0][t7b0]==vc_c4 &&
+            rxd[0][t7b0][CMI_FLIT_W-1:CMI_RHDR_W]==(CMI_FLIT_W-CMI_RHDR_W)'(32'h7A),
+            "T7: core0 got core2's C4 ack via spoke->hub->spoke (VC3)");
 
         $display("");
         if (errors==0) $display("==== tb_cmi_wheel: ALL CHECKS PASSED ====");

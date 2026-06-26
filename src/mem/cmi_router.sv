@@ -90,8 +90,11 @@ module cmi_router
     cmi_link_t           out_n  [NP];
     logic [NV-1:0]       incr_n [NP];
 
-    // route a HEAD's dst node to an output port index on THIS node (§W.1, dst-based)
-    function automatic logic [PW-1:0] route_port(input logic [NODE_ID_W-1:0] dst);
+    // route a HEAD's dst node to an output port index on THIS node (§W.1, dst-based + class-aware
+    // for peer-dst, §5.2): only C2 cache-to-cache data rides the ring; every other peer-dst class
+    // (e.g. an InvAck addressed direct-to-requester, C4) takes the spoke and relays via the hub.
+    function automatic logic [PW-1:0] route_port(input logic [NODE_ID_W-1:0] dst,
+                                                 input cmi_class_e mclass);
         if (IS_HUB) begin
             // at the hub: directory-bound (dst=HUB) -> internal; a core dst -> that spoke
             // (spoke port index == core id, by wheel wiring convention).
@@ -99,10 +102,12 @@ module cmi_router
         end else begin
             if (dst == NODE_ID[NODE_ID_W-1:0])      route_port = PW'(P_LO);   // arrived
             else if (dst == CMI_HUB_ID)             route_port = PW'(P_SP);   // directory-bound
-            else begin                                                        // cache-to-cache
-                // shortest ring direction (0=E forward, 1=W backward); escape=Spoke (M3c).
+            else if (mclass == C2_DATA) begin                                 // cache-to-cache data
+                // shortest ring direction (0=E forward, 1=W backward); escape=Spoke (deferred).
                 route_port = cmi_ring_dir(NODE_ID[CORE_ID_W-1:0], dst[CORE_ID_W-1:0])
                              ? PW'(P_RW) : PW'(P_RE);
+            end else begin                                                    // non-C2 peer-dst (InvAck)
+                route_port = PW'(P_SP);   // spoke -> hub -> dst spoke (never the ring)
             end
         end
     endfunction
@@ -151,7 +156,7 @@ module cmi_router
                     if (hk == FLIT_HEAD || hk == FLIT_HEADTAIL) begin
                         hd  = d0_q[p][v];
                         rh  = hd[CMI_RHDR_W-1:0];
-                        rp  = route_port(rh.dst);
+                        rp  = route_port(rh.dst, rh.mclass);
                         rov = out_vc_of(v[VW-1:0], rp);
                         if (!ovc_busy_n[rp][rov]) begin     // free output VC -> reserve it
                             ovc_busy_n[rp][rov]   = 1'b1;
