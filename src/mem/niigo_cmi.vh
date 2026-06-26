@@ -196,6 +196,26 @@ package NIIGO_CMI;
 
     typedef logic [CMI_FLIT_W-1:0] cmi_body_t;       // a pure 128 b data chunk (sideband carries kind/vc)
 
+    // ----------------------------------------------------------------
+    // Router-visible routing header (§W.3 route compute). The ONLY part of a HEAD
+    // flit a router parses: it is packed into the LOW bits of the 128 b head word so a
+    // router stays agnostic of the upper payload (the protocol head — canonical
+    // cmi_head_t for the D6 protocol, or the M1 transport head for the M1-over-wheel
+    // bring-up). Route is purely dst-node-based given the node role (§W.1); src_core +
+    // mclass are carried for the ring spoke-escape / VC-pinning assertions.
+    typedef struct packed {
+        cmi_class_e            mclass;     // 3  message class (VC pinning / assertions)
+        logic [CORE_ID_W-1:0]  src_core;   // 2  originator core (ring shortest-dir / escape)
+        logic [NODE_ID_W-1:0]  dst;        // 3  routing target node (D5: core 0..3 or HUB=4)
+    } cmi_rhdr_t;
+    localparam int CMI_RHDR_W = $bits(cmi_rhdr_t);   // 8
+
+    // The physical ring splits the data VC (CMI_DATELINE_VC=2) into VC2a/VC2b at the
+    // dateline (§W.4.1). VC2b is wire-encoded as this extra physical VC id (one past the
+    // 5 logical VCs), so a router buffers/credits NUM_VC+1 physical lanes on ring links.
+    localparam int NUM_VC_PHYS = NUM_VC + 1;         // 6: VC0..VC4 + VC2b
+    localparam logic [VC_ID_W-1:0] CMI_VC2B = VC_ID_W'(NUM_VC);  // 5
+
     // The parallel control sideband (~5 wires/port/dir).
     typedef struct packed {
         flit_kind_e          kind;   // 2

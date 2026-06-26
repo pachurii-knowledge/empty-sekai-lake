@@ -66,8 +66,8 @@ b :=
 u :=
 
 .PHONY: all clean assemble assemble-clean check-lab-number-valid \
-		check-test-defined check-riscv-toolchain ccd-m1-test $(TEST_OUTPUT_BIN) \
-		$(TEST_OUTPUT_HEX)
+		check-test-defined check-riscv-toolchain ccd-m1-test ccd-wheel-test \
+		$(TEST_OUTPUT_BIN) $(TEST_OUTPUT_HEX)
 
 all: verilator-build
 
@@ -80,6 +80,13 @@ ccd-m1-test:
 		-Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT -Wno-ASCRANGE \
 		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_m1.sv
 	$(OUTPUT_BASE_DIR)/ccd-m1/Vtb_niigo_ccd_m1
+
+# ---- M3a wheel NoC fabric flit-level test (standalone; cmi_wheel = 4 core routers + hub) ----
+ccd-wheel-test:
+	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/ccd-wheel --top-module tb_cmi_wheel \
+		-Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT -Wno-ASCRANGE \
+		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_cmi_wheel.sv
+	$(OUTPUT_BASE_DIR)/ccd-wheel/Vtb_cmi_wheel
 
 $(OUTPUT):
 	@mkdir -p $@
