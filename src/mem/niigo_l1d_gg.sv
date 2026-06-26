@@ -63,6 +63,8 @@ module niigo_l1d_gg
     function automatic logic [MEMORY_ADDR_WIDTH-1:0] lbase(input logic [MEMORY_ADDR_WIDTH-1:0] wa);
         lbase={wa[MEMORY_ADDR_WIDTH-1:LINE_WORD_BITS],{LINE_WORD_BITS{1'b0}}}; endfunction
     function automatic logic [XLEN-1:0] wrd(input logic [LINE_BITS-1:0] l, input logic [LINE_WORD_BITS-1:0] o); wrd=l[o*XLEN +: XLEN]; endfunction
+    function automatic logic [LINE_BITS-1:0] wmrg(input logic [LINE_BITS-1:0] l, input logic [LINE_WORD_BITS-1:0] o, input logic [XLEN-1:0] w);
+        wmrg=l; wmrg[o*XLEN +: XLEN]=w; endfunction
     function automatic logic [XLEN-1:0] amo(input l1_amo_op_e a, input logic [XLEN-1:0] od, input logic [XLEN-1:0] o);
         unique case(a) AMO_ADD:amo=od+o; AMO_SWAP:amo=o; AMO_OR:amo=od|o; AMO_AND:amo=od&o; AMO_XOR:amo=od^o; default:amo=o; endcase
     endfunction
@@ -126,19 +128,21 @@ module niigo_l1d_gg
         return m;
     endfunction
 
-    // serve a deferred snoop on reaching stable (called from install/ReachM with the line known)
+    // serve a deferred snoop on reaching stable. `line_val` is the CURRENT/just-written line
+    // (the install/RMW cache writes this cycle are nonblocking, so data_q[ix] is still stale).
     task automatic serve_deferred(input logic [IDX-1:0] ix, input cmi_state_e nowst,
-                                  input logic [MEMORY_ADDR_WIDTH-1:0] la);
+                                  input logic [MEMORY_ADDR_WIDTH-1:0] la,
+                                  input logic [LINE_BITS-1:0] line_val);
         if (d_val_q && !sr_pend_q) begin
             d_val_n = 1'b0;
             sr_pend_n = 1'b1; sr_dst_n = cnode(d_req_q);
             unique case (d_op_q)
                 OP_FWD_GETS: begin
-                    sr_msg_n = umsg(OP_DATA, CMI_S, (nowst==CMI_E)?ON_S:ON_O, d_req_q, '0, data_q[ix], la);
+                    sr_msg_n = umsg(OP_DATA, CMI_S, (nowst==CMI_E)?ON_S:ON_O, d_req_q, '0, line_val, la);
                     cs_we=1; cs_idx=ix; cs_val=(nowst==CMI_E)?CMI_S:CMI_O;
                 end
                 OP_FWD_GETM: begin
-                    sr_msg_n = umsg(OP_DATA, CMI_M, ON_NA, d_req_q, d_acks_q, data_q[ix], la);
+                    sr_msg_n = umsg(OP_DATA, CMI_M, ON_NA, d_req_q, d_acks_q, line_val, la);
                     cs_we=1; cs_idx=ix; cs_val=CMI_I;
                 end
                 OP_INV: begin
@@ -257,7 +261,10 @@ module niigo_l1d_gg
                 cw_we=1; cw_idx=ix; cw_tag=tgf(m_lad_q); cw_line=resp_msg.line; cw_st=(resp_msg.gst==CMI_E)?CMI_E:CMI_S;
                 creq_rdy_c=1; crd_c=wrd(resp_msg.line,o);
                 if (m_rop_q==COP_LR) begin rsv_v_n=1; rsv_l_n=m_lad_q; rsv_val_n=wrd(resp_msg.line,o); end
-                serve_deferred(ix, (resp_msg.gst==CMI_E)?CMI_E:CMI_S, m_lad_q);
+                serve_deferred(ix, (resp_msg.gst==CMI_E)?CMI_E:CMI_S, m_lad_q, resp_msg.line);
+                // a deferred snoop served this cycle downgrades the just-installed line: fold its
+                // state into the install (cw_we has seq priority over cs_we, so cs_we would be lost)
+                if (cs_we) begin cw_st=cs_val; cs_we=1'b0; end
                 // completion: UNBLOCK (echo onext from the data); refresh WB if ON_S/ON_I
                 m_unon_n=resp_msg.onext; m_uwb_n=resp_msg.line;
                 m_ts_n=T_UNBLK; m_issued_n=0;
@@ -280,22 +287,26 @@ module niigo_l1d_gg
         if (m_val_q && m_ts_q==T_IM_A && m_data_q && (m_acks_q==0) && !creq_rdy_c) begin
             automatic logic [IDX-1:0] ix=ixf(m_lad_q);
             automatic logic [LINE_WORD_BITS-1:0] o=m_woff_q;
+            automatic logic [LINE_BITS-1:0] postline=data_q[ix];   // line after this cycle's write
             cs_we=1; cs_idx=ix; cs_val=CMI_M;
             unique case (m_atom_q)
-                AT_NONE: begin cww_we=1; cww_idx=ix; cww_off=o; cww_val=m_wd_q; creq_rdy_c=1; rsv_v_n=0; end
+                AT_NONE: begin cww_we=1; cww_idx=ix; cww_off=o; cww_val=m_wd_q; creq_rdy_c=1; rsv_v_n=0;
+                               postline=wmrg(data_q[ix],o,m_wd_q); end
                 AT_SC: begin
                     creq_rdy_c=1;
-                    if (rsv_v_q && rsv_l_q==m_lad_q) begin cww_we=1; cww_idx=ix; cww_off=o; cww_val=m_wd_q; csc_c=1; end else csc_c=0;
+                    if (rsv_v_q && rsv_l_q==m_lad_q) begin cww_we=1; cww_idx=ix; cww_off=o; cww_val=m_wd_q; csc_c=1;
+                                                            postline=wmrg(data_q[ix],o,m_wd_q); end else csc_c=0;
                     rsv_v_n=0; m_atom_n=AT_NONE;
                 end
                 AT_AMO_ACQ, AT_AMO_REPLAY: begin
                     automatic logic [XLEN-1:0] old=wrd(data_q[ix],o);
                     cww_we=1; cww_idx=ix; cww_off=o; cww_val=amo(m_ramo_q,old,m_wd_q);
                     crd_c=old; creq_rdy_c=1; rsv_v_n=0; m_atom_n=AT_NONE;
+                    postline=wmrg(data_q[ix],o,amo(m_ramo_q,old,m_wd_q));
                 end
                 default: ;
             endcase
-            serve_deferred(ix, CMI_M, m_lad_q);
+            serve_deferred(ix, CMI_M, m_lad_q, postline);
             m_unon_n=ON_NA; m_ts_n=T_UNBLK; m_issued_n=0;
         end
 

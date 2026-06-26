@@ -23,7 +23,7 @@ module tb_niigo_ccd_gg
     logic [MEMORY_ADDR_WIDTH-1:0] creq_wa[2]; logic [XLEN-1:0] creq_wd[2];
     logic        creq_rdy [2];  logic [XLEN-1:0] cresp_rd[2]; logic cresp_sc[2];
 
-    niigo_ccd_gg_direct #(.NACTIVE(2), .DIR_SETS(8), .L1_SETS(8)) dut (
+    niigo_ccd_gg_direct #(.NACTIVE(2), .DIR_SETS(8), .L1_SETS(8), .RESP_DLY(4)) dut (
         .clk, .rst_l,
         .c_req_valid(creq_v), .c_req_ready(creq_rdy), .c_req_op(creq_op), .c_req_amo(creq_amo),
         .c_req_waddr(creq_wa), .c_req_wdata(creq_wd),
@@ -46,6 +46,13 @@ module tb_niigo_ccd_gg
                 mresp.valid <= 1'b1; mresp.rdata <= MEM[mline(mreq.waddr)];
             end
         end
+    end
+
+    // deferred-snoop firing monitor (a snoop recorded into an agent's MSHR defer slot)
+    int defer_cnt=0, c1d=0, c7d=0;
+    always_ff @(posedge clk) if (rst_l) begin
+        if (dut.G_AGENT[0].L1D.d_val_n && !dut.G_AGENT[0].L1D.d_val_q) defer_cnt<=defer_cnt+1;
+        if (dut.G_AGENT[1].L1D.d_val_n && !dut.G_AGENT[1].L1D.d_val_q) defer_cnt<=defer_cnt+1;
     end
 
     int errors=0;
@@ -82,7 +89,7 @@ module tb_niigo_ccd_gg
     endtask
 
     localparam logic [MEMORY_ADDR_WIDTH-1:0] WV='h10, WW='h11, WZ='h40, WZ2='hC0;
-    logic [XLEN-1:0] r; logic ok;
+    logic [XLEN-1:0] r, r1; logic ok;
 
     initial begin
         for (int i=0;i<MEMLINES;i++) MEM[i]='0;
@@ -122,6 +129,35 @@ module tb_niigo_ccd_gg
         cstore(0, WZ2, 22);
         cload (0, WZ, r);  chkv(r, 11, "S6: core0 re-fetches Z after eviction");
         cload (1, WZ2, r); chkv(r, 22, "S6: core1 reads Z2 from core0");
+
+        // ---- C1: deferred-snoop -- two cores re-read a line concurrently; one becomes the
+        //      grant-and-go owner while still in IS_D and DEFERS the other's FwdGetS (the path
+        //      no sequential test can reach). RESP_DLY holds the L2 grant to open the window. ----
+        $display("== C1: deferred-snoop (concurrent read; FwdGetS lands mid-IS_D) ==");
+        c1d = defer_cnt;
+        fork
+            cload(0, 'h20, r);          // fresh line WC1 = 0x20 (set 2)
+            cload(1, 'h20, r1);         // core1 reads concurrently
+        join
+        chkv(r,  r1, "C1: both cores read a consistent value");
+        // both must observe the same (fresh => 0) value; coherence preserved
+        cload(0, 'h20, r);  chkv(r, 0, "C1: core0 reads WC1");
+        cload(1, 'h20, r);  chkv(r, 0, "C1: core1 reads WC1");
+        chk(defer_cnt - c1d >= 1, "C1: a snoop was DEFERRED mid-acquire (grant-and-go window hit)");
+        // coherence still works after the deferral: core0 writes, core1 sees it
+        cstore(0, 'h20, 321);
+        cload (1, 'h20, r); chkv(r, 321, "C1: post-deferral coherence intact");
+
+        // ---- C7: concurrent AMO to one line -- the loser's GetM forwards from the winner
+        //      (FwdGetM deferred during the acquire); both RMWs apply atomically. ----
+        $display("== C7: concurrent AMO_ADD (FwdGetM deferred mid-acquire; atomic sum) ==");
+        c7d = defer_cnt;
+        fork
+            camo(0, AMO_ADD, 'h30, 5, r);   // fresh line WC7 = 0x30 (set 3)
+            camo(1, AMO_ADD, 'h30, 3, r1);
+        join
+        cload(0, 'h30, r); chkv(r, 8, "C7: concurrent AMO_ADD final = 0+5+3");
+        chk(defer_cnt - c7d >= 1, "C7: a FwdGetM was deferred during an AMO acquire");
 
         $display("");
         if (errors==0) $display("==== tb_niigo_ccd_gg: ALL CHECKS PASSED ====");

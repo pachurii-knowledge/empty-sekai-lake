@@ -25,7 +25,11 @@ module niigo_ccd_gg_direct
 #(
     parameter int NACTIVE  = 2,
     parameter int DIR_SETS = 16,
-    parameter int L1_SETS  = 16
+    parameter int L1_SETS  = 16,
+    // COH_FORCE: extra cycles to hold an L2-sourced (directory) DATA grant before delivering it,
+    // so a peer's snoop can land on a requester still mid-acquire (IS_D/IM_*) -> exercises the
+    // deferred-snoop matrix deterministically. 0 = a single registered delay (still correct).
+    parameter int RESP_DLY = 0
 )(
     input  wire logic clk,
     input  wire logic rst_l,
@@ -82,6 +86,22 @@ module niigo_ccd_gg_direct
         );
     end endgenerate
 
+    // ---- COH_FORCE L2-DATA hold registers (per core) ----
+    logic                 dd_busy [NACTIVE];
+    logic [7:0]           dd_cnt  [NACTIVE];
+    ccd_msg_t             dd_msg  [NACTIVE];
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) for (int z=0;z<NACTIVE;z++) dd_busy[z]<=1'b0;
+        else for (int z=0;z<NACTIVE;z++) begin
+            if (dd_busy[z]) begin
+                if (dd_cnt[z]!=0)      dd_cnt[z]<=dd_cnt[z]-8'd1;   // hold
+                else if (resp_r[z])    dd_busy[z]<=1'b0;            // agent took the delayed DATA
+            end else if (dout_v && (dout_m.op==OP_DATA) && (dout_d==z[NODE_ID_W-1:0])) begin
+                dd_busy[z]<=1'b1; dd_cnt[z]<=8'(RESP_DLY); dd_msg[z]<=dout_m;
+            end
+        end
+    end
+
     // helper: op classes
     function automatic logic is_req_op(input cmi_op_e op);
         is_req_op = (op==OP_GETS)||(op==OP_GETM)||(op==OP_UPGRADE)||
@@ -126,10 +146,10 @@ module niigo_ccd_gg_direct
             snoop_v[c] = dout_v && is_snoop_op(dout_m.op) && (dout_d==c[NODE_ID_W-1:0]);
             snoop_m[c] = dout_m;
 
-            // resp: dir DATA (priority) else a peer DATA-forward
+            // resp: a delayed dir DATA (priority) else a peer DATA-forward (combinational)
             resp_v[c] = 1'b0; resp_m[c] = '{default:'0};
-            if (dout_v && (dout_m.op==OP_DATA) && (dout_d==c[NODE_ID_W-1:0])) begin
-                resp_v[c]=1'b1; resp_m[c]=dout_m;
+            if (dd_busy[c] && dd_cnt[c]==0) begin
+                resp_v[c]=1'b1; resp_m[c]=dd_msg[c];   // L2-sourced DATA, delivered after the hold
             end else begin
                 for (k=0;k<NACTIVE;k++) if (!resp_v[c] && k!=c &&
                     snp_v[k] && (snp_m[k].op==OP_DATA) && (snp_d[k]==c[NODE_ID_W-1:0])) begin
@@ -154,7 +174,7 @@ module niigo_ccd_gg_direct
         if (dout_v) begin
             for (c=0;c<NACTIVE;c++) if (dout_d==c[NODE_ID_W-1:0]) begin
                 if (is_snoop_op(dout_m.op)) dout_r = snoop_r[c];
-                else if (dout_m.op==OP_DATA) dout_r = resp_r[c];
+                else if (dout_m.op==OP_DATA) dout_r = !dd_busy[c];   // accepted into the delay reg
                 else if (dout_m.op==OP_ACK)  dout_r = ack_r[c];
             end
         end
