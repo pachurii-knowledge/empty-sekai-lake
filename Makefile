@@ -123,6 +123,16 @@ ccd-stage3-test:
 	@echo "--- negative control (peer writes a different line -> sc.w must SUCCEED) ---"
 	$(OUTPUT_BASE_DIR)/ccd-stage3/Vtop +nokill
 
+# ---- M4 S4: real multi-core SMP -- N real riscv_core_ooo cores over niigo_ccd_gg_direct #(.NACTIVE(N))
+#      running an LR/SC spinlock; the shared counter == N*ITERS iff coherence + reservation-kill hold. ----
+ccd-smp-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp/Vtop
+
 $(OUTPUT):
 	@mkdir -p $@
 
