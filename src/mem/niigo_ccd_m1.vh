@@ -57,6 +57,27 @@ package NIIGO_CCD_M1;
         ccd_msg_t  msg;
     } ccd_chan_t;
 
+    // ---- M3 flit transport: the ccd_msg control (everything but the 512 b line) packed
+    //      ABOVE the router-visible cmi_rhdr_t in a 128 b HEAD flit. The line, when present,
+    //      rides 4 body flits (§W.2). cmi_msg_tx/cmi_msg_rx (de)serialise this over the wheel. ----
+    typedef struct packed {
+        cmi_op_e                       op;
+        logic [CORE_ID_W-1:0]          src;
+        logic                          is_icache;
+        cmi_state_e                    gst;
+        cmi_owner_next_e               onext;
+        logic [ACK_CNT_W-1:0]          acks;
+        logic [CORE_ID_W-1:0]          req;
+        logic [MEMORY_ADDR_WIDTH-1:0]  laddr;
+    } ccd_ctrl_t;                                  // RV32: 48b ; RV64: 79b  (+8b rhdr <= 128)
+    localparam int CCD_CTRL_W = $bits(ccd_ctrl_t);
+
+    // ops whose ccd_msg carries a 512 b line (head + 4 body flits): DATA forward, WB, dirty Put.
+    function automatic logic ccd_has_line(input cmi_op_e op);
+        ccd_has_line = (op==NIIGO_CMI::OP_DATA)  || (op==NIIGO_CMI::OP_WB_DATA) ||
+                       (op==NIIGO_CMI::OP_PUTM)  || (op==NIIGO_CMI::OP_PUTO);
+    endfunction
+
     // ---- the L1D agent's core-side request interface (a simplified LSQ port) ----
     typedef enum logic [2:0] {
         COP_LOAD, COP_STORE, COP_LR, COP_SC, COP_AMO

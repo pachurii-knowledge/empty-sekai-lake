@@ -88,6 +88,13 @@ ccd-wheel-test:
 		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_cmi_wheel.sv
 	$(OUTPUT_BASE_DIR)/ccd-wheel/Vtb_cmi_wheel
 
+# ---- M3b two-core MOESI coherence over the wheel NoC (agents + dir + SerDes + routers) ----
+ccd-wheel-coh-test:
+	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/ccd-wheel-coh --top-module tb_niigo_ccd_wheel \
+		-Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT -Wno-ASCRANGE \
+		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_wheel.sv
+	$(OUTPUT_BASE_DIR)/ccd-wheel-coh/Vtb_niigo_ccd_wheel
+
 $(OUTPUT):
 	@mkdir -p $@
 
