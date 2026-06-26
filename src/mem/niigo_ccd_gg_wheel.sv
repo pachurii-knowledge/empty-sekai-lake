@@ -43,6 +43,9 @@ module niigo_ccd_gg_wheel
     // M3d writeback-all flush (drives the core-0 agent; idle cores never own dirty lines)
     input  wire logic                          flush_req,
     output logic                               flush_done,
+    // M3d Stage 3 (S1): expose the core-0 agent's snoop-kill pulse (parity with _direct).
+    output logic                               snoop_kill_valid,
+    output logic [MEMORY_ADDR_WIDTH-1:0]       snoop_kill_laddr,
     output nmi_req_t   mem_req_o,
     input  wire logic  mem_req_ready_i,
     input  nmi_resp_t  mem_resp_i
@@ -84,6 +87,10 @@ module niigo_ccd_gg_wheel
     // ---- core tiles (active cores get an agent + uplink/downlink; idle cores tie off) ----
     logic fl_done_a [NACTIVE];
     assign flush_done = fl_done_a[0];
+    logic                          snp_kill_v_a [NACTIVE];
+    logic [MEMORY_ADDR_WIDTH-1:0]  snp_kill_la_a[NACTIVE];
+    assign snoop_kill_valid = snp_kill_v_a[0];
+    assign snoop_kill_laddr = snp_kill_la_a[0];
 
     genvar gi;
     generate
@@ -100,6 +107,7 @@ module niigo_ccd_gg_wheel
                 .c_req_waddr(c_req_waddr[gi]), .c_req_wdata(c_req_wdata[gi]), .c_req_wmask(c_req_wmask[gi]),
                 .c_resp_rdata(c_resp_rdata[gi]), .c_resp_sc_ok(c_resp_sc_ok[gi]),
                 .flush_req((gi==0) ? flush_req : 1'b0), .flush_done(fl_done_a[gi]),
+                .snoop_kill_valid(snp_kill_v_a[gi]), .snoop_kill_laddr(snp_kill_la_a[gi]),
                 .dmd_valid(a_dmd_v), .dmd_msg(a_dmd_m), .dmd_ready(a_dmd_r),
                 .snp_valid(a_snp_v), .snp_msg(a_snp_m), .snp_dst(a_snp_d), .snp_ready(a_snp_r),
                 .snoop_valid(a_sn_v), .snoop_msg(a_sn_m), .snoop_ready(a_sn_r),

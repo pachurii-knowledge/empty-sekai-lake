@@ -113,6 +113,11 @@ module niigo_memsys
     output logic                          dmem_resp_valid,
     output logic [MEMORY_ADDR_WIDTH-1:0]  dmem_resp_addr,
     output logic [XLEN-1:0]               dmem_resp_data,
+    // M3d Stage 3 (S1): snoop-kill notification to the core LSQ (a remote write that must kill a
+    // reservation / squash a spec-load). Driven by the CCD agent; tied 0 in non-CCD arms. Constant
+    // 0 in the single-core CCD build (NACTIVE=1, no peer => no snoops) -> baseline bit-identical.
+    output logic                          dmem_snoop_kill_valid,
+    output logic [MEMORY_ADDR_WIDTH-1:0]  dmem_snoop_kill_laddr,
 
     // ---- Core: page-table-walker port ----
     input wire logic                          ptw_req_valid,
@@ -191,6 +196,13 @@ module niigo_memsys
     // read is harmless where the CCD arm also uses it functionally).
     logic unused_dmem_op;
     assign unused_dmem_op = |dmem_req_op;
+
+    // M3d Stage 3 (S1): the snoop-kill outputs are driven by the CCD agent arm; tie them off in
+    // every non-CCD build so they always have exactly one driver (passthrough/L1/L1D have no agent).
+`ifndef CCD_AGENT
+    assign dmem_snoop_kill_valid = 1'b0;
+    assign dmem_snoop_kill_laddr = '0;
+`endif
 
     // ------------------------------------------------------------------
     // Fuzz configuration (plusargs, read once) and LCG streams.
@@ -737,6 +749,7 @@ module niigo_memsys
         .c_req_waddr(c_req_waddr), .c_req_wdata(c_req_wdata), .c_req_wmask(c_req_wmask),
         .c_resp_rdata(c_resp_rdata), .c_resp_sc_ok(c_resp_sc_ok),
         .flush_req(ccd_flush_req), .flush_done(dcache_flush_done),
+        .snoop_kill_valid(dmem_snoop_kill_valid), .snoop_kill_laddr(dmem_snoop_kill_laddr),
         .mem_req_o(ccd_nmi_req), .mem_req_ready_i(ccd_nmi_ready), .mem_resp_i(ccd_nmi_resp)
     );
 

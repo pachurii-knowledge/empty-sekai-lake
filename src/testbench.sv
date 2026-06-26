@@ -103,6 +103,8 @@ module top;
     logic                          dmem_resp_valid;
     logic [MEMORY_ADDR_WIDTH-1:0]  dmem_resp_addr;
     logic [XLEN-1:0]               dmem_resp_data;
+    logic                          dmem_snoop_kill_valid;   // M3d Stage 3: CCD snoop-kill -> LSQ
+    logic [MEMORY_ADDR_WIDTH-1:0]  dmem_snoop_kill_laddr;
     logic                          ptw_mem_req, ptw_mem_we, ptw_mem_ack;
     logic [MEMORY_ADDR_WIDTH-1:0]  ptw_mem_addr_w;
     logic [XLEN-1:0]               ptw_mem_wdata, ptw_mem_rdata;
@@ -158,6 +160,8 @@ module top;
         .dmem_resp_valid (dmem_resp_valid),
         .dmem_resp_addr  (dmem_resp_addr),
         .dmem_resp_data  (dmem_resp_data),
+        .dmem_snoop_kill_valid (dmem_snoop_kill_valid),
+        .dmem_snoop_kill_laddr (dmem_snoop_kill_laddr),
         .ptw_mem_req     (ptw_mem_req),
         .ptw_mem_we      (ptw_mem_we),
         .ptw_mem_addr_w  (ptw_mem_addr_w),
@@ -200,6 +204,8 @@ module top;
         .dmem_resp_valid  (dmem_resp_valid),
         .dmem_resp_addr   (dmem_resp_addr),
         .dmem_resp_data   (dmem_resp_data),
+        .dmem_snoop_kill_valid (dmem_snoop_kill_valid),
+        .dmem_snoop_kill_laddr (dmem_snoop_kill_laddr),
         .ptw_req_valid    (ptw_mem_req),
         .ptw_req_we       (ptw_mem_we),
         .ptw_req_addr     (ptw_mem_addr_w),

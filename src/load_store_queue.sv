@@ -33,6 +33,11 @@ module load_store_queue
     // write beat) this cycle. Registered upstream; never depends on the
     // request being presented.
     input wire logic                 dmem_req_ready,
+    // M3d Stage 3: snoop-kill from the CCD agent -- a remote write (FwdGetM/INV) to this line.
+    // S2 uses it for the reservation coherence-kill; a future S5 for spec-load squash. Constant 0
+    // in non-CCD + single-core CCD builds, so all consumers are inert and the baseline is identical.
+    input wire logic                 snoop_kill_valid,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] snoop_kill_laddr,
     input wire logic                 commit_store,
     input wire active_id_t           commit_store_id,
     // Sv32 data-side translation (driven by the core's MMU). When paging_data is
@@ -116,6 +121,13 @@ module load_store_queue
     localparam logic [2:0] DMEM_OP_STORE  = 3'd1;
     localparam logic [2:0] DMEM_OP_LR     = 3'd2;
     localparam logic [2:0] DMEM_OP_AMO_RD = 3'd3;
+
+    // M3d Stage 3: coherence line = 64 B (the fixed PIPT line). LINE_OFF_W = the word-offset
+    // bits within a line, so [MEMORY_ADDR_WIDTH-1:LINE_OFF_W] of a word address is its line.
+    // The CCD agent's snoop_kill_laddr is already line-aligned; masking the reservation PA's low
+    // bits gives a line-granular compare (the RISC-V reservation set is a cache line).
+    localparam int LINE_BYTES = 64;
+    localparam int LINE_OFF_W = $clog2(LINE_BYTES) - ADDR_SHIFT;
 
     // FB2b false-loop break (LSQ wakeup<->load_writeback): the per-op head blocks
     // (HD) write the single head entry via sparse per-field write-enables instead
@@ -216,6 +228,11 @@ module load_store_queue
     logic head_retire;
     logic reservation_valid_q, reservation_valid_next;
     logic [XLEN-1:0] reservation_addr_q, reservation_addr_next;
+    // M3d Stage 3: a PHYSICAL line-address shadow of the reservation (word address), latched
+    // alongside reservation_addr at LR completion from the LR's captured PA (store_lo_pa). The SC
+    // success/fail test stays the VA compare (reservation_addr_q == headq.addr, byte-identical);
+    // this shadow is read ONLY by the snoop coherence-kill (a remote write -> the reservation dies).
+    logic [MEMORY_ADDR_WIDTH-1:0] reservation_pa_q, reservation_pa_next, reservation_pa_mid;
     // Unused high-word outputs of the AMO result repositioning (atomics are
     // aligned, so they never split across memory words).
     logic [XLEN-1:0] amo_split_hi_data;
@@ -297,6 +314,7 @@ module load_store_queue
         mem_inflight_kill_next = mem_inflight_kill_q;
         reservation_valid_mid = reservation_valid_q;
         reservation_addr_mid = reservation_addr_q;
+        reservation_pa_mid = reservation_pa_q;
         head_retire = 1'b0;
         head_done = 1'b0;
         amo_store_data = '0;
@@ -565,6 +583,9 @@ module load_store_queue
                 if (headq.entry.ctrl.amo_op == AMO_LR) begin
                     reservation_valid_mid = 1'b1;
                     reservation_addr_mid = headq.addr;
+                    // M3d Stage 3: capture the LR's PHYSICAL line for the snoop coherence-kill.
+                    // store_lo_pa was latched with the LR's translated PA at issue (load-issue block).
+                    reservation_pa_mid = headq.store_lo_pa[XLEN-1:ADDR_SHIFT];
                     head_delta.zero = 1'b1;
                     head_retire = 1'b1;
                 end else begin
@@ -802,6 +823,15 @@ module load_store_queue
         // Reservation: HD's post-head-op value, then store-commit clears on match.
         reservation_valid_next = reservation_valid_mid;
         reservation_addr_next = reservation_addr_mid;
+        reservation_pa_next = reservation_pa_mid;
+        // M3d Stage 3 (S2): coherence-kill -- a remote write (FwdGetM/INV) to the reserved line
+        // clears the reservation, so a later SC fails (RVWMO LR/SC atomicity). Conservative-early,
+        // line-granular, mirrors the agent's own rsv-kill (niigo_l1d_gg.sv block C). The SC compare
+        // itself is unchanged (VA-based). Inert single-core (snoop_kill_valid is constant 0).
+        if (snoop_kill_valid &&
+            (reservation_pa_q[MEMORY_ADDR_WIDTH-1:LINE_OFF_W] ==
+             snoop_kill_laddr[MEMORY_ADDR_WIDTH-1:LINE_OFF_W]))
+            reservation_valid_next = 1'b0;
         double_store_pending_next = 1'b0;
         double_store_addr_next = '0;
         double_store_data_next = '0;
@@ -1148,6 +1178,7 @@ module load_store_queue
             tail_q <= '0;
             reservation_valid_q <= 1'b0;
             reservation_addr_q <= '0;
+            reservation_pa_q <= '0;
             double_store_pending_q <= 1'b0;
             double_store_addr_q <= '0;
             double_store_data_q <= '0;
@@ -1171,6 +1202,7 @@ module load_store_queue
             tail_q <= tail_next;
             reservation_valid_q <= reservation_valid_next;
             reservation_addr_q <= reservation_addr_next;
+            reservation_pa_q <= reservation_pa_next;
             double_store_pending_q <= double_store_pending_next;
             double_store_addr_q <= double_store_addr_next;
             double_store_data_q <= double_store_data_next;

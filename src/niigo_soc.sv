@@ -90,6 +90,8 @@ module niigo_soc
     logic                                    dmem_resp_valid;
     logic [MEMORY_ADDR_WIDTH-1:0]            dmem_resp_addr;
     logic [XLEN-1:0]                         dmem_resp_data;
+    logic                                    dmem_snoop_kill_valid;   // M3d Stage 3
+    logic [MEMORY_ADDR_WIDTH-1:0]            dmem_snoop_kill_laddr;
 
     logic                                    ptw_mem_req, ptw_mem_we, ptw_mem_ack;
     logic [MEMORY_ADDR_WIDTH-1:0]            ptw_mem_addr_w;
@@ -105,6 +107,7 @@ module niigo_soc
         .dmem_req_valid, .dmem_req_ready, .dmem_req_write, .dmem_req_addr,
         .dmem_req_wdata, .dmem_req_wmask, .dmem_req_op,
         .dmem_resp_valid, .dmem_resp_addr, .dmem_resp_data,
+        .dmem_snoop_kill_valid, .dmem_snoop_kill_laddr,
         .ptw_mem_req, .ptw_mem_we, .ptw_mem_addr_w, .ptw_mem_wdata,
         .ptw_mem_ack, .ptw_mem_rdata,
         .ifetch_inval, .dmem_req_device, .dcache_flush_req, .dcache_flush_done,
@@ -124,6 +127,7 @@ module niigo_soc
         .dmem_req_valid, .dmem_req_ready, .dmem_req_write, .dmem_req_addr,
         .dmem_req_wdata, .dmem_req_wmask, .dmem_req_op,
         .dmem_resp_valid, .dmem_resp_addr, .dmem_resp_data,
+        .dmem_snoop_kill_valid, .dmem_snoop_kill_laddr,
         .ptw_req_valid(ptw_mem_req), .ptw_req_we(ptw_mem_we),
         .ptw_req_addr(ptw_mem_addr_w), .ptw_req_wdata(ptw_mem_wdata),
         .ptw_req_ack(ptw_mem_ack), .ptw_resp_rdata(ptw_mem_rdata),

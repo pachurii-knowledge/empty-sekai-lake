@@ -43,6 +43,13 @@ module niigo_l1d_gg
     input  wire logic [XLEN/8-1:0]             c_req_wmask,   // M3d: per-byte write-enable (sub-word stores)
     output logic [XLEN-1:0]                     c_resp_rdata,
     output logic                               c_resp_sc_ok,
+    // ---- M3d Stage 3 (S1): snoop-kill tap to the core LSQ. Pulses when this agent ACCEPTS
+    //      an inbound remote-WRITE snoop (FwdGetM/INV) -- the RVWMO event that must kill a
+    //      reservation / squash a speculatively-completed load to that line. Excludes FwdGetS
+    //      (a remote read is not a kill). Fires at both defer and service time (snoop_rdy_c).
+    //      Constant 0 single-core (NACTIVE=1: the directory never forwards to the sole core). ----
+    output logic                               snoop_kill_valid,
+    output logic [MEMORY_ADDR_WIDTH-1:0]       snoop_kill_laddr,
     // ---- M3d writeback-all flush (fence.i + halt): drain the demand MSHR, then Put every
     //      dirty (M/O) line so memory is current, then assert flush_done. Held by the core
     //      behind dcache_flush_req; c_req_ready stays low for the duration of the walk. ----
@@ -498,6 +505,11 @@ module niigo_l1d_gg
     assign dmd_valid=dmd_v_c; assign dmd_msg=dmd_m_c;
     assign c_req_ready=creq_rdy_c; assign c_resp_rdata=crd_c; assign c_resp_sc_ok=csc_c;
     assign flush_done=flush_done_c;
+    // S1: snoop-kill tap -- an ACCEPTED inbound FwdGetM/INV (a remote write) for the LSQ to
+    // act on (reservation-kill in S2, spec-load squash in S5). snoop_rdy_c is asserted in both
+    // the defer and the service branch of block C, so this fires exactly once per accepted snoop.
+    assign snoop_kill_valid = snoop_rdy_c && (snoop_msg.op==OP_FWD_GETM || snoop_msg.op==OP_INV);
+    assign snoop_kill_laddr = snoop_msg.laddr;
     assign snoop_ready=snoop_rdy_c; assign resp_ready=resp_rdy_c; assign ack_ready=ack_rdy_c;
     /* verilator lint_on ENUMVALUE */
 endmodule

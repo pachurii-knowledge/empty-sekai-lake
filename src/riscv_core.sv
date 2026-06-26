@@ -40,6 +40,8 @@ module riscv_core
     input wire logic             dmem_resp_valid,
     input wire logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
     input wire logic [XLEN-1:0]  dmem_resp_data,
+    input wire logic             dmem_snoop_kill_valid,   // M3d Stage 3: CCD snoop-kill -> LSQ
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] dmem_snoop_kill_laddr,
     // Page-table-walk port (req/ack)
     output logic             ptw_mem_req,
     output logic             ptw_mem_we,
@@ -76,6 +78,8 @@ module riscv_core
         .dmem_resp_valid,
         .dmem_resp_addr,
         .dmem_resp_data,
+        .dmem_snoop_kill_valid,
+        .dmem_snoop_kill_laddr,
         .ptw_mem_req,
         .ptw_mem_we,
         .ptw_mem_addr_w,

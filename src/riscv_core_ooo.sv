@@ -51,6 +51,10 @@ module riscv_core_ooo
     input wire logic             dmem_resp_valid,
     input wire logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
     input wire logic [XLEN-1:0]  dmem_resp_data,
+    // M3d Stage 3 (S1): snoop-kill from the CCD agent (remote write -> reservation-kill /
+    // spec-load squash in the LSQ). Constant 0 in non-CCD + single-core CCD builds.
+    input wire logic             dmem_snoop_kill_valid,
+    input wire logic [MEMORY_ADDR_WIDTH-1:0] dmem_snoop_kill_laddr,
 
     // MMU page-table-walk port: the walker's level req/ack word port (PTE
     // reads + A/D writebacks); rdata is valid in the ack cycle.
@@ -1387,6 +1391,8 @@ module riscv_core_ooo
                    plic_load_hit  ? plic_load_data  :
                    uart_load_hit  ? uart_load_data  : dmem_resp_data),
         .dmem_req_ready(dmem_req_ready),
+        .snoop_kill_valid(dmem_snoop_kill_valid),
+        .snoop_kill_laddr(dmem_snoop_kill_laddr),
         .commit_store,
         .commit_store_id,
         .paging_data(paging_data),

@@ -45,6 +45,10 @@ module niigo_ccd_gg_direct
     // M3d writeback-all flush (drives the core-0 agent; idle cores never own dirty lines)
     input  wire logic                          flush_req,
     output logic                               flush_done,
+    // M3d Stage 3 (S1): expose the core-0 agent's snoop-kill pulse to the LSQ (reservation-kill /
+    // spec-load squash). Core 0 is the real core in the production CCD build and the S3 harness.
+    output logic                               snoop_kill_valid,
+    output logic [MEMORY_ADDR_WIDTH-1:0]       snoop_kill_laddr,
     output nmi_req_t   mem_req_o,
     input  wire logic  mem_req_ready_i,
     input  nmi_resp_t  mem_resp_i
@@ -76,6 +80,11 @@ module niigo_ccd_gg_direct
 
     logic fl_done_a [NACTIVE];
     assign flush_done = fl_done_a[0];
+    // S1: per-agent snoop-kill, core 0 exposed (the real core / production single core).
+    logic                          snp_kill_v_a [NACTIVE];
+    logic [MEMORY_ADDR_WIDTH-1:0]  snp_kill_la_a[NACTIVE];
+    assign snoop_kill_valid = snp_kill_v_a[0];
+    assign snoop_kill_laddr = snp_kill_la_a[0];
 
     genvar gi;
     generate for (gi=0; gi<NACTIVE; gi++) begin : G_AGENT
@@ -86,6 +95,7 @@ module niigo_ccd_gg_direct
             .c_req_waddr(c_req_waddr[gi]), .c_req_wdata(c_req_wdata[gi]), .c_req_wmask(c_req_wmask[gi]),
             .c_resp_rdata(c_resp_rdata[gi]), .c_resp_sc_ok(c_resp_sc_ok[gi]),
             .flush_req((gi==0) ? flush_req : 1'b0), .flush_done(fl_done_a[gi]),
+            .snoop_kill_valid(snp_kill_v_a[gi]), .snoop_kill_laddr(snp_kill_la_a[gi]),
             .dmd_valid(dmd_v[gi]), .dmd_msg(dmd_m[gi]), .dmd_ready(dmd_r[gi]),
             .snp_valid(snp_v[gi]), .snp_msg(snp_m[gi]), .snp_dst(snp_d[gi]), .snp_ready(snp_r[gi]),
             .snoop_valid(snoop_v[gi]), .snoop_msg(snoop_m[gi]), .snoop_ready(snoop_r[gi]),

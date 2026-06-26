@@ -31,6 +31,7 @@ module tb_niigo_ccd_gg
         .c_req_waddr(creq_wa), .c_req_wdata(creq_wd), .c_req_wmask(creq_wm),
         .c_resp_rdata(cresp_rd), .c_resp_sc_ok(cresp_sc),
         .flush_req(1'b0), .flush_done(),
+        .snoop_kill_valid(), .snoop_kill_laddr(),
         .mem_req_o(mreq), .mem_req_ready_i(mreq_ready), .mem_resp_i(mresp));
 
     // ---- behavioural NMI memory ----
