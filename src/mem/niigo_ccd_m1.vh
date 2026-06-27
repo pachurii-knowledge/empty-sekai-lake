@@ -91,8 +91,8 @@ package NIIGO_CCD_M1;
         COP_LOAD, COP_STORE, COP_LR, COP_SC, COP_AMO, COP_AMO_RD
     } l1_core_op_e;
 
-    typedef enum logic [2:0] {            // AMO sub-op (the RMW the cache applies atomically)
-        AMO_ADD, AMO_SWAP, AMO_OR, AMO_AND, AMO_XOR
+    typedef enum logic [3:0] {            // AMO sub-op (the RMW the cache applies atomically)
+        AMO_ADD, AMO_SWAP, AMO_OR, AMO_AND, AMO_XOR, AMO_MIN, AMO_MAX, AMO_MINU, AMO_MAXU
     } l1_amo_op_e;
 
 endpackage : NIIGO_CCD_M1

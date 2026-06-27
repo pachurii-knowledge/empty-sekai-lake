@@ -110,6 +110,7 @@ module active_list
         logic has_dest;
         logic is_store;
         logic is_sc;          // M4-S5b: store-conditional (memWrite + EXEC_AMO + AMO_SC)
+        logic is_amo;         // M4 #3: RMW atomic (EXEC_AMO, amo_op not LR/SC)
         branch_mask_t branch_mask;
     } active_entry_t;
 
@@ -331,6 +332,7 @@ module active_list
                 commit_packet_next[i].serializing = entries_q[commit_idx].serializing;
                 commit_packet_next[i].is_store = entries_q[commit_idx].is_store;
                 commit_packet_next[i].is_sc = entries_q[commit_idx].is_sc;
+                commit_packet_next[i].is_amo = entries_q[commit_idx].is_amo;
                 commit_packet_next[i].halted = entries_q[commit_idx].halted;
                 commit_packet_next[i].exception = entries_q[commit_idx].exception;
                 commit_packet_next[i].exc_cause = entries_q[commit_idx].exc_cause;
@@ -414,6 +416,12 @@ module active_list
                     allocate_packet_q[i].ctrl.memWrite &&
                     (allocate_packet_q[i].ctrl.exec_class == EXEC_AMO) &&
                     (allocate_packet_q[i].ctrl.amo_op == AMO_SC);
+                // M4 #3: an RMW atomic (EXEC_AMO, not LR/SC). The commit unit holds it
+                // at the ROB head until the agent-authoritative COP_AMO resolves.
+                entries_next[allocate_packet_q[i].active_id].is_amo =
+                    (allocate_packet_q[i].ctrl.exec_class == EXEC_AMO) &&
+                    (allocate_packet_q[i].ctrl.amo_op != AMO_LR) &&
+                    (allocate_packet_q[i].ctrl.amo_op != AMO_SC);
                 entries_next[allocate_packet_q[i].active_id].branch_mask =
                     allocate_packet_q[i].branch_mask & ~reset_mask;
             end

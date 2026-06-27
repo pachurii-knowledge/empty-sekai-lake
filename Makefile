@@ -133,6 +133,15 @@ ccd-smp-test:
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smp/Vtop
 
+# ---- M4 #3 AMO atomicity: 2 real cores contend amoadd.w on a shared counter ----
+ccd-smp-amo-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp-amo \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_amo.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp-amo/Vtop
+
 # ---- M4-S6b cross-hart IPI: 2 real cores + ONE shared CLINT (NIIGO_EXT_DEVICES) ----
 ccd-smp-ipi-test:
 	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \

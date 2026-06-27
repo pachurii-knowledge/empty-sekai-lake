@@ -84,7 +84,11 @@ module niigo_l1d_gg
                                                   input logic [XLEN-1:0] w, input logic [XBY-1:0] be);
         wmrgm=l; for (int b=0;b<XBY;b++) if (be[b]) wmrgm[o*XLEN + b*8 +: 8] = w[b*8 +: 8]; endfunction
     function automatic logic [XLEN-1:0] amo(input l1_amo_op_e a, input logic [XLEN-1:0] od, input logic [XLEN-1:0] o);
-        unique case(a) AMO_ADD:amo=od+o; AMO_SWAP:amo=o; AMO_OR:amo=od|o; AMO_AND:amo=od&o; AMO_XOR:amo=od^o; default:amo=o; endcase
+        // RV32: full-XLEN RMW. (RV64 .W sub-word AMOs ride RV64-on-CCD, deferred.)
+        unique case(a) AMO_ADD:amo=od+o; AMO_SWAP:amo=o; AMO_OR:amo=od|o; AMO_AND:amo=od&o; AMO_XOR:amo=od^o;
+            AMO_MIN: amo=($signed(od) < $signed(o))?od:o; AMO_MAX: amo=($signed(od) > $signed(o))?od:o;
+            AMO_MINU:amo=(od < o)?od:o;                   AMO_MAXU:amo=(od > o)?od:o;
+            default:amo=o; endcase
     endfunction
     function automatic cmi_op_e put_for(input cmi_state_e s);
         unique case(s) CMI_M:put_for=OP_PUTM; CMI_O:put_for=OP_PUTO; CMI_E:put_for=OP_PUTE; default:put_for=OP_PUTS; endcase

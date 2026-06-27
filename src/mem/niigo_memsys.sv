@@ -110,6 +110,8 @@ module niigo_memsys
     // the CCD agent arm consumes it; the L1D/passthrough arms derive load vs store
     // from dmem_req_write and sink this port as unused.
     input wire logic [2:0]                    dmem_req_op,
+    // M4 #3: fine AMO sub-op (amo_op_t ordinal) for a COP_AMO beat; CCD-arm only.
+    input wire logic [3:0]                    dmem_req_amo,
     output logic                          dmem_resp_valid,
     output logic [MEMORY_ADDR_WIDTH-1:0]  dmem_resp_addr,
     output logic [XLEN-1:0]               dmem_resp_data,
@@ -195,7 +197,7 @@ module niigo_memsys
     // unconditionally so the L1D/passthrough builds don't flag it unused (the extra
     // read is harmless where the CCD arm also uses it functionally).
     logic unused_dmem_op;
-    assign unused_dmem_op = |dmem_req_op;
+    assign unused_dmem_op = |dmem_req_op | |dmem_req_amo;
 
     // M3d Stage 3 (S1): the snoop-kill outputs are driven by the CCD agent arm; tie them off in
     // every non-CCD build so they always have exactly one driver (passthrough/L1/L1D have no agent).
@@ -633,7 +635,24 @@ module niigo_memsys
             3'd2:    map_dmem_op = COP_LR;
             3'd3:    map_dmem_op = COP_AMO_RD;
             3'd4:    map_dmem_op = COP_SC;      // M4-S5b: agent-authoritative SC
+            3'd5:    map_dmem_op = COP_AMO;     // M4 #3: agent-authoritative AMO (atomic RMW)
             default: map_dmem_op = COP_LOAD;   // 3'd0
+        endcase
+    endfunction
+
+    // M4 #3: the LSQ's fine AMO sub-op (amo_op_t ordinal) -> the agent's l1_amo_op_e.
+    function automatic l1_amo_op_e map_amo(input logic [3:0] a);
+        unique case (a)
+            4'd3:    map_amo = AMO_SWAP;
+            4'd4:    map_amo = AMO_ADD;
+            4'd5:    map_amo = AMO_XOR;
+            4'd6:    map_amo = AMO_AND;
+            4'd7:    map_amo = AMO_OR;
+            4'd8:    map_amo = AMO_MIN;
+            4'd9:    map_amo = AMO_MAX;
+            4'd10:   map_amo = AMO_MINU;
+            4'd11:   map_amo = AMO_MAXU;
+            default: map_amo = AMO_ADD;
         endcase
     endfunction
 
@@ -664,7 +683,9 @@ module niigo_memsys
     // ---- registered launch adapter (breaks the c_req_ready comb loop) ----
     logic                          ad_busy_q, ad_is_ptw_q, ad_is_load_q;
     logic                          ad_is_sc_q;   // M4-S5b: the outstanding op is a COP_SC
+    logic                          ad_is_amo_q;  // M4 #3: the outstanding op is a COP_AMO
     l1_core_op_e                   ad_op_q;
+    l1_amo_op_e                    ad_amo_q;     // M4 #3: latched fine AMO sub-op
     logic [MEMORY_ADDR_WIDTH-1:0]  ad_addr_q;
     logic [XLEN-1:0]               ad_wdata_q;
     logic [XLEN_BYTES-1:0]         ad_wmask_q;
@@ -693,7 +714,7 @@ module niigo_memsys
 
     assign c_req_valid[0] = ad_busy_q;
     assign c_req_op[0]    = ad_op_q;
-    assign c_req_amo[0]   = AMO_ADD;     // Stage-1 don't-care: the LSQ owns AMO RMW
+    assign c_req_amo[0]   = ad_amo_q;    // M4 #3: fine AMO op for COP_AMO (else don't-care)
     assign c_req_waddr[0] = ad_addr_q;
     assign c_req_wdata[0] = ad_wdata_q;
     assign c_req_wmask[0] = ad_wmask_q;
@@ -710,6 +731,10 @@ module niigo_memsys
                 // M4-S5b: a COP_SC (dmem_req_op==3'd4) is a write that returns sc_ok;
                 // latch it so the response path delivers the rd (0=ok/1=fail).
                 ad_is_sc_q   <= present_dmem && (dmem_req_op == 3'd4);
+                // M4 #3: a COP_AMO (dmem_req_op==3'd5) is a write that returns the OLD
+                // word; latch it + the fine sub-op so the agent applies the RMW.
+                ad_is_amo_q  <= present_dmem && (dmem_req_op == 3'd5);
+                ad_amo_q     <= present_dmem ? map_amo(dmem_req_amo) : AMO_ADD;
                 // M3d Stage 2: dmem ops carry their LSQ type (LOAD/STORE/LR/AMO_RD); the
                 // PTW is a plain read or A/D write. ad_is_load_q above stays correct: LR /
                 // AMO_RD arrive on the read path (!dmem_req_write), so they latch a response.
@@ -722,8 +747,10 @@ module niigo_memsys
             // 1-deep response latch (dmem load OR coherent SC; PTW acks via ptw_req_ack below).
             // M4-S5b: an SC returns its rd (0=success / 1=fail) from the agent's sc_ok on
             // the same response channel a load uses.
-            if (ad_done && ((ad_is_load_q && !ad_is_ptw_q) || ad_is_sc_q)) begin
+            if (ad_done && ((ad_is_load_q && !ad_is_ptw_q) || ad_is_sc_q || ad_is_amo_q)) begin
                 ad_resp_pend_q <= 1'b1;
+                // SC: rd = 0/1 from sc_ok. AMO/load: rd = the agent's returned word
+                // (AMO's OLD value).
                 ad_resp_data_q <= ad_is_sc_q ? (c_resp_sc_ok[0] ? '0 : XLEN'(1)) : c_resp_rdata[0];
                 ad_resp_addr_q <= ad_addr_q;
             end else if (ad_resp_pend_q) ad_resp_pend_q <= 1'b0;

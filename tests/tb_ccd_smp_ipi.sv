@@ -100,7 +100,7 @@ module top
             .ifetch_req_valid(if_req_v), .ifetch_req_ready(if_req_r), .ifetch_req_addr(if_req_a),
             .ifetch_resp_valid(if_resp_v), .ifetch_resp_data(if_resp_d), .ifetch_resp_excpt(if_resp_e),
             .dmem_req_valid(d_req_v), .dmem_req_ready(d_req_r), .dmem_req_write(d_req_w), .dmem_req_addr(d_req_a),
-            .dmem_req_wdata(d_req_wd), .dmem_req_wmask(d_req_wm), .dmem_req_op(d_req_op),
+            .dmem_req_wdata(d_req_wd), .dmem_req_wmask(d_req_wm), .dmem_req_op(d_req_op), .dmem_req_amo(),
             .dmem_resp_valid(d_resp_v), .dmem_resp_addr(d_resp_a), .dmem_resp_data(d_resp_d),
             .dmem_snoop_kill_valid(ccd_sk_v[g]), .dmem_snoop_kill_laddr(ccd_sk_la[g]),
             .ptw_mem_req(pt_req), .ptw_mem_we(pt_we), .ptw_mem_addr_w(pt_aw), .ptw_mem_wdata(pt_wd),

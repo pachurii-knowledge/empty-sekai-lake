@@ -60,7 +60,7 @@ module top
         .ifetch_req_valid, .ifetch_req_ready, .ifetch_req_addr,
         .ifetch_resp_valid, .ifetch_resp_data, .ifetch_resp_excpt,
         .dmem_req_valid, .dmem_req_ready, .dmem_req_write, .dmem_req_addr,
-        .dmem_req_wdata, .dmem_req_wmask, .dmem_req_op,
+        .dmem_req_wdata, .dmem_req_wmask, .dmem_req_op, .dmem_req_amo(),
         .dmem_resp_valid, .dmem_resp_addr, .dmem_resp_data,
         .dmem_snoop_kill_valid, .dmem_snoop_kill_laddr,
         .ptw_mem_req, .ptw_mem_we, .ptw_mem_addr_w, .ptw_mem_wdata,

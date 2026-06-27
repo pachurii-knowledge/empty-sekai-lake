@@ -52,6 +52,8 @@ module riscv_core_ooo
     // M3d Stage 2: typed memory-op code (LOAD/STORE/LR/AMO_RD) for the CCD L1D
     // agent; ignored by the L1D/passthrough memsys arms. See load_store_queue.sv.
     output logic [2:0]       dmem_req_op,
+    // M4 #3: fine AMO sub-op accompanying a COP_AMO beat (agent-authoritative AMO).
+    output logic [3:0]       dmem_req_amo,
     input wire logic             dmem_resp_valid,
     input wire logic [MEMORY_ADDR_WIDTH-1:0] dmem_resp_addr,
     input wire logic [XLEN-1:0]  dmem_resp_data,
@@ -450,6 +452,7 @@ module riscv_core_ooo
     logic [XLEN-1:0] mem_data_store;
     logic [XLEN_BYTES-1:0] mem_data_store_mask;
     logic [2:0] mem_dmem_op;            // M3d Stage 2: LSQ typed op -> dmem_req_op
+    logic [3:0] mem_dmem_amo;           // M4 #3: LSQ fine AMO op -> dmem_req_amo
     logic lsq_store_second_beat;
     logic lsq_store_port_busy;
     logic lsq_sc_commit_done;           // M4-S5b: LSQ resolved the coherent SC -> release ROB retire
@@ -1462,6 +1465,7 @@ module riscv_core_ooo
         .data_store(mem_data_store),
         .data_store_mask(mem_data_store_mask),
         .dmem_req_op(mem_dmem_op),
+        .dmem_req_amo(mem_dmem_amo),
         .store_second_beat(lsq_store_second_beat),
         .store_port_busy(lsq_store_port_busy),
         .head_load_off(dev_load_off),
@@ -2157,6 +2161,7 @@ module riscv_core_ooo
         dmem_req_wdata = mem_data_store;
         dmem_req_wmask = mem_data_store_mask;
         dmem_req_op    = mem_dmem_op;
+        dmem_req_amo   = mem_dmem_amo;
     end
 
     // ---- B7: frontend control + commit-driven redirects (pc_next,

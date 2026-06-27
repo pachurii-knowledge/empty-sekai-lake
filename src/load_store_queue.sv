@@ -74,6 +74,10 @@ module load_store_queue
     // A load issue carries LOAD/LR/AMO_RD; a store write (commit / second beat) carries
     // STORE. The 3-bit contract MUST match the decode in niigo_memsys.sv's CCD arm.
     output logic [2:0]           dmem_req_op,
+    // M4 #3: the fine AMO sub-op (amo_op_t ordinal) accompanying a COP_AMO beat,
+    // so the CCD agent applies the right atomic RMW. Don't-care on non-AMO beats /
+    // non-CCD builds (sunk by the memsys).
+    output logic [3:0]           dmem_req_amo,
     // High while driving the second beat of a split store: the data_addr output
     // already carries the captured physical word address, so the core port must
     // bypass the (head-VA based) translation mux.
@@ -133,6 +137,7 @@ module load_store_queue
     localparam logic [2:0] DMEM_OP_LR     = 3'd2;
     localparam logic [2:0] DMEM_OP_AMO_RD = 3'd3;
     localparam logic [2:0] DMEM_OP_SC     = 3'd4;   // M4-S5b: agent-authoritative SC (COP_SC)
+    localparam logic [2:0] DMEM_OP_AMO    = 3'd5;   // M4 #3: agent-authoritative AMO (COP_AMO)
 
     // M3d Stage 3: coherence line = 64 B (the fixed PIPT line). LINE_OFF_W = the word-offset
     // bits within a line, so [MEMORY_ADDR_WIDTH-1:LINE_OFF_W] of a word address is its line.
@@ -206,6 +211,14 @@ module load_store_queue
     // All inert when COHERENT=0.
     logic                          sc_issue;
     logic                          sc_inflight_q, sc_inflight_next;
+    // M4 #3 (COHERENT only): agent-authoritative AMO. Mirrors the SC -- the AMO
+    // defers to commit, then issues a COP_AMO (the agent does acquire-M + atomic
+    // RMW + return-OLD in one action, with snoop-replay during acquire), awaits the
+    // OLD word, writes rd, and pulses sc_commit_done. amo_issue drives the COP_AMO
+    // data beat in block M; amo_inflight_q tracks the outstanding COP_AMO. Inert
+    // when COHERENT=0 (the AMO uses the Stage-2 COP_AMO_RD + commit-store path).
+    logic                          amo_issue;
+    logic                          amo_inflight_q, amo_inflight_next;
     // HD local: post-squash validity per slot (head-skip input, no wakeup).
     logic [MEM_Q_SIZE-1:0]         sq_valid;
     // HD locals: AMO result byte-split (low into head_delta, high unused).
@@ -340,6 +353,8 @@ module load_store_queue
         sc_issue = 1'b0;
         sc_commit_done = 1'b0;
         sc_inflight_next = sc_inflight_q;
+        amo_issue = 1'b0;
+        amo_inflight_next = amo_inflight_q;
         amo_store_data = '0;
         amo_store_mask = '0;
         amo_split_hi_data = '0;
@@ -567,6 +582,62 @@ module load_store_queue
             sc_issue = 1'b1;
             mem_inflight_next = 1'b1;
             sc_inflight_next = 1'b1;
+        end
+
+        // M4 #3 (COHERENT only): agent-authoritative AMO. Mirrors the SC. The AMO
+        // does NOT read at the head; it PARKS (head-park block below) and at commit
+        // issues a COP_AMO -- the agent acquires M, atomically reads OLD, writes
+        // amo(op, OLD, operand), and returns OLD (snoop-replay during the acquire).
+        // The OLD word arrives like a load response; rd is written from it. This
+        // closes the Stage-2 read->commit-store window (AT_AMO_RD has no replay).
+        if (COHERENT && amo_inflight_q && data_load_valid) begin
+            // (2) COMPLETE: the agent's OLD word arrived -> write rd, retire, release.
+            head_done = 1'b1;
+            load_writeback.valid = 1'b1;
+            load_writeback.active_id = headq.entry.active_id;
+            load_writeback.prd = headq.entry.prd;
+            load_writeback.has_dest = headq.entry.has_dest;
+            load_writeback.branch_mask = '0;     // the AMO is the non-speculative ROB head
+            load_writeback.data = format_load(data_load,
+                headq.addr[ADDR_SHIFT-1:0], headq.entry.ctrl.ldst_mode);
+            head_delta.zero = 1'b1;
+            head_retire = 1'b1;
+            amo_inflight_next = 1'b0;
+            sc_commit_done = 1'b1;               // shared "atomic op at head resolved" pulse
+        end else if (COHERENT && !amo_inflight_q && !head_done && !double_store_pending_q &&
+                headq.entry.valid && headq.issued_load &&
+                (headq.entry.ctrl.exec_class == EXEC_AMO) &&
+                (headq.entry.ctrl.amo_op != AMO_LR) && (headq.entry.ctrl.amo_op != AMO_SC) &&
+                commit_store && (commit_store_id == headq.entry.active_id) &&
+                !mem_inflight_q && dmem_req_ready) begin
+            // (1) ISSUE the COP_AMO. Block M drives the data beat (captured PA,
+            // operand=store_raw, dmem_req_amo=amo_op, tagged DMEM_OP_AMO).
+            head_done = 1'b1;
+            amo_issue = 1'b1;
+            mem_inflight_next = 1'b1;
+            amo_inflight_next = 1'b1;
+        end
+
+        // M4 #3 (COHERENT only): AMO head-park. Like the COHERENT SC head-decision,
+        // mark the AMO ROB-done with a completion-only writeback (has_dest=0 => the
+        // dependent op sleeps), capture the PA, and PARK at the head (issued_load=1)
+        // WITHOUT issuing a read. The atomic RMW + rd happen at the commit COP_AMO
+        // above. Placed before the load-issue so the AMO never issues a COP_AMO_RD.
+        if (COHERENT && head_xlate_ok && !head_done && !double_store_pending_q &&
+                headq.entry.valid &&
+                (headq.entry.ctrl.exec_class == EXEC_AMO) &&
+                (headq.entry.ctrl.amo_op != AMO_LR) && (headq.entry.ctrl.amo_op != AMO_SC) &&
+                headq.entry.src1_ready && headq.entry.src2_ready &&
+                !headq.issued_load) begin
+            head_done = 1'b1;
+            load_writeback.valid = 1'b1;
+            load_writeback.active_id = headq.entry.active_id;
+            load_writeback.branch_mask = headq.entry.branch_mask;
+            load_writeback.has_dest = 1'b0;
+            head_delta.we_store_lo_pa = 1'b1;
+            head_delta.store_lo_pa = xlate_pa_q;
+            head_delta.we_issued_load = 1'b1;
+            head_delta.issued_load = 1'b1;
         end
 
         // Load issue: reads/conditions from the REGISTERED head snapshot (headq)
@@ -933,16 +1004,18 @@ module load_store_queue
         // entries_premerge (post squash/wakeup/head_delta) so a same-cycle squash is
         // honored; the DATA reads the REGISTERED entries_q (value-equivalent for a
         // committing store, and shallow).
-        // M4-S5b: a coherent SC is NOT a plain committed store -- it is resolved by the
-        // COP_SC issue/complete path (block HD + the sc_issue data beat below), so it
-        // must never fire the unconditional store-commit write. Exclude it here.
+        // M4-S5b / M4 #3: a coherent SC or RMW-AMO is NOT a plain committed store --
+        // it is resolved by the COP_SC / COP_AMO issue/complete path (block HD + the
+        // sc_issue / amo_issue data beat below), so it must never fire the
+        // unconditional store-commit write. Exclude both here (LR is a read, never
+        // a committed store, so amo_op != AMO_LR covers SC + every RMW AMO).
         store_commit_fires = !double_store_pending_q && commit_store &&
             entries_premerge[head_after_retire].entry.valid &&
             entries_premerge[head_after_retire].entry.ctrl.memWrite &&
             (entries_premerge[head_after_retire].entry.active_id == commit_store_id) &&
             !(COHERENT &&
               (entries_premerge[head_after_retire].entry.ctrl.exec_class == EXEC_AMO) &&
-              (entries_premerge[head_after_retire].entry.ctrl.amo_op == AMO_SC));
+              (entries_premerge[head_after_retire].entry.ctrl.amo_op != AMO_LR));
 
         if (store_commit_fires) begin
             // Second (high) beat of a two-beat store: queue a fire-and-forget write
@@ -987,6 +1060,7 @@ module load_store_queue
         // (double-store beat / store-commit are STORE; a head load issue carries its
         // LOAD/LR/AMO_RD tag). Idle -> don't-care (the port is invalid).
         dmem_req_op = DMEM_OP_LOAD;
+        dmem_req_amo = 4'd0;            // M4 #3: only meaningful on the COP_AMO beat
         if (double_store_pending_q) begin
             data_addr = double_store_addr_q;
             data_store = double_store_data_q;
@@ -1005,6 +1079,17 @@ module load_store_queue
             data_store_mask = entries_q[head_after_retire].store_mask;
             store_second_beat = 1'b1;
             dmem_req_op = DMEM_OP_SC;
+        end else if (amo_issue) begin
+            // M4 #3: coherent AMO -- drive the COP_AMO beat at the captured PA. The
+            // raw operand (rs2) rides data_store and the fine op rides dmem_req_amo;
+            // the agent reads OLD, applies amo(op, OLD, operand) atomically, and
+            // returns OLD (awaited via mem_inflight, like a load). Full-word write.
+            data_addr = entries_q[head_after_retire].store_lo_pa[XLEN-1:ADDR_SHIFT];
+            data_store = entries_q[head_after_retire].store_raw;
+            data_store_mask = '1;
+            store_second_beat = 1'b1;
+            dmem_req_op = DMEM_OP_AMO;
+            dmem_req_amo = entries_q[head_after_retire].entry.ctrl.amo_op;
         end else if (store_commit_fires) begin
             // First (low) beat: written at the captured physical address.
             data_addr = entries_q[head_after_retire].store_lo_pa[XLEN-1:ADDR_SHIFT];
@@ -1291,6 +1376,7 @@ module load_store_queue
             mem_inflight_q <= 1'b0;
             mem_inflight_kill_q <= 1'b0;
             sc_inflight_q <= 1'b0;
+            amo_inflight_q <= 1'b0;
             xlate_pa_q <= '0;
             xlate_fault_q <= 1'b0;
             xlate_stall_q <= 1'b0;
@@ -1316,6 +1402,7 @@ module load_store_queue
             mem_inflight_q <= mem_inflight_next;
             mem_inflight_kill_q <= mem_inflight_kill_next;
             sc_inflight_q <= sc_inflight_next;
+            amo_inflight_q <= amo_inflight_next;
             // Register this cycle's head translation (combinational from the core's
             // DTLB+DataPMP on mem_req_vaddr) + the (head_q, store_probe_hi_q,
             // mem_req_valid) tag identifying which head request it is for. Consumed

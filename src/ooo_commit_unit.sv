@@ -48,12 +48,14 @@ module ooo_commit_unit
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (commit_valid[i] && !stop_prefix) begin
-                if (COHERENT && commit_packet[i].is_sc) begin
-                    // M4-S5b: coherent store-conditional. Engage the LSQ (commit_store
-                    // carries the active_id; the LSQ self-gates the COP_SC issue on its
-                    // own port readiness) and HOLD at the ROB head until the LSQ reports
-                    // the agent's verdict. retire_valid waits for sc_commit_done; rd is
-                    // written by the LSQ's resolve writeback that same cycle.
+                if (COHERENT && (commit_packet[i].is_sc || commit_packet[i].is_amo)) begin
+                    // M4-S5b / M4 #3: coherent store-conditional OR RMW atomic. Engage
+                    // the LSQ (commit_store carries the active_id; the LSQ self-gates the
+                    // COP_SC / COP_AMO issue on its own port readiness) and HOLD at the
+                    // ROB head until the LSQ reports the agent's outcome. retire_valid
+                    // waits for sc_commit_done (shared "atomic op resolved" pulse); rd
+                    // (SC: 0/1, AMO: OLD) is written by the LSQ's resolve writeback that
+                    // same cycle.
                     if (sc_commit_done) begin
                         retire_valid[i] = 1'b1;
                         free_valid[i] = commit_packet[i].has_dest;
