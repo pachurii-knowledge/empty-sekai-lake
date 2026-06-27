@@ -40,7 +40,10 @@ module plic
     import RISCV_UArch::MEMORY_ADDR_WIDTH;
 #(
     parameter logic [31:0] BASE = 32'h0C00_0000,
-    parameter int          NSOURCES = 31           // sources 1..NSOURCES (<= 31)
+    parameter int          NSOURCES = 31,          // sources 1..NSOURCES (<= 31)
+    // M4 SMP: 2 contexts per hart (even=M-external, odd=S-external). NCTX=2 (the
+    // default) is the single-hart layout -> bit-identical to the pre-SMP PLIC.
+    parameter int          NCTX = 2
 ) (
     input wire logic        clk,
     input wire logic        rst_l,
@@ -64,24 +67,22 @@ module plic
     output logic        load_hit,
     output logic [XLEN-1:0] load_data,
 
-    output logic        irq_m_external,   // context 0
-    output logic        irq_s_external    // context 1
+    output logic [NCTX/2-1:0] irq_m_external,   // even contexts (M-external per hart)
+    output logic [NCTX/2-1:0] irq_s_external    // odd contexts  (S-external per hart)
 );
 
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
     localparam int NSUB = XLEN / 32;
+    localparam int NHART = NCTX / 2;
 
-    localparam int NCTX = 2;
     localparam logic [31:0] PRIO_BASE_B  = BASE + 32'h0000_0000;
     localparam logic [31:0] PENDING_B    = BASE + 32'h0000_1000;
     // Non-standard test/IPI helper: write-1-to-clear the software-pending word.
     localparam logic [31:0] PENDING_CLR_B = BASE + 32'h0000_1004;
-    localparam logic [31:0] ENABLE0_B    = BASE + 32'h0000_2000;
-    localparam logic [31:0] ENABLE1_B    = BASE + 32'h0000_2080;
-    localparam logic [31:0] THRESH0_B    = BASE + 32'h0020_0000;
-    localparam logic [31:0] CLAIM0_B     = BASE + 32'h0020_0004;
-    localparam logic [31:0] THRESH1_B    = BASE + 32'h0020_1000;
-    localparam logic [31:0] CLAIM1_B     = BASE + 32'h0020_1004;
+    // Per-context register blocks (SiFive layout): enable @ 0x2000 + 0x80*ctx;
+    // threshold @ 0x200000 + 0x1000*ctx; claim/complete at threshold+4.
+    localparam logic [31:0] ENABLE_BASE  = BASE + 32'h0000_2000;
+    localparam logic [31:0] CTX_BASE     = BASE + 32'h0020_0000;
 
     // State
     logic [2:0]  prio_q     [NSOURCES+1];   // priority per source (0 disables)
@@ -142,8 +143,33 @@ module plic
         end
     end
 
-    assign irq_m_external = (best_id[0] != 6'd0);
-    assign irq_s_external = (best_id[1] != 6'd0);
+    // Even context 2*h = hart h M-external; odd 2*h+1 = hart h S-external.
+    for (genvar h = 0; h < NHART; h += 1) begin : g_ext
+        assign irq_m_external[h] = (best_id[2*h]   != 6'd0);
+        assign irq_s_external[h] = (best_id[2*h+1] != 6'd0);
+    end
+
+    // Per-context register decode (enable / threshold / claim).
+    //   kind: 0=none 1=enable 2=thresh 3=claim ; ctx = the matched context
+    function automatic void ctx_decode(input logic [31:0] baddr,
+            output int kind, output int ctx);
+        kind = 0;
+        ctx  = 0;
+        if ((baddr >= ENABLE_BASE) &&
+                (baddr < ENABLE_BASE + 32'(NCTX) * 32'h80) &&
+                ((baddr & 32'h7F) == 32'h0)) begin
+            kind = 1;
+            ctx  = int'((baddr - ENABLE_BASE) >> 7);   // /0x80
+        end else if ((baddr >= CTX_BASE) &&
+                (baddr < CTX_BASE + 32'(NCTX) * 32'h1000)) begin
+            ctx = int'((baddr - CTX_BASE) >> 12);       // /0x1000
+            unique case ((baddr - CTX_BASE) & 32'hFFF)
+                32'h0:   kind = 2;   // threshold
+                32'h4:   kind = 3;   // claim/complete
+                default: kind = 0;
+            endcase
+        end
+    endfunction
 
     // Pending-bits read word (bit s = source s gateway pending).
     logic [31:0] pending_word;
@@ -155,24 +181,23 @@ module plic
     // 32-bit register read at a byte address.
     function automatic logic [31:0] reg_read(input logic [31:0] baddr,
             output logic hit);
+        int ckind, cctx;
         hit = 1'b1;
+        ctx_decode(baddr, ckind, cctx);
         if ((baddr >= PRIO_BASE_B + 32'd4) &&
                 (baddr <= PRIO_BASE_B + 32'(NSOURCES * 4))) begin
             reg_read = {29'b0, prio_q[baddr[6:2]]};
+        end else if (baddr == PENDING_B) begin
+            reg_read = pending_word;
+        end else if (ckind == 1) begin     // enable[ctx]
+            reg_read = enable_q[cctx];
+        end else if (ckind == 2) begin     // threshold[ctx]
+            reg_read = {29'b0, thresh_q[cctx]};
+        end else if (ckind == 3) begin     // claim[ctx]
+            reg_read = {26'b0, best_id[cctx]};
         end else begin
-            unique case (baddr)
-                PENDING_B: reg_read = pending_word;
-                ENABLE0_B: reg_read = enable_q[0];
-                ENABLE1_B: reg_read = enable_q[1];
-                THRESH0_B: reg_read = {29'b0, thresh_q[0]};
-                THRESH1_B: reg_read = {29'b0, thresh_q[1]};
-                CLAIM0_B:  reg_read = {26'b0, best_id[0]};
-                CLAIM1_B:  reg_read = {26'b0, best_id[1]};
-                default: begin
-                    reg_read = 32'b0;
-                    hit = 1'b0;
-                end
-            endcase
+            reg_read = 32'b0;
+            hit = 1'b0;
         end
     endfunction
 
@@ -196,14 +221,14 @@ module plic
     logic [31:0] load_baddr;
     assign load_baddr = 32'(load_addr << ADDR_SHIFT) + 32'(load_off);
     always_comb begin
+        int ckind, cctx;
         for (int c = 0; c < NCTX; c += 1) begin
             claim_take[c] = 1'b0;
             claim_id[c]   = best_id[c];
         end
-        if (load_en && (load_baddr == CLAIM0_B) && (best_id[0] != 6'd0))
-            claim_take[0] = 1'b1;
-        if (load_en && (load_baddr == CLAIM1_B) && (best_id[1] != 6'd0))
-            claim_take[1] = 1'b1;
+        ctx_decode(load_baddr, ckind, cctx);
+        if (load_en && (ckind == 3) && (best_id[cctx] != 6'd0))
+            claim_take[cctx] = 1'b1;
     end
 
     // Completion: a write of a source id to a claim/complete register reopens
@@ -233,33 +258,28 @@ module plic
                     logic [31:0] baddr;
                     logic [31:0] wsub;
                     logic [3:0]  msub;
+                    int          wkind, wctx;
                     baddr = 32'(store_waddr << ADDR_SHIFT) + 32'(unsigned'(i) * 4);
                     wsub  = store_wdata[i*32 +: 32];
                     msub  = store_mask[i*4 +: 4];
+                    ctx_decode(baddr, wkind, wctx);
                     if (msub != 4'b0) begin
                         if ((baddr >= PRIO_BASE_B + 32'd4) &&
                                 (baddr <= PRIO_BASE_B + 32'(NSOURCES * 4))) begin
                             if (msub[0]) prio_q[baddr[6:2]] <= wsub[2:0];
-                        end else begin
-                            unique case (baddr)
-                                PENDING_B: begin
-                                    for (int s = 1; s <= NSOURCES; s += 1)
-                                        if (wsub[s]) sw_pend_q[s] <= 1'b1;
-                                end
-                                PENDING_CLR_B: begin
-                                    for (int s = 1; s <= NSOURCES; s += 1)
-                                        if (wsub[s]) sw_pend_q[s] <= 1'b0;
-                                end
-                                ENABLE0_B: enable_q[0] <= wsub;
-                                ENABLE1_B: enable_q[1] <= wsub;
-                                THRESH0_B: if (msub[0]) thresh_q[0] <= wsub[2:0];
-                                THRESH1_B: if (msub[0]) thresh_q[1] <= wsub[2:0];
-                                CLAIM0_B:  if (wsub[5:0] <= 6'(NSOURCES))
-                                               inflight_q[wsub[5:0]] <= 1'b0;
-                                CLAIM1_B:  if (wsub[5:0] <= 6'(NSOURCES))
-                                               inflight_q[wsub[5:0]] <= 1'b0;
-                                default: ;
-                            endcase
+                        end else if (baddr == PENDING_B) begin
+                            for (int s = 1; s <= NSOURCES; s += 1)
+                                if (wsub[s]) sw_pend_q[s] <= 1'b1;
+                        end else if (baddr == PENDING_CLR_B) begin
+                            for (int s = 1; s <= NSOURCES; s += 1)
+                                if (wsub[s]) sw_pend_q[s] <= 1'b0;
+                        end else if (wkind == 1) begin       // enable[ctx]
+                            enable_q[wctx] <= wsub;
+                        end else if (wkind == 2) begin       // threshold[ctx]
+                            if (msub[0]) thresh_q[wctx] <= wsub[2:0];
+                        end else if (wkind == 3) begin       // claim/complete[ctx]
+                            if (wsub[5:0] <= 6'(NSOURCES))
+                                inflight_q[wsub[5:0]] <= 1'b0;
                         end
                     end
                 end
