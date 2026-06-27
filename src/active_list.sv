@@ -109,6 +109,7 @@ module active_list
         phys_reg_t old_prd;
         logic has_dest;
         logic is_store;
+        logic is_sc;          // M4-S5b: store-conditional (memWrite + EXEC_AMO + AMO_SC)
         branch_mask_t branch_mask;
     } active_entry_t;
 
@@ -329,6 +330,7 @@ module active_list
                 commit_packet_next[i].fp_fflags = entries_q[commit_idx].fp_fflags;
                 commit_packet_next[i].serializing = entries_q[commit_idx].serializing;
                 commit_packet_next[i].is_store = entries_q[commit_idx].is_store;
+                commit_packet_next[i].is_sc = entries_q[commit_idx].is_sc;
                 commit_packet_next[i].halted = entries_q[commit_idx].halted;
                 commit_packet_next[i].exception = entries_q[commit_idx].exception;
                 commit_packet_next[i].exc_cause = entries_q[commit_idx].exc_cause;
@@ -408,6 +410,10 @@ module active_list
                     allocate_packet_q[i].has_dest;
                 entries_next[allocate_packet_q[i].active_id].is_store =
                     allocate_packet_q[i].ctrl.memWrite;
+                entries_next[allocate_packet_q[i].active_id].is_sc =
+                    allocate_packet_q[i].ctrl.memWrite &&
+                    (allocate_packet_q[i].ctrl.exec_class == EXEC_AMO) &&
+                    (allocate_packet_q[i].ctrl.amo_op == AMO_SC);
                 entries_next[allocate_packet_q[i].active_id].branch_mask =
                     allocate_packet_q[i].branch_mask & ~reset_mask;
             end

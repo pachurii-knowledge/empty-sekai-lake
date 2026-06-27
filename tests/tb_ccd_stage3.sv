@@ -123,10 +123,11 @@ module top
             3'd1:    map_dmem_op = COP_STORE;
             3'd2:    map_dmem_op = COP_LR;
             3'd3:    map_dmem_op = COP_AMO_RD;
+            3'd4:    map_dmem_op = COP_SC;
             default: map_dmem_op = COP_LOAD;
         endcase
     endfunction
-    logic                          ad_busy_q, ad_is_load_q;
+    logic                          ad_busy_q, ad_is_load_q, ad_is_sc_q;
     l1_core_op_e                   ad_op_q;
     logic [MEMORY_ADDR_WIDTH-1:0]  ad_addr_q;
     logic [XLEN-1:0]               ad_wdata_q;
@@ -151,13 +152,15 @@ module top
             if (ad_launch_fire) begin
                 ad_busy_q    <= 1'b1;
                 ad_is_load_q <= !dmem_req_write;
+                ad_is_sc_q   <= (dmem_req_op == 3'd4);   // M4-S5b
                 ad_op_q      <= map_dmem_op(dmem_req_op);
                 ad_addr_q    <= dmem_req_addr;
                 ad_wdata_q   <= dmem_req_wdata;
                 ad_wmask_q   <= dmem_req_wmask;
             end else if (ad_done) ad_busy_q <= 1'b0;
-            if (ad_done && ad_is_load_q) begin
-                ad_resp_pend_q <= 1'b1; ad_resp_data_q <= cresp_rd[0]; ad_resp_addr_q <= ad_addr_q;
+            if (ad_done && (ad_is_load_q || ad_is_sc_q)) begin
+                ad_resp_pend_q <= 1'b1; ad_resp_addr_q <= ad_addr_q;
+                ad_resp_data_q <= ad_is_sc_q ? (cresp_sc[0] ? '0 : XLEN'(1)) : cresp_rd[0];
             end else if (ad_resp_pend_q) ad_resp_pend_q <= 1'b0;
         end
     end

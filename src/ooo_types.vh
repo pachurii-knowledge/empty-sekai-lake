@@ -178,6 +178,7 @@ package OOO_Types;
         logic [4:0]    fp_fflags;
         logic          serializing;
         logic          is_store;
+        logic          is_sc;        // M4-S5b: store-conditional (memWrite + EXEC_AMO + AMO_SC)
         logic          halted;
         logic          exception;
         logic [4:0]    exc_cause;

@@ -632,6 +632,7 @@ module niigo_memsys
             3'd1:    map_dmem_op = COP_STORE;
             3'd2:    map_dmem_op = COP_LR;
             3'd3:    map_dmem_op = COP_AMO_RD;
+            3'd4:    map_dmem_op = COP_SC;      // M4-S5b: agent-authoritative SC
             default: map_dmem_op = COP_LOAD;   // 3'd0
         endcase
     endfunction
@@ -662,6 +663,7 @@ module niigo_memsys
 
     // ---- registered launch adapter (breaks the c_req_ready comb loop) ----
     logic                          ad_busy_q, ad_is_ptw_q, ad_is_load_q;
+    logic                          ad_is_sc_q;   // M4-S5b: the outstanding op is a COP_SC
     l1_core_op_e                   ad_op_q;
     logic [MEMORY_ADDR_WIDTH-1:0]  ad_addr_q;
     logic [XLEN-1:0]               ad_wdata_q;
@@ -705,6 +707,9 @@ module niigo_memsys
                 ad_busy_q    <= 1'b1;
                 ad_is_ptw_q  <= present_ptw;
                 ad_is_load_q <= present_dmem ? !dmem_req_write : !ptw_req_we;
+                // M4-S5b: a COP_SC (dmem_req_op==3'd4) is a write that returns sc_ok;
+                // latch it so the response path delivers the rd (0=ok/1=fail).
+                ad_is_sc_q   <= present_dmem && (dmem_req_op == 3'd4);
                 // M3d Stage 2: dmem ops carry their LSQ type (LOAD/STORE/LR/AMO_RD); the
                 // PTW is a plain read or A/D write. ad_is_load_q above stays correct: LR /
                 // AMO_RD arrive on the read path (!dmem_req_write), so they latch a response.
@@ -714,9 +719,13 @@ module niigo_memsys
                 ad_wdata_q   <= present_dmem ? dmem_req_wdata : ptw_req_wdata;
                 ad_wmask_q   <= present_dmem ? dmem_req_wmask : {XLEN_BYTES{1'b1}};
             end else if (ad_done) ad_busy_q <= 1'b0;
-            // 1-deep response latch (dmem load only; PTW acks via ptw_req_ack below)
-            if (ad_done && ad_is_load_q && !ad_is_ptw_q) begin
-                ad_resp_pend_q <= 1'b1; ad_resp_data_q <= c_resp_rdata[0]; ad_resp_addr_q <= ad_addr_q;
+            // 1-deep response latch (dmem load OR coherent SC; PTW acks via ptw_req_ack below).
+            // M4-S5b: an SC returns its rd (0=success / 1=fail) from the agent's sc_ok on
+            // the same response channel a load uses.
+            if (ad_done && ((ad_is_load_q && !ad_is_ptw_q) || ad_is_sc_q)) begin
+                ad_resp_pend_q <= 1'b1;
+                ad_resp_data_q <= ad_is_sc_q ? (c_resp_sc_ok[0] ? '0 : XLEN'(1)) : c_resp_rdata[0];
+                ad_resp_addr_q <= ad_addr_q;
             end else if (ad_resp_pend_q) ad_resp_pend_q <= 1'b0;
         end
     end
@@ -763,7 +772,7 @@ module niigo_memsys
     assign mem_ptw_we    = 1'b0;
     assign mem_ptw_wdata = '0;
     logic unused_ccd;
-    assign unused_ccd = (|mem_ptw_rdata) | mem_d_excpt | c_resp_sc_ok[0];
+    assign unused_ccd = (|mem_ptw_rdata) | mem_d_excpt;  // M4-S5b: c_resp_sc_ok now drives the SC response
 `endif /* CCD_AGENT */
 
 `ifdef L1_CACHES

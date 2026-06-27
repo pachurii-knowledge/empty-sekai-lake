@@ -431,6 +431,7 @@ module riscv_core_ooo
     logic [2:0] mem_dmem_op;            // M3d Stage 2: LSQ typed op -> dmem_req_op
     logic lsq_store_second_beat;
     logic lsq_store_port_busy;
+    logic lsq_sc_commit_done;           // M4-S5b: LSQ resolved the coherent SC -> release ROB retire
     logic commit_store;
     active_id_t commit_store_id;
 
@@ -1416,6 +1417,7 @@ module riscv_core_ooo
         .store_second_beat(lsq_store_second_beat),
         .store_port_busy(lsq_store_port_busy),
         .head_load_off(dev_load_off),
+        .sc_commit_done(lsq_sc_commit_done),
         .load_writeback
     );
 
@@ -1464,11 +1466,12 @@ module riscv_core_ooo
         .redirect_pc
     );
 
-    ooo_commit_unit CommitUnit (
+    ooo_commit_unit #(.COHERENT(COHERENT)) CommitUnit (
         .commit_valid(active_commit_valid),
         .commit_packet(active_commit_packet),
         .store_port_busy(lsq_store_port_busy),
         .store_port_ready(dmem_req_ready),
+        .sc_commit_done(lsq_sc_commit_done),
         .retire_valid,
         .free_valid(commit_free_valid),
         .free_prd(commit_free_prd),

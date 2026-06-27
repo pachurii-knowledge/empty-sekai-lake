@@ -54,7 +54,8 @@ module top
 
     function automatic l1_core_op_e map_dmem_op(input logic [2:0] c);
         unique case (c) 3'd1: map_dmem_op=COP_STORE; 3'd2: map_dmem_op=COP_LR;
-                        3'd3: map_dmem_op=COP_AMO_RD; default: map_dmem_op=COP_LOAD; endcase
+                        3'd3: map_dmem_op=COP_AMO_RD; 3'd4: map_dmem_op=COP_SC;
+                        default: map_dmem_op=COP_LOAD; endcase
     endfunction
 
     // ===== per-core: real core + behavioural ifetch + replicated launch adapter =====
@@ -101,7 +102,7 @@ module top
             assign if_resp_d[w] = IMEM[(if_a_q - TEXT_BASE_W) + w[MEMORY_ADDR_WIDTH-1:0]];
 
         // replicated launch adapter (dmem <-> c_req[g]); device path unused (litmus is all-cacheable)
-        logic ad_busy_q, ad_is_load_q; l1_core_op_e ad_op_q;
+        logic ad_busy_q, ad_is_load_q, ad_is_sc_q; l1_core_op_e ad_op_q;
         logic [MEMORY_ADDR_WIDTH-1:0] ad_addr_q; logic [XLEN-1:0] ad_wdata_q; logic [XLEN_BYTES-1:0] ad_wmask_q;
         logic ad_resp_pend_q; logic [XLEN-1:0] ad_resp_data_q; logic [MEMORY_ADDR_WIDTH-1:0] ad_resp_addr_q;
         wire present_dmem  = d_req_v && !d_dev;
@@ -115,11 +116,14 @@ module top
             if (!rst_l) begin ad_busy_q<=1'b0; ad_resp_pend_q<=1'b0; end
             else begin
                 if (ad_launch_fire) begin
-                    ad_busy_q<=1'b1; ad_is_load_q<=!d_req_w; ad_op_q<=map_dmem_op(d_req_op);
+                    ad_busy_q<=1'b1; ad_is_load_q<=!d_req_w; ad_is_sc_q<=(d_req_op==3'd4);
+                    ad_op_q<=map_dmem_op(d_req_op);
                     ad_addr_q<=d_req_a; ad_wdata_q<=d_req_wd; ad_wmask_q<=d_req_wm;
                 end else if (ad_done) ad_busy_q<=1'b0;
-                if (ad_done && ad_is_load_q) begin
-                    ad_resp_pend_q<=1'b1; ad_resp_data_q<=cresp_rd[g]; ad_resp_addr_q<=ad_addr_q;
+                // M4-S5b: a load OR a coherent SC returns a response (SC -> sc_ok as 0/1).
+                if (ad_done && (ad_is_load_q || ad_is_sc_q)) begin
+                    ad_resp_pend_q<=1'b1; ad_resp_addr_q<=ad_addr_q;
+                    ad_resp_data_q<= ad_is_sc_q ? (cresp_sc[g] ? '0 : XLEN'(1)) : cresp_rd[g];
                 end else if (ad_resp_pend_q) ad_resp_pend_q<=1'b0;
             end
         end

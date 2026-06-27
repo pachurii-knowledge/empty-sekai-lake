@@ -84,6 +84,10 @@ module load_store_queue
     // Byte offset of the in-order head load within the bus word, for
     // memory-mapped device read side effects (which 32-bit register is read).
     output logic [ADDR_SHIFT-1:0] head_load_off,
+    // M4-S5b: pulses the cycle the LSQ resolves a coherent SC (the agent's COP_SC
+    // sc_ok arrived + rd written). The commit unit holds the SC at the ROB head
+    // until this fires, then retires it. Constant 0 when COHERENT=0.
+    output logic                 sc_commit_done,
     output writeback_packet_t    load_writeback
 );
 
@@ -128,6 +132,7 @@ module load_store_queue
     localparam logic [2:0] DMEM_OP_STORE  = 3'd1;
     localparam logic [2:0] DMEM_OP_LR     = 3'd2;
     localparam logic [2:0] DMEM_OP_AMO_RD = 3'd3;
+    localparam logic [2:0] DMEM_OP_SC     = 3'd4;   // M4-S5b: agent-authoritative SC (COP_SC)
 
     // M3d Stage 3: coherence line = 64 B (the fixed PIPT line). LINE_OFF_W = the word-offset
     // bits within a line, so [MEMORY_ADDR_WIDTH-1:LINE_OFF_W] of a word address is its line.
@@ -193,11 +198,14 @@ module load_store_queue
     // commits this cycle (drives the data port + the second-beat schedule).
     logic [$clog2(MEM_Q_SIZE)-1:0] head_after_retire;
     logic                          store_commit_fires;
-    // M4 B9 (COHERENT only): computed in block HD at the SC's commit cycle,
-    // read in block M to suppress the store beat of a failed SC. Constant 0
-    // when COHERENT=0 (the head-decision arm never sets them).
-    logic                          sc_committing;
-    logic                          sc_commit_success;
+    // M4-S5b (COHERENT only): agent-authoritative SC. The SC defers to commit, then
+    // issues a COP_SC (atomic check-and-store at the agent) and awaits the agent's
+    // sc_ok; rd is written from that response. sc_issue (block HD) drives the COP_SC
+    // data beat in block M; sc_inflight_q tracks the outstanding COP_SC; sc_commit_done
+    // (to the commit unit) releases the SC's ROB retire once the agent has answered.
+    // All inert when COHERENT=0.
+    logic                          sc_issue;
+    logic                          sc_inflight_q, sc_inflight_next;
     // HD local: post-squash validity per slot (head-skip input, no wakeup).
     logic [MEM_Q_SIZE-1:0]         sq_valid;
     // HD locals: AMO result byte-split (low into head_delta, high unused).
@@ -329,8 +337,9 @@ module load_store_queue
         reservation_pa_mid = reservation_pa_q;
         head_retire = 1'b0;
         head_done = 1'b0;
-        sc_committing = 1'b0;
-        sc_commit_success = 1'b0;
+        sc_issue = 1'b0;
+        sc_commit_done = 1'b0;
+        sc_inflight_next = sc_inflight_q;
         amo_store_data = '0;
         amo_store_mask = '0;
         amo_split_hi_data = '0;
@@ -516,37 +525,48 @@ module load_store_queue
             end
         end
 
-        // M4 B9 (COHERENT only): SC commit-resolve. The provisional head op above
-        // parked the SC at the head (issued_load=1) with no rd. When the commit unit
-        // commits it (commit_store for this active_id), decide success from the
-        // reservation AS OF this cycle -- folding in every remote snoop-kill that
-        // landed in [head, commit] (each was registered into reservation_valid_q by
-        // the kill at lines ~847-850 below) plus a same-cycle kill (the snoop term).
-        // Drive the real rd writeback here (has_dest restored => wakeup + phys-write
-        // fire); block M suppresses the store beat on failure. The reservation is
-        // computed from registered state + module inputs only, so this stays in the
-        // HD cone (no wakeup<->load_writeback loop). Constant-folds away when COHERENT=0.
-        if (COHERENT && !head_done && !double_store_pending_q && headq.entry.valid &&
-                headq.issued_load &&
-                (headq.entry.ctrl.exec_class == EXEC_AMO) &&
-                (headq.entry.ctrl.amo_op == AMO_SC) &&
-                commit_store && (commit_store_id == headq.entry.active_id)) begin
-            sc_committing = 1'b1;
-            sc_commit_success = reservation_valid_q &&
-                (reservation_addr_q == headq.addr) &&
-                !(snoop_kill_valid &&
-                  (reservation_pa_q[MEMORY_ADDR_WIDTH-1:LINE_OFF_W] ==
-                   snoop_kill_laddr[MEMORY_ADDR_WIDTH-1:LINE_OFF_W]));
+        // M4-S5b (COHERENT only): agent-authoritative SC at the commit point. The
+        // provisional head op above parked the SC at the head (issued_load=1) with no
+        // rd. Two phases, both driven off registered state + module inputs only (the
+        // HD cone -- no wakeup<->load_writeback loop):
+        //  (1) ISSUE: when the commit unit signals this SC (commit_store + matching
+        //      active_id) and no COP_SC is outstanding, issue a COP_SC on the data
+        //      port (driven in block M) -- the agent does the reservation
+        //      check-and-store ATOMICALLY at the directory serialization point. Mark
+        //      mem_inflight + sc_inflight so the response is awaited (single-outstanding).
+        //  (2) COMPLETE: when the agent's response arrives (data_load carries the
+        //      formatted rd: 0=success / 1=fail), write rd, retire the SC from the LSQ,
+        //      and pulse sc_commit_done so the commit unit retires it from the ROB.
+        // Correct under tight SMP contention (unlike an LSQ-local re-check): the
+        // success decision and the store are one atomic agent action ordered by the
+        // directory, so exactly one contender wins. Constant-folds when COHERENT=0.
+        if (COHERENT && sc_inflight_q && data_load_valid) begin
+            // (2) COMPLETE
             head_done = 1'b1;
             load_writeback.valid = 1'b1;
             load_writeback.active_id = headq.entry.active_id;
             load_writeback.prd = headq.entry.prd;
             load_writeback.has_dest = headq.entry.has_dest;
-            // The SC is the non-speculative ROB head at commit (all older branches
-            // resolved), so force branch_mask 0 -- guarantees the writeback bus
-            // abort gate can never drop this wakeup and strand the dependent op.
-            load_writeback.branch_mask = '0;
-            load_writeback.data = sc_commit_success ? '0 : XLEN'(1);
+            load_writeback.branch_mask = '0;   // SC is the non-speculative ROB head
+            load_writeback.data = data_load;   // agent sc_ok, formatted to 0/1 by the adapter
+            head_delta.zero = 1'b1;
+            head_retire = 1'b1;
+            reservation_valid_mid = 1'b0;      // RVWMO: SC clears the reservation either way
+            sc_inflight_next = 1'b0;
+            sc_commit_done = 1'b1;
+        end else if (COHERENT && !sc_inflight_q && !head_done && !double_store_pending_q &&
+                headq.entry.valid && headq.issued_load &&
+                (headq.entry.ctrl.exec_class == EXEC_AMO) &&
+                (headq.entry.ctrl.amo_op == AMO_SC) &&
+                commit_store && (commit_store_id == headq.entry.active_id) &&
+                !mem_inflight_q && dmem_req_ready) begin
+            // (1) ISSUE the COP_SC. Block M drives the data port (a write at the
+            // captured PA tagged DMEM_OP_SC); here we reserve the single outstanding
+            // slot and wait for the agent's verdict.
+            head_done = 1'b1;
+            sc_issue = 1'b1;
+            mem_inflight_next = 1'b1;
+            sc_inflight_next = 1'b1;
         end
 
         // Load issue: reads/conditions from the REGISTERED head snapshot (headq)
@@ -913,10 +933,16 @@ module load_store_queue
         // entries_premerge (post squash/wakeup/head_delta) so a same-cycle squash is
         // honored; the DATA reads the REGISTERED entries_q (value-equivalent for a
         // committing store, and shallow).
+        // M4-S5b: a coherent SC is NOT a plain committed store -- it is resolved by the
+        // COP_SC issue/complete path (block HD + the sc_issue data beat below), so it
+        // must never fire the unconditional store-commit write. Exclude it here.
         store_commit_fires = !double_store_pending_q && commit_store &&
             entries_premerge[head_after_retire].entry.valid &&
             entries_premerge[head_after_retire].entry.ctrl.memWrite &&
-            (entries_premerge[head_after_retire].entry.active_id == commit_store_id);
+            (entries_premerge[head_after_retire].entry.active_id == commit_store_id) &&
+            !(COHERENT &&
+              (entries_premerge[head_after_retire].entry.ctrl.exec_class == EXEC_AMO) &&
+              (entries_premerge[head_after_retire].entry.ctrl.amo_op == AMO_SC));
 
         if (store_commit_fires) begin
             // Second (high) beat of a two-beat store: queue a fire-and-forget write
@@ -969,12 +995,18 @@ module load_store_queue
             // the core port to use it directly (skip the head-VA translation).
             store_second_beat = 1'b1;
             dmem_req_op = DMEM_OP_STORE;
-        end else if (store_commit_fires && !(sc_committing && !sc_commit_success)) begin
+        end else if (sc_issue) begin
+            // M4-S5b: coherent SC -- drive the conditional store beat (COP_SC) at the
+            // captured PA. The agent does the atomic check-and-store and returns sc_ok
+            // (awaited via mem_inflight, like a load). Same captured-PA / store_second_beat
+            // shape as a committed store, but tagged DMEM_OP_SC.
+            data_addr = entries_q[head_after_retire].store_lo_pa[XLEN-1:ADDR_SHIFT];
+            data_store = entries_q[head_after_retire].store_data;
+            data_store_mask = entries_q[head_after_retire].store_mask;
+            store_second_beat = 1'b1;
+            dmem_req_op = DMEM_OP_SC;
+        end else if (store_commit_fires) begin
             // First (low) beat: written at the captured physical address.
-            // M4 B9: a FAILED coherent SC (sc_committing && !sc_commit_success) still
-            // runs the store_commit_fires bookkeeping (entry-zero, head advance,
-            // reservation clear below) so it retires, but its memory write beat is
-            // suppressed here -- a lost SC writes neither memory nor a success rd.
             data_addr = entries_q[head_after_retire].store_lo_pa[XLEN-1:ADDR_SHIFT];
             data_store = entries_q[head_after_retire].store_data;
             data_store_mask = entries_q[head_after_retire].store_mask;
@@ -1258,6 +1290,7 @@ module load_store_queue
             store_probe_hi_q <= 1'b0;
             mem_inflight_q <= 1'b0;
             mem_inflight_kill_q <= 1'b0;
+            sc_inflight_q <= 1'b0;
             xlate_pa_q <= '0;
             xlate_fault_q <= 1'b0;
             xlate_stall_q <= 1'b0;
@@ -1282,6 +1315,7 @@ module load_store_queue
             store_probe_hi_q <= store_probe_hi_next;
             mem_inflight_q <= mem_inflight_next;
             mem_inflight_kill_q <= mem_inflight_kill_next;
+            sc_inflight_q <= sc_inflight_next;
             // Register this cycle's head translation (combinational from the core's
             // DTLB+DataPMP on mem_req_vaddr) + the (head_q, store_probe_hi_q,
             // mem_req_valid) tag identifying which head request it is for. Consumed
