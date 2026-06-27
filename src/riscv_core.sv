@@ -20,7 +20,8 @@ module riscv_core
     import RISCV_ISA::XLEN, RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
 #(
-    parameter logic [XLEN-1:0] HART_ID = '0   // M4: per-core mhartid (OoO build; default 0 = single core)
+    parameter logic [XLEN-1:0] HART_ID = '0,  // M4: per-core mhartid (OoO build; default 0 = single core)
+    parameter bit              COHERENT = 1'b0 // M4 B9: SC resolves rd at commit (multi-core); default 0 = single-core verbatim
 )
 `ifdef OOO_4WIDE
 (
@@ -62,7 +63,7 @@ module riscv_core
     output logic             halted
 );
 
-    riscv_core_ooo #(.HART_ID(HART_ID)) OoOCore (
+    riscv_core_ooo #(.HART_ID(HART_ID), .COHERENT(COHERENT)) OoOCore (
         .clk,
         .rst_l,
         .ifetch_req_valid,

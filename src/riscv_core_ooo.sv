@@ -23,7 +23,8 @@ module riscv_core_ooo
     import RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_READ_WIDTH, RISCV_UArch::MEMORY_ADDR_WIDTH;
 #(
-    parameter logic [XLEN-1:0] HART_ID = '0   // M4: per-core mhartid (default 0 = single core; XLEN via OOO_Types)
+    parameter logic [XLEN-1:0] HART_ID = '0,  // M4: per-core mhartid (default 0 = single core; XLEN via OOO_Types)
+    parameter bit              COHERENT = 1'b0 // M4 B9: SC resolves rd at commit (multi-core); default 0 = single-core verbatim
 )
 (
     input wire logic             clk, rst_l,
@@ -1373,7 +1374,7 @@ module riscv_core_ooo
         .writeback(fp_writeback)
     );
 
-    load_store_queue LoadStoreQueue (
+    load_store_queue #(.COHERENT(COHERENT)) LoadStoreQueue (
         .clk,
         .rst_l,
         .insert_valid(mem_insert_valid),

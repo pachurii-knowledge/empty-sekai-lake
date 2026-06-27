@@ -55,7 +55,7 @@ module top
     logic                          ifetch_inval, dmem_req_device, dcache_flush_req, dcache_flush_done;
     logic                          hpm_l1i_miss, hpm_l1d_miss, hpm_l1d_wb, halted;
 
-    riscv_core Core0 (
+    riscv_core #(.COHERENT(1'b1)) Core0 (
         .clk, .rst_l,
         .ifetch_req_valid, .ifetch_req_ready, .ifetch_req_addr,
         .ifetch_resp_valid, .ifetch_resp_data, .ifetch_resp_excpt,

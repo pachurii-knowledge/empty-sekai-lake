@@ -7,6 +7,13 @@ module load_store_queue
     import OOO_Types::*;
     import RISCV_ISA::XLEN_BYTES;
     import RISCV_UArch::MEMORY_ADDR_WIDTH;
+#(
+    // M4 B9: in a coherent (multi-core) build the SC defers its success/fail
+    // decision and rd writeback to the commit-store cycle, re-checking the
+    // (snoop-killed) reservation there. Default 0 => single-core builds elaborate
+    // the verbatim head-decision path, so the netlist is bit-identical.
+    parameter bit COHERENT = 1'b0
+)
 (
     input wire logic                 clk,
     input wire logic                 rst_l,
@@ -186,6 +193,11 @@ module load_store_queue
     // commits this cycle (drives the data port + the second-beat schedule).
     logic [$clog2(MEM_Q_SIZE)-1:0] head_after_retire;
     logic                          store_commit_fires;
+    // M4 B9 (COHERENT only): computed in block HD at the SC's commit cycle,
+    // read in block M to suppress the store beat of a failed SC. Constant 0
+    // when COHERENT=0 (the head-decision arm never sets them).
+    logic                          sc_committing;
+    logic                          sc_commit_success;
     // HD local: post-squash validity per slot (head-skip input, no wakeup).
     logic [MEM_Q_SIZE-1:0]         sq_valid;
     // HD locals: AMO result byte-split (low into head_delta, high unused).
@@ -317,6 +329,8 @@ module load_store_queue
         reservation_pa_mid = reservation_pa_q;
         head_retire = 1'b0;
         head_done = 1'b0;
+        sc_committing = 1'b0;
+        sc_commit_success = 1'b0;
         amo_store_data = '0;
         amo_store_mask = '0;
         amo_split_hi_data = '0;
@@ -461,24 +475,78 @@ module load_store_queue
                 headq.entry.src2_ready &&
                 !headq.issued_load) begin
             head_done = 1'b1;
-            load_writeback.valid = 1'b1;
-            load_writeback.active_id = headq.entry.active_id;
-            load_writeback.prd = headq.entry.prd;
-            load_writeback.has_dest = headq.entry.has_dest;
-            load_writeback.branch_mask = headq.entry.branch_mask;
-            load_writeback.data = (reservation_valid_q &&
-                (reservation_addr_q == headq.addr)) ? '0 : XLEN'(1);
-            if (load_writeback.data == '0) begin
-                // SC succeeds: capture its PA for the commit write-back.
+            if (!COHERENT) begin
+                // Single-core: the SC decides success/fail and writes rd here, at
+                // the head (the verbatim pre-B9 path). Bit-identical when COHERENT=0.
+                load_writeback.valid = 1'b1;
+                load_writeback.active_id = headq.entry.active_id;
+                load_writeback.prd = headq.entry.prd;
+                load_writeback.has_dest = headq.entry.has_dest;
+                load_writeback.branch_mask = headq.entry.branch_mask;
+                load_writeback.data = (reservation_valid_q &&
+                    (reservation_addr_q == headq.addr)) ? '0 : XLEN'(1);
+                if (load_writeback.data == '0) begin
+                    // SC succeeds: capture its PA for the commit write-back.
+                    head_delta.we_store_lo_pa = 1'b1;
+                    head_delta.store_lo_pa = xlate_pa_q;
+                    head_delta.we_issued_load = 1'b1;
+                    head_delta.issued_load = 1'b1;
+                    reservation_valid_mid = 1'b0;
+                end else begin
+                    head_delta.zero = 1'b1;
+                    head_retire = 1'b1;
+                end
+            end else begin
+                // M4 B9 (coherent): DEFER the decision. Mark the SC ROB-done with a
+                // completion-only writeback (has_dest=0 => no rd, no wakeup, no
+                // phys-write, so the dependent op sleeps until commit), capture the
+                // PA, and PARK the SC at the head (issued_load=1) WITHOUT clearing
+                // the reservation and WITHOUT retiring. Both would-succeed and
+                // would-fail park; the success/fail decision + rd are taken at the
+                // commit-store cycle (commit-resolve block below), so a remote
+                // snoop-kill anywhere in [head, commit] forces the SC to fail.
+                load_writeback.valid = 1'b1;
+                load_writeback.active_id = headq.entry.active_id;
+                load_writeback.branch_mask = headq.entry.branch_mask;
+                load_writeback.has_dest = 1'b0;
                 head_delta.we_store_lo_pa = 1'b1;
                 head_delta.store_lo_pa = xlate_pa_q;
                 head_delta.we_issued_load = 1'b1;
                 head_delta.issued_load = 1'b1;
-                reservation_valid_mid = 1'b0;
-            end else begin
-                head_delta.zero = 1'b1;
-                head_retire = 1'b1;
             end
+        end
+
+        // M4 B9 (COHERENT only): SC commit-resolve. The provisional head op above
+        // parked the SC at the head (issued_load=1) with no rd. When the commit unit
+        // commits it (commit_store for this active_id), decide success from the
+        // reservation AS OF this cycle -- folding in every remote snoop-kill that
+        // landed in [head, commit] (each was registered into reservation_valid_q by
+        // the kill at lines ~847-850 below) plus a same-cycle kill (the snoop term).
+        // Drive the real rd writeback here (has_dest restored => wakeup + phys-write
+        // fire); block M suppresses the store beat on failure. The reservation is
+        // computed from registered state + module inputs only, so this stays in the
+        // HD cone (no wakeup<->load_writeback loop). Constant-folds away when COHERENT=0.
+        if (COHERENT && !head_done && !double_store_pending_q && headq.entry.valid &&
+                headq.issued_load &&
+                (headq.entry.ctrl.exec_class == EXEC_AMO) &&
+                (headq.entry.ctrl.amo_op == AMO_SC) &&
+                commit_store && (commit_store_id == headq.entry.active_id)) begin
+            sc_committing = 1'b1;
+            sc_commit_success = reservation_valid_q &&
+                (reservation_addr_q == headq.addr) &&
+                !(snoop_kill_valid &&
+                  (reservation_pa_q[MEMORY_ADDR_WIDTH-1:LINE_OFF_W] ==
+                   snoop_kill_laddr[MEMORY_ADDR_WIDTH-1:LINE_OFF_W]));
+            head_done = 1'b1;
+            load_writeback.valid = 1'b1;
+            load_writeback.active_id = headq.entry.active_id;
+            load_writeback.prd = headq.entry.prd;
+            load_writeback.has_dest = headq.entry.has_dest;
+            // The SC is the non-speculative ROB head at commit (all older branches
+            // resolved), so force branch_mask 0 -- guarantees the writeback bus
+            // abort gate can never drop this wakeup and strand the dependent op.
+            load_writeback.branch_mask = '0;
+            load_writeback.data = sc_commit_success ? '0 : XLEN'(1);
         end
 
         // Load issue: reads/conditions from the REGISTERED head snapshot (headq)
@@ -901,8 +969,12 @@ module load_store_queue
             // the core port to use it directly (skip the head-VA translation).
             store_second_beat = 1'b1;
             dmem_req_op = DMEM_OP_STORE;
-        end else if (store_commit_fires) begin
+        end else if (store_commit_fires && !(sc_committing && !sc_commit_success)) begin
             // First (low) beat: written at the captured physical address.
+            // M4 B9: a FAILED coherent SC (sc_committing && !sc_commit_success) still
+            // runs the store_commit_fires bookkeeping (entry-zero, head advance,
+            // reservation clear below) so it retires, but its memory write beat is
+            // suppressed here -- a lost SC writes neither memory nor a success rd.
             data_addr = entries_q[head_after_retire].store_lo_pa[XLEN-1:ADDR_SHIFT];
             data_store = entries_q[head_after_retire].store_data;
             data_store_mask = entries_q[head_after_retire].store_mask;

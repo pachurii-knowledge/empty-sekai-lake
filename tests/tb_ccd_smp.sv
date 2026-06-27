@@ -75,7 +75,7 @@ module top
         logic                          pt_req, pt_we; logic [MEMORY_ADDR_WIDTH-1:0] pt_aw; logic [XLEN-1:0] pt_wd;
         logic                          if_inval, d_dev, dcflush_req, halted_c;
 
-        riscv_core #(.HART_ID(g[XLEN-1:0])) Core (
+        riscv_core #(.HART_ID(g[XLEN-1:0]), .COHERENT(1'b1)) Core (
             .clk, .rst_l,
             .ifetch_req_valid(if_req_v), .ifetch_req_ready(if_req_r), .ifetch_req_addr(if_req_a),
             .ifetch_resp_valid(if_resp_v), .ifetch_resp_data(if_resp_d), .ifetch_resp_excpt(if_resp_e),
