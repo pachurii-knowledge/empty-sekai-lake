@@ -85,6 +85,27 @@ module riscv_core_ooo
     input wire logic             hpm_l1i_miss,
     input wire logic             hpm_l1d_miss,
     input wire logic             hpm_l1d_wb,
+`ifdef NIIGO_EXT_DEVICES
+    // M4 SMP: the per-core CLINT/PLIC/UART are lifted to ONE shared instance at
+    // the SMP top. This core EXPORTS its committed-store snoop + device-load
+    // query and IMPORTS the shared device's load result, mtime, and the four
+    // per-hart interrupt lines. (NIIGO_EXT_DEVICES is set only by the SMP build
+    // targets; the default build never sees these ports or the external arm.)
+    output logic             dsnoop_store_en,
+    output logic [MEMORY_ADDR_WIDTH-1:0] dsnoop_store_waddr,
+    output logic [XLEN-1:0]  dsnoop_store_wdata,
+    output logic [XLEN_BYTES-1:0] dsnoop_store_mask,
+    output logic [MEMORY_ADDR_WIDTH-1:0] dsnoop_load_addr,
+    output logic             dsnoop_load_en,
+    output logic [$clog2(XLEN_BYTES)-1:0] dsnoop_load_off,
+    input  wire logic        ext_load_hit,
+    input  wire logic [XLEN-1:0] ext_load_data,
+    input  wire logic [63:0] ext_mtime,
+    input  wire logic        ext_irq_m_timer,
+    input  wire logic        ext_irq_m_software,
+    input  wire logic        ext_irq_m_external,
+    input  wire logic        ext_irq_s_external,
+`endif
 
     output logic             halted
 `ifdef FPGA_BUILD
@@ -674,6 +695,32 @@ module riscv_core_ooo
     logic unused_flush_done;
     assign unused_flush_done = dcache_flush_done;
 
+    // ============================ Device bus ============================
+    // By default each core owns private CLINT/PLIC/UART instances. With
+    // NIIGO_EXT_DEVICES (M4 SMP) they are lifted to ONE shared instance at the
+    // SMP top: this core exports its snoop/load-query ports and imports the
+    // shared device result/mtime/IRQs. The external result rides the clint_*
+    // carriers so the data_load mux and the priv_csr_file wiring are unchanged.
+`ifdef NIIGO_EXT_DEVICES
+    assign dsnoop_store_en    = dmem_store_fire;
+    assign dsnoop_store_waddr = dmem_req_addr;
+    assign dsnoop_store_wdata = dmem_req_wdata;
+    assign dsnoop_store_mask  = dmem_req_wmask;
+    assign dsnoop_load_addr   = dmem_resp_addr;
+    assign dsnoop_load_en     = dmem_resp_valid;
+    assign dsnoop_load_off    = dev_load_off;
+    // Shared-device load result rides the clint_* carrier (plic/uart unused here).
+    assign clint_load_hit  = ext_load_hit;
+    assign clint_load_data = ext_load_data;
+    assign plic_load_hit   = 1'b0;  assign plic_load_data = '0;
+    assign uart_load_hit   = 1'b0;  assign uart_load_data = '0;
+    assign uart_irq        = 1'b0;
+    assign clint_mtime     = ext_mtime;
+    assign irq_mtimer      = ext_irq_m_timer;
+    assign irq_msoft       = ext_irq_m_software;
+    assign plic_m_ext      = ext_irq_m_external;
+    assign plic_s_ext      = ext_irq_s_external;
+`else
     // Minimal CLINT: snoops committed stores for mtimecmp / msip.
     clint Clint (
         .clk,
@@ -741,6 +788,7 @@ module riscv_core_ooo
         .vuart_rx_valid, .vuart_rx_byte, .vuart_rx_pop
 `endif
     );
+`endif
 
     // ===================== Sv32 MMU (Phase 4) =====================
     // satp / mstatus-derived translation context. Identical to the scalar core.

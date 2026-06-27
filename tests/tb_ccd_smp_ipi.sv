@@ -1,14 +1,12 @@
-// tb_ccd_smp.sv -- M4 S4: the real multi-core SMP harness. NCORE real riscv_core_ooo cores (each with a
-// distinct mhartid via #(.HART_ID(g))) share the grant-and-go MOESI directory (niigo_ccd_gg_direct
-// #(.NACTIVE(NCORE))). Every core runs the SAME litmus (litmus_smp_lock.S, hand-loaded at the reset vector)
-// and self-differentiates on mhartid. They contend for an LR/SC spinlock guarding a shared counter; the
-// final counter == NCORE*ITERS iff mutual exclusion holds (cache coherence + the LR/SC reservation
-// coherence-kill, M3d Stage 3, working under REAL two-core contention).
-//
-// Per core: a self-contained behavioural ifetch (shared read-only IMEM), the core's dmem rerouted through a
-// REPLICATED launch adapter (copy of the niigo_memsys CCD arm) into c_req[g], PTW tied off (bare M-mode),
-// and the CCD's per-agent snoop_kill[g] wired into core[g]'s LSQ (M4 S1 array). Built like tb_ccd_stage3
-// (module `top`, full OoO core; testbench.sv excluded). Build/run: make ccd-smp-test
+// tb_ccd_smp_ipi.sv -- M4 S6b: cross-hart IPI through the ONE shared CLINT, end
+// to end through TWO real riscv_core_ooo cores. Same SMP skeleton as tb_ccd_smp
+// (NCORE real cores over niigo_ccd_gg_direct, behavioural ifetch from a shared
+// IMEM, replicated launch adapter), but the per-core CLINT/PLIC are lifted to
+// ONE shared instance (NIIGO_EXT_DEVICES). Both cores run litmus_smp_ipi.S:
+// hart 0 stores msip[1]=1 (an IPI); hart 1 spins with M-software interrupts
+// enabled, takes the trap, and the handler writes SENTINEL[1]=1 to RAM. The
+// device store (CLINT) bypasses the CCD; the SENTINEL store is cacheable and
+// flows through the directory. Build/run: make ccd-smp-ipi-test
 `include "niigo_mem.vh"
 `include "niigo_cmi.vh"
 `include "niigo_ccd_m1.vh"
@@ -22,11 +20,10 @@ module top
     import MemorySegments::USER_TEXT_START;
 ;
     localparam int NCORE      = 2;
-    localparam int ITERS      = 3;        // per-core protected increments (must match the litmus)
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
     logic clk=0, rst_l=0;
     always #5 clk=~clk;
-    // register_file.sv's print_cpu_state XMR ($root.top.cycle_count/.pc); never called here.
+    // register_file.sv's print_cpu_state XMR ($root.top.cycle_count/.pc); unused here.
     int              cycle_count = 0;
     logic [XLEN-1:0] pc = '0;
     always_ff @(posedge clk) cycle_count <= cycle_count + 1;
@@ -58,29 +55,22 @@ module top
                         default: map_dmem_op=COP_LOAD; endcase
     endfunction
 
-    // ===== M4 S6b: ONE shared CLINT + PLIC for all cores (device hole bypasses
-    // the CCD directory). Each core EXPORTS its committed-store snoop + per-port
-    // device-load query (NIIGO_EXT_DEVICES) into the hub; the hub returns the
-    // device load result, mtime, and the per-hart interrupt lines. =====
+    // ===== M4 S6b: ONE shared CLINT + PLIC (device hole bypasses the CCD) =====
     localparam int NCTX = 2*NCORE;
-    logic                          ds_en [NCORE];           // per-core device store snoop
+    logic                          ds_en [NCORE];
     logic [MEMORY_ADDR_WIDTH-1:0]  ds_wa [NCORE];
     logic [XLEN-1:0]               ds_wd [NCORE];
     logic [XLEN_BYTES-1:0]         ds_wm [NCORE];
-    logic [MEMORY_ADDR_WIDTH-1:0]  dl_a  [NCORE];           // per-core device load query
+    logic [MEMORY_ADDR_WIDTH-1:0]  dl_a  [NCORE];
     logic                          dl_en [NCORE];
     logic [ADDR_SHIFT-1:0]         dl_off[NCORE];
-    logic                          ext_hit [NCORE];         // device load result -> core
-    logic [XLEN-1:0]               ext_dat [NCORE];
-    // packed load buses + per-port device results
+    logic                          ext_hit [NCORE]; logic [XLEN-1:0] ext_dat [NCORE];
     logic [NCORE*MEMORY_ADDR_WIDTH-1:0] dl_a_p;
     logic [NCORE-1:0]                   dl_en_p;
     logic [NCORE*ADDR_SHIFT-1:0]        dl_off_p;
     logic [NCORE-1:0]                   cl_hit_p, pl_hit_p, cl_mtip, cl_msip, pl_mext, pl_sext;
     logic [NCORE*XLEN-1:0]              cl_data_p, pl_data_p;
     logic [63:0]                        cl_mtime;
-    // single arbitrated device store port (priority mux; device stores are rare,
-    // a simultaneous cross-core device store is flagged -- it never happens here).
     logic                          dev_st_en;
     logic [MEMORY_ADDR_WIDTH-1:0]  dev_st_wa;
     logic [XLEN-1:0]               dev_st_wd;
@@ -116,9 +106,9 @@ module top
             .ptw_mem_req(pt_req), .ptw_mem_we(pt_we), .ptw_mem_addr_w(pt_aw), .ptw_mem_wdata(pt_wd),
             .ptw_mem_ack(1'b0), .ptw_mem_rdata('0),
             .ifetch_inval(if_inval), .dmem_req_device(d_dev),
-            .dcache_flush_req(dcflush_req), .dcache_flush_done(dcflush_req),  // self-complete (no flush in litmus)
+            .dcache_flush_req(dcflush_req), .dcache_flush_done(dcflush_req),
             .hpm_l1i_miss(1'b0), .hpm_l1d_miss(1'b0), .hpm_l1d_wb(1'b0),
-            // M4 S6b: shared-device interface (NIIGO_EXT_DEVICES) into the hub.
+            // M4 S6b shared-device interface into the hub.
             .dsnoop_store_en(ds_en[g]), .dsnoop_store_waddr(ds_wa[g]),
             .dsnoop_store_wdata(ds_wd[g]), .dsnoop_store_mask(ds_wm[g]),
             .dsnoop_load_addr(dl_a[g]), .dsnoop_load_en(dl_en[g]), .dsnoop_load_off(dl_off[g]),
@@ -138,7 +128,7 @@ module top
         for (genvar w=0; w<MEMORY_READ_WIDTH; w++)
             assign if_resp_d[w] = IMEM[(if_a_q - TEXT_BASE_W) + w[MEMORY_ADDR_WIDTH-1:0]];
 
-        // replicated launch adapter (dmem <-> c_req[g]); device path unused (litmus is all-cacheable)
+        // replicated launch adapter (dmem <-> c_req[g]); device path bypasses CCD
         logic ad_busy_q, ad_is_load_q, ad_is_sc_q; l1_core_op_e ad_op_q;
         logic [MEMORY_ADDR_WIDTH-1:0] ad_addr_q; logic [XLEN-1:0] ad_wdata_q; logic [XLEN_BYTES-1:0] ad_wmask_q;
         logic ad_resp_pend_q; logic [XLEN-1:0] ad_resp_data_q; logic [MEMORY_ADDR_WIDTH-1:0] ad_resp_addr_q;
@@ -157,7 +147,6 @@ module top
                     ad_op_q<=map_dmem_op(d_req_op);
                     ad_addr_q<=d_req_a; ad_wdata_q<=d_req_wd; ad_wmask_q<=d_req_wm;
                 end else if (ad_done) ad_busy_q<=1'b0;
-                // M4-S5b: a load OR a coherent SC returns a response (SC -> sc_ok as 0/1).
                 if (ad_done && (ad_is_load_q || ad_is_sc_q)) begin
                     ad_resp_pend_q<=1'b1; ad_resp_addr_q<=ad_addr_q;
                     ad_resp_data_q<= ad_is_sc_q ? (cresp_sc[g] ? '0 : XLEN'(1)) : cresp_rd[g];
@@ -165,7 +154,6 @@ module top
             end
         end
         assign d_resp_v=ad_resp_pend_q; assign d_resp_a=ad_resp_addr_q; assign d_resp_d=ad_resp_data_q;
-        // sink the unused PTW/inval/flush outputs
         wire unused = pt_req|pt_we|(|pt_aw)|(|pt_wd)|if_inval|halted_c|d_dev|dcflush_req;
     end endgenerate
 
@@ -176,7 +164,6 @@ module top
             dev_st_en=1'b1; dev_st_wa=ds_wa[c]; dev_st_wd=ds_wd[c]; dev_st_wm=ds_wm[c];
         end
     end
-    // flag a dropped simultaneous device store (priority-mux limitation; 0 here).
     always_ff @(posedge clk) begin
         int n; n=0;
         for (int c=0;c<NCORE;c++) if (ds_en[c]) n++;
@@ -213,91 +200,89 @@ module top
             if (mreq.valid) begin
                 mresp.valid <= 1'b1;
                 mresp.rdata <= MEM.exists(mreq.waddr) ? MEM[mreq.waddr] : '0;
-                if (mreq.op==NMI_WR_LINE) MEM[mreq.waddr] = mreq.wdata;  // assoc array: blocking
+                if (mreq.op==NMI_WR_LINE) MEM[mreq.waddr] = mreq.wdata;
             end
         end
     end
 
-    // ===== counter readout: white-box from whichever agent owns the COUNTER line (M/O/E/S) =====
-    localparam logic [MEMORY_ADDR_WIDTH-1:0] COUNTER_W = MEMORY_ADDR_WIDTH'('h140 >> ADDR_SHIFT);
+    // ===== white-box SENTINEL[h] readout (RAM line owned by whichever agent) =====
     localparam int L1_IDX = $clog2(64);
-    localparam logic [L1_IDX-1:0]         CTR_SET  = COUNTER_W[LINE_WORD_BITS +: L1_IDX];
-    localparam logic [LINE_WORD_BITS-1:0] CTR_WOFF = COUNTER_W[LINE_WORD_BITS-1:0];
-    function automatic logic [XLEN-1:0] read_counter;
-        logic [XLEN-1:0] v; v = '0;
-        // the line lives in the last writer's cache; pick the owning (non-I) agent
-        if (CCD.G_AGENT[0].L1D.state_q[CTR_SET] != CMI_I)
-            v = CCD.G_AGENT[0].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
-        else if (CCD.G_AGENT[1].L1D.state_q[CTR_SET] != CMI_I)
-            v = CCD.G_AGENT[1].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
-        read_counter = v;
+    function automatic logic [XLEN-1:0] read_sentinel(input int h);
+        logic [MEMORY_ADDR_WIDTH-1:0] wa;
+        logic [L1_IDX-1:0]         st;
+        logic [LINE_WORD_BITS-1:0] woff;
+        logic [XLEN-1:0] v; v='0;
+        wa   = MEMORY_ADDR_WIDTH'((32'h200 + 32'(h)*4) >> ADDR_SHIFT);
+        st   = wa[LINE_WORD_BITS +: L1_IDX];
+        woff = wa[LINE_WORD_BITS-1:0];
+        if (CCD.G_AGENT[0].L1D.state_q[st] != CMI_I)
+            v = CCD.G_AGENT[0].L1D.data_q[st][woff*XLEN +: XLEN];
+        else if (CCD.G_AGENT[1].L1D.state_q[st] != CMI_I)
+            v = CCD.G_AGENT[1].L1D.data_q[st][woff*XLEN +: XLEN];
+        read_sentinel = v;
     endfunction
 
     int errors=0, timeout;
-    logic [XLEN-1:0] ctr;
+    logic saw_msip1 = 1'b0;          // latch: hart-1 msip was actually raised in the CLINT
+    always_ff @(posedge clk) if (cl_msip[1]) saw_msip1 <= 1'b1;
     task automatic chk(input bit ok, input string what);
         if (!ok) begin $display("  [FAIL] %s", what); errors++; end else $display("  [ ok ] %s", what);
     endtask
 
     initial begin
         for (int i=0;i<IMEM_WORDS;i++) IMEM[i]='0;
-        // litmus_smp_lock.S, assembled (rv32ima_zicsr). LOCK=0x100, COUNTER=0x140, DONE[h]=0x180+h*0x40.
-        IMEM[0]  = 32'hf1402473;  // csrr s0,mhartid
-        IMEM[1]  = 32'h10000293;  // li   t0,256       (LOCK)
-        IMEM[2]  = 32'h14000313;  // li   t1,320       (COUNTER)
-        IMEM[3]  = 32'h00300393;  // li   t2,3         (ITERS)
-        IMEM[4]  = 32'h02038863;  // beqz t2,done(+0x40)
-        IMEM[5]  = 32'h1002ae2f;  // acq: lr.w t3,(t0)
-        IMEM[6]  = 32'hfe0e1ee3;  // bnez t3,acq(-8)
-        IMEM[7]  = 32'h00100e93;  // li   t4,1
-        IMEM[8]  = 32'h19d2ae2f;  // sc.w t3,t4,(t0)
-        IMEM[9]  = 32'hfe0e18e3;  // bnez t3,acq(-0x10)
-        IMEM[10] = 32'h00032f03;  // lw   t5,0(t1)
-        IMEM[11] = 32'h001f0f13;  // addi t5,t5,1
-        IMEM[12] = 32'h01e32023;  // sw   t5,0(t1)
-        IMEM[13] = 32'h0002a023;  // sw   zero,0(t0)   (release)
-        IMEM[14] = 32'hfff38393;  // addi t2,t2,-1
-        IMEM[15] = 32'hfd5ff06f;  // j    loop(-0x30)
-        IMEM[16] = 32'h18000f93;  // done: li t6,384   (DONE base)
-        IMEM[17] = 32'h00641493;  // slli s1,s0,0x6
-        IMEM[18] = 32'h009f8fb3;  // add  t6,t6,s1
-        IMEM[19] = 32'h00100f13;  // li   t5,1
-        IMEM[20] = 32'h01efa023;  // sw   t5,0(t6)     (done flag)
-        IMEM[21] = 32'h0000006f;  // spin: j spin
+        // litmus_smp_ipi.S, assembled (rv32ima_zicsr). CLINT 0x0200_0000; SENTINEL 0x200.
+        IMEM[ 0] = 32'hf1402473;  // csrr s0,mhartid
+        IMEM[ 1] = 32'h00000297;  // auipc t0,0
+        IMEM[ 2] = 32'h03028293;  // addi t0,t0,48  -> handler
+        IMEM[ 3] = 32'h30529073;  // csrw mtvec,t0
+        IMEM[ 4] = 32'h00800293;  // li   t0,8
+        IMEM[ 5] = 32'h3042a073;  // csrs mie,t0     (MSIE)
+        IMEM[ 6] = 32'h3002a073;  // csrs mstatus,t0 (MIE)
+        IMEM[ 7] = 32'h00041a63;  // bnez s0,receiver
+        IMEM[ 8] = 32'h020002b7;  // lui  t0,0x2000  (CLINT)
+        IMEM[ 9] = 32'h00100313;  // li   t1,1
+        IMEM[10] = 32'h0062a223;  // sw   t1,4(t0)   (msip[1]=1 -> IPI hart1)
+        IMEM[11] = 32'h0000006f;  // spin0: j spin0
+        IMEM[12] = 32'h0000006f;  // receiver: j receiver
+        IMEM[13] = 32'hf1402473;  // handler: csrr s0,mhartid
+        IMEM[14] = 32'h00241493;  // slli s1,s0,2
+        IMEM[15] = 32'h20000393;  // li   t2,512     (SENTINEL)
+        IMEM[16] = 32'h009383b3;  // add  t2,t2,s1
+        IMEM[17] = 32'h00100e13;  // li   t3,1
+        IMEM[18] = 32'h01c3a023;  // sw   t3,0(t2)   (SENTINEL[hart]=1)
+        IMEM[19] = 32'h020002b7;  // lui  t0,0x2000
+        IMEM[20] = 32'h009282b3;  // add  t0,t0,s1
+        IMEM[21] = 32'h0002a023;  // sw   zero,0(t0) (msip[hart]=0)
+        IMEM[22] = 32'h0000006f;  // hspin: j hspin
         for (int c=0;c<NCORE;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wm[c]='1; end
         rst_l=0; repeat(8) @(posedge clk); rst_l=1;
 
-        $display("== M4 SMP spinlock: %0d real cores x %0d protected increments -> counter == %0d ==",
-                 NCORE, ITERS, NCORE*ITERS);
-        // both cores boot + contend through the LR/SC spinlock; the counter is deterministic
+        $display("== M4 S6b cross-hart IPI: hart0 -> msip[1] -> hart1 takes M-software trap ==");
+        // wait for hart 1 to take the IPI trap (SENTINEL[1] set by its handler)
         timeout=0;
-        do begin @(posedge clk); ctr=read_counter(); timeout++; end
-        while (ctr != XLEN'(NCORE*ITERS) && timeout < 60000);
-        ctr = read_counter();
+        do begin @(posedge clk); timeout++; end
+        while (read_sentinel(1) != XLEN'(1) && timeout < 20000);
+        // the handler clears its own msip a few instructions after SENTINEL;
+        // give that store time to commit before checking the deassert.
+        timeout=0;
+        while (cl_msip[1] && timeout < 2000) begin @(posedge clk); timeout++; end
 
-        // INFRASTRUCTURE checks (must hold): both real cores boot, run, and coherently share the line.
-        chk(ctr != 0, "two real cores booted + coherently shared the counter line");
-        chk(ctr <= XLEN'(NCORE*ITERS), "counter never exceeds NCORE*ITERS (no spurious increments)");
-
-        // CORRECTNESS diagnostic: mutual exclusion. Currently EXPOSES the B9 LR/SC commit-window race
-        // (the SC commits success even when a remote write kills the reservation between the SC's
-        // head-decision and its commit-store) -> some increments are lost. The fix is rd-at-commit
-        // (the commit-retire restructuring). Reported, not asserted, until that lands.
-        if (ctr == XLEN'(NCORE*ITERS))
-            $display("  [ ok ] MUTUAL EXCLUSION HELD: counter=%0d == %0d", ctr, NCORE*ITERS);
-        else
-            $display("  [DIAG] B9 LR/SC commit-window race: counter=%0d (expected %0d, %0d lost). "
-                   , ctr, NCORE*ITERS, NCORE*ITERS-ctr);
+        chk(saw_msip1,                     "CLINT raised hart-1 msip (the IPI landed in the shared device)");
+        chk(read_sentinel(1) == XLEN'(1),  "hart 1 took the M-software-interrupt trap (SENTINEL[1]=1)");
+        chk(read_sentinel(0) == XLEN'(0),  "hart 0 did NOT trap (SENTINEL[0]=0; it only sent the IPI)");
+        chk(cl_msip[1] == 1'b0,            "handler cleared its own msip (cl_msip[1] deasserted)");
+        chk(dev_st_drop == 0,              "no device-store arbitration drops");
 
         $display("");
-        if (errors==0) begin
-            $display("==== tb_ccd_smp: infra checks PASSED (2 real cores coherent);%s ====",
-                     (ctr==XLEN'(NCORE*ITERS)) ? " mutual exclusion HELD" : " B9 race DIAGNOSED (rd-at-commit pending)");
-        end else
-            $display("==== tb_ccd_smp: %0d INFRA CHECK(S) FAILED ====", errors);
+        if (errors==0)
+            $display("==== tb_ccd_smp_ipi: ALL CHECKS PASSED (cross-hart IPI through shared CLINT) ====");
+        else
+            $display("==== tb_ccd_smp_ipi: %0d CHECK(S) FAILED ====", errors);
         $finish;
     end
 
-    initial begin repeat(120000) @(posedge clk); $display("WATCHDOG TIMEOUT (counter=%0d)", read_counter()); $finish; end
+    initial begin repeat(60000) @(posedge clk);
+        $display("WATCHDOG TIMEOUT (SENTINEL[1]=%0d saw_msip1=%0d)", read_sentinel(1), saw_msip1); $finish; end
 endmodule
 `default_nettype wire

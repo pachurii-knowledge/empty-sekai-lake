@@ -128,10 +128,19 @@ ccd-stage3-test:
 ccd-smp-test:
 	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
 		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp \
-		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES \
 		$(VERILATOR_INC_FLAGS) \
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smp/Vtop
+
+# ---- M4-S6b cross-hart IPI: 2 real cores + ONE shared CLINT (NIIGO_EXT_DEVICES) ----
+ccd-smp-ipi-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp-ipi \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_ipi.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp-ipi/Vtop
 
 # ---- M4-S6a multi-hart shared CLINT/PLIC directed test (standalone; clint NUM_HARTS=4 + plic NCTX=8) ----
 clint-plic-smp-test:

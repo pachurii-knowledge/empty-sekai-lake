@@ -60,6 +60,23 @@ module riscv_core
     input wire logic             hpm_l1i_miss,
     input wire logic             hpm_l1d_miss,
     input wire logic             hpm_l1d_wb,
+`ifdef NIIGO_EXT_DEVICES
+    // M4 SMP: pass-through of the shared-device interface (see riscv_core_ooo).
+    output logic             dsnoop_store_en,
+    output logic [MEMORY_ADDR_WIDTH-1:0] dsnoop_store_waddr,
+    output logic [XLEN-1:0]  dsnoop_store_wdata,
+    output logic [XLEN_BYTES-1:0] dsnoop_store_mask,
+    output logic [MEMORY_ADDR_WIDTH-1:0] dsnoop_load_addr,
+    output logic             dsnoop_load_en,
+    output logic [$clog2(XLEN_BYTES)-1:0] dsnoop_load_off,
+    input  wire logic        ext_load_hit,
+    input  wire logic [XLEN-1:0] ext_load_data,
+    input  wire logic [63:0] ext_mtime,
+    input  wire logic        ext_irq_m_timer,
+    input  wire logic        ext_irq_m_software,
+    input  wire logic        ext_irq_m_external,
+    input  wire logic        ext_irq_s_external,
+`endif
     output logic             halted
 );
 
@@ -97,6 +114,12 @@ module riscv_core
         .hpm_l1i_miss,
         .hpm_l1d_miss,
         .hpm_l1d_wb,
+`ifdef NIIGO_EXT_DEVICES
+        .dsnoop_store_en, .dsnoop_store_waddr, .dsnoop_store_wdata, .dsnoop_store_mask,
+        .dsnoop_load_addr, .dsnoop_load_en, .dsnoop_load_off,
+        .ext_load_hit, .ext_load_data, .ext_mtime,
+        .ext_irq_m_timer, .ext_irq_m_software, .ext_irq_m_external, .ext_irq_s_external,
+`endif
         .halted
     );
 
