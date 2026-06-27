@@ -20,10 +20,18 @@ _start:
     csrs  mstatus, t0          # global M interrupt enable
     bnez  s0, receiver
 
-sender:                        # hart 0 -> IPI to hart 1
+sender:                        # hart 0 -> IPI to harts 1..3 (msip[h]); 2-core: 2,3 no-op
     li    t0, 0x02000000       # CLINT base
-    li    t1, 1
-    sw    t1, 4(t0)            # msip[1] = 1
+    li    t4, 1                # msip value
+    li    t1, 1                # h = 1
+    li    t2, 4                # limit (harts 1..3)
+sloop:
+    bge   t1, t2, spin0
+    slli  t3, t1, 2            # 4*h
+    add   t5, t0, t3
+    sw    t4, 0(t5)            # msip[h] = 1
+    addi  t1, t1, 1
+    j     sloop
 spin0:
     j     spin0
 

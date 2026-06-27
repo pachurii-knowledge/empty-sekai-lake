@@ -20,7 +20,11 @@ module top
     import NIIGO_CCD_M1::*;
     import MemorySegments::USER_TEXT_START;
 ;
+`ifdef NCORE4
+    localparam int NCORE      = 4;        // M4 #4: 4-core AMO scale-up
+`else
     localparam int NCORE      = 2;
+`endif
     localparam int ITERS      = 3;        // per-core atomic increments (must match the litmus)
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
     logic clk=0, rst_l=0;
@@ -161,6 +165,12 @@ module top
             v = CCD.G_AGENT[0].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
         else if (CCD.G_AGENT[1].L1D.state_q[CTR_SET] != CMI_I)
             v = CCD.G_AGENT[1].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
+`ifdef NCORE4
+        else if (CCD.G_AGENT[2].L1D.state_q[CTR_SET] != CMI_I)
+            v = CCD.G_AGENT[2].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
+        else if (CCD.G_AGENT[3].L1D.state_q[CTR_SET] != CMI_I)
+            v = CCD.G_AGENT[3].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
+`endif
         read_counter = v;
     endfunction
 

@@ -133,6 +133,15 @@ ccd-smp-test:
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smp/Vtop
 
+# ---- M4 #4: 4-core scale-up of the LR/SC spinlock (NCORE=4 -> counter == 4*ITERS) ----
+ccd-smp4-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp4 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DNCORE4 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp4/Vtop
+
 # ---- M4 #3 AMO atomicity: 2 real cores contend amoadd.w on a shared counter ----
 ccd-smp-amo-test:
 	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
@@ -142,6 +151,15 @@ ccd-smp-amo-test:
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_amo.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smp-amo/Vtop
 
+# ---- M4 #4: 4-core AMO atomicity scale-up (NCORE=4 -> counter == 4*ITERS) ----
+ccd-smp-amo4-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp-amo4 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNCORE4 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_amo.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp-amo4/Vtop
+
 # ---- M4-S6b cross-hart IPI: 2 real cores + ONE shared CLINT (NIIGO_EXT_DEVICES) ----
 ccd-smp-ipi-test:
 	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
@@ -150,6 +168,15 @@ ccd-smp-ipi-test:
 		$(VERILATOR_INC_FLAGS) \
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_ipi.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smp-ipi/Vtop
+
+# ---- M4 #4: 4-core IPI broadcast (hart 0 -> msip[1..3]; each receiver traps) ----
+ccd-smp-ipi4-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp-ipi4 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DNCORE4 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_ipi.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp-ipi4/Vtop
 
 # ---- M4-S6a multi-hart shared CLINT/PLIC directed test (standalone; clint NUM_HARTS=4 + plic NCTX=8) ----
 clint-plic-smp-test:

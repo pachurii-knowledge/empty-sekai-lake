@@ -19,7 +19,11 @@ module top
     import NIIGO_CCD_M1::*;
     import MemorySegments::USER_TEXT_START;
 ;
+`ifdef NCORE4
+    localparam int NCORE      = 4;        // M4 #4: hart 0 broadcasts an IPI to harts 1..3
+`else
     localparam int NCORE      = 2;
+`endif
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
     logic clk=0, rst_l=0;
     always #5 clk=~clk;
@@ -71,11 +75,20 @@ module top
     logic [NCORE-1:0]                   cl_hit_p, pl_hit_p, cl_mtip, cl_msip, pl_mext, pl_sext;
     logic [NCORE*XLEN-1:0]              cl_data_p, pl_data_p;
     logic [63:0]                        cl_mtime;
+    // non-dropping device-store hub: a FIFO buffers up to NCORE committed device
+    // stores per cycle and drains ONE to the single shared device store port per
+    // cycle, so no cross-core device store is ever lost (the priority-mux would
+    // drop simultaneous stores -- visible once 4 cores hammer msip).
     logic                          dev_st_en;
     logic [MEMORY_ADDR_WIDTH-1:0]  dev_st_wa;
     logic [XLEN-1:0]               dev_st_wd;
     logic [XLEN_BYTES-1:0]         dev_st_wm;
-    int                            dev_st_drop = 0;
+    localparam int DQ = 64;
+    logic [MEMORY_ADDR_WIDTH-1:0]  dq_wa [DQ];
+    logic [XLEN-1:0]               dq_wd [DQ];
+    logic [XLEN_BYTES-1:0]         dq_wm [DQ];
+    int                            dq_head = 0, dq_tail = 0;
+    int                            dst_drop = 0;   // FIFO overflow (should stay 0)
 
     // ===== per-core: real core + behavioural ifetch + replicated launch adapter =====
     genvar g;
@@ -157,17 +170,28 @@ module top
         wire unused = pt_req|pt_we|(|pt_aw)|(|pt_wd)|if_inval|halted_c|d_dev|dcflush_req;
     end endgenerate
 
-    // ===== shared-device hub: store arbiter, load-query packing, instances =====
+    // ===== shared-device hub: non-dropping store FIFO, load-query packing, instances =====
+    // drain the FIFO head to the device store port (one store/cycle).
+    wire dq_empty = (dq_head == dq_tail);
     always_comb begin
-        dev_st_en=1'b0; dev_st_wa='0; dev_st_wd='0; dev_st_wm='0;
-        for (int c=0;c<NCORE;c++) if (ds_en[c] && !dev_st_en) begin
-            dev_st_en=1'b1; dev_st_wa=ds_wa[c]; dev_st_wd=ds_wd[c]; dev_st_wm=ds_wm[c];
-        end
+        dev_st_en = !dq_empty;
+        dev_st_wa = dq_wa[dq_head % DQ];
+        dev_st_wd = dq_wd[dq_head % DQ];
+        dev_st_wm = dq_wm[dq_head % DQ];
     end
-    always_ff @(posedge clk) begin
-        int n; n=0;
-        for (int c=0;c<NCORE;c++) if (ds_en[c]) n++;
-        if (n>1) dev_st_drop <= dev_st_drop + (n-1);
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin dq_head<=0; dq_tail<=0; dst_drop<=0; end
+        else begin
+            int t; t = dq_tail;
+            for (int c=0;c<NCORE;c++) if (ds_en[c]) begin
+                if ((t - dq_head) < DQ) begin
+                    dq_wa[t % DQ] <= ds_wa[c]; dq_wd[t % DQ] <= ds_wd[c]; dq_wm[t % DQ] <= ds_wm[c];
+                    t = t + 1;
+                end else dst_drop <= dst_drop + 1;   // FIFO full (never expected)
+            end
+            dq_tail <= t;
+            if (!dq_empty) dq_head <= dq_head + 1;     // drain one this cycle
+        end
     end
     always_comb begin
         for (int c=0;c<NCORE;c++) begin
@@ -219,10 +243,17 @@ module top
             v = CCD.G_AGENT[0].L1D.data_q[st][woff*XLEN +: XLEN];
         else if (CCD.G_AGENT[1].L1D.state_q[st] != CMI_I)
             v = CCD.G_AGENT[1].L1D.data_q[st][woff*XLEN +: XLEN];
+`ifdef NCORE4
+        else if (CCD.G_AGENT[2].L1D.state_q[st] != CMI_I)
+            v = CCD.G_AGENT[2].L1D.data_q[st][woff*XLEN +: XLEN];
+        else if (CCD.G_AGENT[3].L1D.state_q[st] != CMI_I)
+            v = CCD.G_AGENT[3].L1D.data_q[st][woff*XLEN +: XLEN];
+`endif
         read_sentinel = v;
     endfunction
 
     int errors=0, timeout;
+    logic all_trapped;
     logic saw_msip1 = 1'b0;          // latch: hart-1 msip was actually raised in the CLINT
     always_ff @(posedge clk) if (cl_msip[1]) saw_msip1 <= 1'b1;
     task automatic chk(input bit ok, input string what);
@@ -232,47 +263,60 @@ module top
     initial begin
         for (int i=0;i<IMEM_WORDS;i++) IMEM[i]='0;
         // litmus_smp_ipi.S, assembled (rv32ima_zicsr). CLINT 0x0200_0000; SENTINEL 0x200.
+        // hart 0 broadcasts msip[1..3]=1 (2-core: 2,3 are no-ops); each non-0 hart traps.
         IMEM[ 0] = 32'hf1402473;  // csrr s0,mhartid
         IMEM[ 1] = 32'h00000297;  // auipc t0,0
-        IMEM[ 2] = 32'h03028293;  // addi t0,t0,48  -> handler
+        IMEM[ 2] = 32'h04c28293;  // addi t0,t0,76   -> handler
         IMEM[ 3] = 32'h30529073;  // csrw mtvec,t0
         IMEM[ 4] = 32'h00800293;  // li   t0,8
         IMEM[ 5] = 32'h3042a073;  // csrs mie,t0     (MSIE)
         IMEM[ 6] = 32'h3002a073;  // csrs mstatus,t0 (MIE)
-        IMEM[ 7] = 32'h00041a63;  // bnez s0,receiver
-        IMEM[ 8] = 32'h020002b7;  // lui  t0,0x2000  (CLINT)
-        IMEM[ 9] = 32'h00100313;  // li   t1,1
-        IMEM[10] = 32'h0062a223;  // sw   t1,4(t0)   (msip[1]=1 -> IPI hart1)
-        IMEM[11] = 32'h0000006f;  // spin0: j spin0
-        IMEM[12] = 32'h0000006f;  // receiver: j receiver
-        IMEM[13] = 32'hf1402473;  // handler: csrr s0,mhartid
-        IMEM[14] = 32'h00241493;  // slli s1,s0,2
-        IMEM[15] = 32'h20000393;  // li   t2,512     (SENTINEL)
-        IMEM[16] = 32'h009383b3;  // add  t2,t2,s1
-        IMEM[17] = 32'h00100e13;  // li   t3,1
-        IMEM[18] = 32'h01c3a023;  // sw   t3,0(t2)   (SENTINEL[hart]=1)
-        IMEM[19] = 32'h020002b7;  // lui  t0,0x2000
-        IMEM[20] = 32'h009282b3;  // add  t0,t0,s1
-        IMEM[21] = 32'h0002a023;  // sw   zero,0(t0) (msip[hart]=0)
-        IMEM[22] = 32'h0000006f;  // hspin: j hspin
+        IMEM[ 7] = 32'h02041863;  // bnez s0,receiver
+        IMEM[ 8] = 32'h020002b7;  // sender: lui t0,0x2000 (CLINT)
+        IMEM[ 9] = 32'h00100e93;  // li   t4,1
+        IMEM[10] = 32'h00100313;  // li   t1,1       (h)
+        IMEM[11] = 32'h00400393;  // li   t2,4       (limit)
+        IMEM[12] = 32'h00735c63;  // sloop: bge t1,t2,spin0
+        IMEM[13] = 32'h00231e13;  // slli t3,t1,2
+        IMEM[14] = 32'h01c28f33;  // add  t5,t0,t3
+        IMEM[15] = 32'h01df2023;  // sw   t4,0(t5)   (msip[h]=1)
+        IMEM[16] = 32'h00130313;  // addi t1,t1,1
+        IMEM[17] = 32'hfedff06f;  // j    sloop
+        IMEM[18] = 32'h0000006f;  // spin0: j spin0
+        IMEM[19] = 32'h0000006f;  // receiver: j receiver
+        IMEM[20] = 32'hf1402473;  // handler: csrr s0,mhartid
+        IMEM[21] = 32'h00241493;  // slli s1,s0,2
+        IMEM[22] = 32'h20000393;  // li   t2,512     (SENTINEL)
+        IMEM[23] = 32'h009383b3;  // add  t2,t2,s1
+        IMEM[24] = 32'h00100e13;  // li   t3,1
+        IMEM[25] = 32'h01c3a023;  // sw   t3,0(t2)   (SENTINEL[hart]=1)
+        IMEM[26] = 32'h020002b7;  // lui  t0,0x2000
+        IMEM[27] = 32'h009282b3;  // add  t0,t0,s1
+        IMEM[28] = 32'h0002a023;  // sw   zero,0(t0) (msip[hart]=0)
+        IMEM[29] = 32'h0000006f;  // hspin: j hspin
         for (int c=0;c<NCORE;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wm[c]='1; end
         rst_l=0; repeat(8) @(posedge clk); rst_l=1;
 
-        $display("== M4 S6b cross-hart IPI: hart0 -> msip[1] -> hart1 takes M-software trap ==");
-        // wait for hart 1 to take the IPI trap (SENTINEL[1] set by its handler)
+        $display("== M4 #4 cross-hart IPI: hart0 -> msip[1..%0d] -> each takes M-software trap ==", NCORE-1);
+        // wait until every receiver hart (1..NCORE-1) has taken its trap (SENTINEL[h]=1)
         timeout=0;
-        do begin @(posedge clk); timeout++; end
-        while (read_sentinel(1) != XLEN'(1) && timeout < 20000);
-        // the handler clears its own msip a few instructions after SENTINEL;
-        // give that store time to commit before checking the deassert.
+        do begin
+            @(posedge clk); timeout++;
+            all_trapped = 1'b1;
+            for (int h=1; h<NCORE; h++) if (read_sentinel(h) != XLEN'(1)) all_trapped = 1'b0;
+        end while (!all_trapped && timeout < 40000);
+        // handlers clear their own msip a few instructions after SENTINEL; let those drain.
         timeout=0;
-        while (cl_msip[1] && timeout < 2000) begin @(posedge clk); timeout++; end
+        while ((|cl_msip) && timeout < 4000) begin @(posedge clk); timeout++; end
 
-        chk(saw_msip1,                     "CLINT raised hart-1 msip (the IPI landed in the shared device)");
-        chk(read_sentinel(1) == XLEN'(1),  "hart 1 took the M-software-interrupt trap (SENTINEL[1]=1)");
-        chk(read_sentinel(0) == XLEN'(0),  "hart 0 did NOT trap (SENTINEL[0]=0; it only sent the IPI)");
-        chk(cl_msip[1] == 1'b0,            "handler cleared its own msip (cl_msip[1] deasserted)");
-        chk(dev_st_drop == 0,              "no device-store arbitration drops");
+        chk(saw_msip1, "CLINT raised hart-1 msip (the IPI landed in the shared device)");
+        for (int h=1; h<NCORE; h++)
+            chk(read_sentinel(h) == XLEN'(1),
+                $sformatf("hart %0d took the M-software-interrupt trap (SENTINEL[%0d]=1)", h, h));
+        chk(read_sentinel(0) == XLEN'(0), "hart 0 did NOT trap (SENTINEL[0]=0; it only sent the IPIs)");
+        chk(cl_msip == '0, "all handlers cleared their own msip (cl_msip all deasserted)");
+        chk(dst_drop == 0, "device-store FIFO never overflowed (no lost cross-core stores)");
+        chk(dq_head == dq_tail, "device-store FIFO fully drained (every store delivered)");
 
         $display("");
         if (errors==0)

@@ -21,7 +21,11 @@ module top
     import NIIGO_CCD_M1::*;
     import MemorySegments::USER_TEXT_START;
 ;
+`ifdef NCORE4
+    localparam int NCORE      = 4;        // M4 #4: 4-core scale-up (make ccd-smp4-test)
+`else
     localparam int NCORE      = 2;
+`endif
     localparam int ITERS      = 3;        // per-core protected increments (must match the litmus)
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
     logic clk=0, rst_l=0;
@@ -230,6 +234,12 @@ module top
             v = CCD.G_AGENT[0].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
         else if (CCD.G_AGENT[1].L1D.state_q[CTR_SET] != CMI_I)
             v = CCD.G_AGENT[1].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
+`ifdef NCORE4
+        else if (CCD.G_AGENT[2].L1D.state_q[CTR_SET] != CMI_I)
+            v = CCD.G_AGENT[2].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
+        else if (CCD.G_AGENT[3].L1D.state_q[CTR_SET] != CMI_I)
+            v = CCD.G_AGENT[3].L1D.data_q[CTR_SET][CTR_WOFF*XLEN +: XLEN];
+`endif
         read_counter = v;
     endfunction
 
@@ -291,7 +301,7 @@ module top
 
         $display("");
         if (errors==0) begin
-            $display("==== tb_ccd_smp: infra checks PASSED (2 real cores coherent);%s ====",
+            $display("==== tb_ccd_smp: infra checks PASSED (%0d real cores coherent);%s ====", NCORE,
                      (ctr==XLEN'(NCORE*ITERS)) ? " mutual exclusion HELD" : " B9 race DIAGNOSED (rd-at-commit pending)");
         end else
             $display("==== tb_ccd_smp: %0d INFRA CHECK(S) FAILED ====", errors);
