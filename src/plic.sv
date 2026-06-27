@@ -43,7 +43,11 @@ module plic
     parameter int          NSOURCES = 31,          // sources 1..NSOURCES (<= 31)
     // M4 SMP: 2 contexts per hart (even=M-external, odd=S-external). NCTX=2 (the
     // default) is the single-hart layout -> bit-identical to the pre-SMP PLIC.
-    parameter int          NCTX = 2
+    parameter int          NCTX = 2,
+    // M4 SMP: NPORT independent load ports (one per hart). Packed so NPORT=1 is
+    // byte-for-byte the single-port layout. A claim READ has a side effect, so a
+    // port-priority arbiter prevents two ports double-claiming the same source.
+    parameter int          NPORT = 1
 ) (
     input wire logic        clk,
     input wire logic        rst_l,
@@ -60,18 +64,20 @@ module plic
     // Combinational load query; load_en marks the cycle the load result is
     // actually consumed (so a claim's side effect is not taken speculatively).
     // load_off is the consuming access's byte offset within the memory word,
-    // for read-side-effect gating (which 32-bit register was read).
-    input wire logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
-    input wire logic        load_en,
-    input wire logic [$clog2(XLEN_BYTES)-1:0] load_off,
-    output logic        load_hit,
-    output logic [XLEN-1:0] load_data,
+    // for read-side-effect gating (which 32-bit register was read). NPORT ports,
+    // packed.
+    input wire logic [NPORT*MEMORY_ADDR_WIDTH-1:0] load_addr,
+    input wire logic [NPORT-1:0]        load_en,
+    input wire logic [NPORT*$clog2(XLEN_BYTES)-1:0] load_off,
+    output logic [NPORT-1:0]        load_hit,
+    output logic [NPORT*XLEN-1:0]   load_data,
 
     output logic [NCTX/2-1:0] irq_m_external,   // even contexts (M-external per hart)
     output logic [NCTX/2-1:0] irq_s_external    // odd contexts  (S-external per hart)
 );
 
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
+    localparam int OFF_W      = $clog2(XLEN_BYTES);
     localparam int NSUB = XLEN / 32;
     localparam int NHART = NCTX / 2;
 
@@ -201,34 +207,62 @@ module plic
         end
     endfunction
 
-    // ---- Combinational read path (per bus subword) ----
-    always_comb begin
-        logic sub_hit;
-        load_hit  = 1'b0;
-        load_data = '0;
-        for (int i = 0; i < NSUB; i += 1) begin
-            load_data[i*32 +: 32] = reg_read(
-                32'(load_addr << ADDR_SHIFT) + 32'(unsigned'(i) * 4), sub_hit);
-            load_hit |= sub_hit;
-        end
-    end
-
     // A claim load that actually completes marks its source in flight. The
     // claim register the load addressed is selected by its byte offset (a claim
-    // read is a 32-bit access at the register's aligned address).
+    // read is a 32-bit access at the register's aligned address). With NPORT>1
+    // a source claimed by a lower-index port is masked from higher ports the
+    // same cycle, so two harts cannot both receive the same source: the loser's
+    // claim read ALSO returns 0 (port_claim_src) -- true no-double-claim.
     logic        claim_take [NCTX];
     logic [5:0]  claim_id   [NCTX];
-    logic [31:0] load_baddr;
-    assign load_baddr = 32'(load_addr << ADDR_SHIFT) + 32'(load_off);
+    logic [5:0]  port_claim_src [NPORT];   // source port p actually claims (0=none)
     always_comb begin
         int ckind, cctx;
+        logic [NSOURCES:0] claimed_mask;
+        logic [31:0] lb;
         for (int c = 0; c < NCTX; c += 1) begin
             claim_take[c] = 1'b0;
             claim_id[c]   = best_id[c];
         end
-        ctx_decode(load_baddr, ckind, cctx);
-        if (load_en && (ckind == 3) && (best_id[cctx] != 6'd0))
-            claim_take[cctx] = 1'b1;
+        claimed_mask = '0;
+        for (int p = 0; p < NPORT; p += 1) begin
+            port_claim_src[p] = 6'd0;
+            lb = 32'((load_addr[p*MEMORY_ADDR_WIDTH +: MEMORY_ADDR_WIDTH]) << ADDR_SHIFT)
+               + 32'(load_off[p*OFF_W +: OFF_W]);
+            ctx_decode(lb, ckind, cctx);
+            if (load_en[p] && (ckind == 3) && (best_id[cctx] != 6'd0) &&
+                    !claimed_mask[best_id[cctx]]) begin
+                port_claim_src[p]       = best_id[cctx];
+                claim_take[cctx]        = 1'b1;
+                claim_id[cctx]          = best_id[cctx];
+                claimed_mask[best_id[cctx]] = 1'b1;
+            end
+        end
+    end
+
+    // ---- Combinational read path (per port, per bus subword) ----
+    // A claim register read that actually completes (load_en) returns the
+    // arbitrated source (port_claim_src, 0 if the port lost the source to a
+    // lower port); a peek (load_en=0) returns the context's elected source with
+    // no side effect. NPORT=1 reduces to the original single-port behaviour.
+    always_comb begin
+        logic sub_hit;
+        logic [MEMORY_ADDR_WIDTH-1:0] pa;
+        logic [31:0] saddr;
+        int    rkind, rctx;
+        load_hit  = '0;
+        load_data = '0;
+        for (int p = 0; p < NPORT; p += 1) begin
+            pa = load_addr[p*MEMORY_ADDR_WIDTH +: MEMORY_ADDR_WIDTH];
+            for (int i = 0; i < NSUB; i += 1) begin
+                saddr = 32'(pa << ADDR_SHIFT) + 32'(unsigned'(i) * 4);
+                load_data[p*XLEN + i*32 +: 32] = reg_read(saddr, sub_hit);
+                ctx_decode(saddr, rkind, rctx);
+                if (load_en[p] && (rkind == 3))
+                    load_data[p*XLEN + i*32 +: 32] = {26'b0, port_claim_src[p]};
+                if (sub_hit) load_hit[p] = 1'b1;
+            end
+        end
     end
 
     // Completion: a write of a source id to a claim/complete register reopens

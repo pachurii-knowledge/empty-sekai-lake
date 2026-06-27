@@ -33,7 +33,10 @@ module clint
     import RISCV_UArch::MEMORY_ADDR_WIDTH;
 #(
     parameter logic [31:0] BASE = 32'h0200_0000,
-    parameter int          NUM_HARTS = 1
+    parameter int          NUM_HARTS = 1,
+    // M4 SMP: NPORT independent combinational read ports (one per hart sharing
+    // this CLINT). Packed so NPORT=1 is byte-for-byte the single-port layout.
+    parameter int          NPORT = 1
 ) (
     input wire logic        clk,
     input wire logic        rst_l,
@@ -44,10 +47,11 @@ module clint
     input wire logic [XLEN-1:0] store_wdata,
     input wire logic [XLEN_BYTES-1:0] store_mask,
 
-    // Combinational load query
-    input wire logic [MEMORY_ADDR_WIDTH-1:0] load_addr,
-    output logic        load_hit,
-    output logic [XLEN-1:0] load_data,
+    // Combinational load query (NPORT read ports, packed). A CLINT read has no
+    // side effect, so the ports are fully independent.
+    input wire logic [NPORT*MEMORY_ADDR_WIDTH-1:0] load_addr,
+    output logic [NPORT-1:0]        load_hit,
+    output logic [NPORT*XLEN-1:0]   load_data,
 
     output logic [NUM_HARTS-1:0] irq_m_timer,
     output logic [NUM_HARTS-1:0] irq_m_software,
@@ -110,15 +114,20 @@ module clint
         endcase
     endfunction
 
-    // Combinational read path: each bus subword decodes independently.
+    // Combinational read path: each port reads independently; each bus subword
+    // decodes independently within a port.
     always_comb begin
         logic sub_hit;
-        load_hit  = 1'b0;
+        logic [MEMORY_ADDR_WIDTH-1:0] pa;
+        load_hit  = '0;
         load_data = '0;
-        for (int i = 0; i < NSUB; i += 1) begin
-            load_data[i*32 +: 32] = reg_read(
-                32'(load_addr << ADDR_SHIFT) + 32'(unsigned'(i) * 4), sub_hit);
-            load_hit |= sub_hit;
+        for (int p = 0; p < NPORT; p += 1) begin
+            pa = load_addr[p*MEMORY_ADDR_WIDTH +: MEMORY_ADDR_WIDTH];
+            for (int i = 0; i < NSUB; i += 1) begin
+                load_data[p*XLEN + i*32 +: 32] = reg_read(
+                    32'(pa << ADDR_SHIFT) + 32'(unsigned'(i) * 4), sub_hit);
+                if (sub_hit) load_hit[p] = 1'b1;
+            end
         end
     end
 
