@@ -244,7 +244,7 @@ module top
     // per-agent / per-core shadows (constant-index ladder)
     logic        sh_mval [NCORE]; logic [3:0] sh_mts [NCORE]; logic signed [15:0] sh_acks [NCORE];
     logic        sh_dval [NCORE]; logic sh_srp [NCORE]; logic [MEMORY_ADDR_WIDTH-1:0] sh_mlad [NCORE];
-    logic [63:0] hart_retire [NCORE];
+    logic [63:0] hart_retire [NCORE]; logic [XLEN-1:0] last_pc [NCORE];
     `define AGSH(K) \
         assign sh_mval[K] = MEMSYS.CCD.G_AGENT[K].L1D.m_val_q; \
         assign sh_mts[K]  = MEMSYS.CCD.G_AGENT[K].L1D.m_ts_q; \
@@ -252,16 +252,29 @@ module top
         assign sh_dval[K] = MEMSYS.CCD.G_AGENT[K].L1D.d_val_q; \
         assign sh_srp[K]  = MEMSYS.CCD.G_AGENT[K].L1D.sr_pend_q; \
         assign sh_mlad[K] = MEMSYS.CCD.G_AGENT[K].L1D.m_lad_q;
+    // hart_retire accumulates committed-instr count; last_pc latches the most recent committed PC
+    // (lane 0) -- a hart spinning in a tight loop (e.g. an fs-write livelock) parks last_pc in a
+    // small window, visible in the heartbeat, mapping straight to kernel.asm.
     `define HRET(K) \
         always_ff @(posedge clk or negedge rst_l) \
-            if (!rst_l) hart_retire[K] <= '0; \
-            else hart_retire[K] <= hart_retire[K] + 64'(CORE[K].Core.OoOCore.retire_count);
+            if (!rst_l) begin hart_retire[K] <= '0; last_pc[K] <= '0; end \
+            else begin hart_retire[K] <= hart_retire[K] + 64'(CORE[K].Core.OoOCore.retire_count); \
+                if (CORE[K].Core.OoOCore.retire_valid[0]) last_pc[K] <= CORE[K].Core.OoOCore.active_commit_packet[0].pc; end
     generate
         `AGSH(0) `HRET(0)
         if (NCORE > 1) begin : SH1 `AGSH(1) `HRET(1) end
         if (NCORE > 2) begin : SH2 `AGSH(2) `HRET(2) end
         if (NCORE > 3) begin : SH3 `AGSH(3) `HRET(3) end
     endgenerate
+
+    // last committed dmem load/store per hart (tb port signals -- runtime-indexable, no XMR). Shows
+    // what a spinning hart reads/writes (e.g. an fs-write block-alloc livelock reading a stale value).
+    logic [MEMORY_ADDR_WIDTH-1:0] last_ld_a [NCORE], last_st_a [NCORE];
+    logic [XLEN-1:0]              last_ld_d [NCORE], last_st_d [NCORE];
+    always_ff @(posedge clk) if (rst_l) for (int k=0;k<NCORE;k++) begin
+        if (d_resp_v[k] && !d_dev[k])                  begin last_ld_a[k] <= d_resp_a[k]; last_ld_d[k] <= d_resp_d[k]; end
+        if (d_req_v[k] && d_req_r[k] && d_req_w[k])    begin last_st_a[k] <= d_req_a[k];  last_st_d[k] <= d_req_wd[k]; end
+    end
 
     // watchdog / heartbeat state
     int unsigned stuck_cyc = 0;  logic [MEMORY_ADDR_WIDTH-1:0] last_blad = 0;
@@ -275,8 +288,8 @@ module top
         $display("\n[WATCHDOG] %s @cyc=%0d", why, cycle_count);
         $display("  DIR: busy=%0b st=%0d bkind=%0d blad=%h", sh_busy, sh_st, sh_bk, sh_blad);
         for (int k=0;k<NCORE;k++)
-            $display("  hart%0d: retire=%0d agent[m_val=%0b m_ts=%0d acks=%0d m_lad=%h d_val=%0b sr_pend=%0b]",
-                     k, hart_retire[k], sh_mval[k], sh_mts[k], sh_acks[k], sh_mlad[k], sh_dval[k], sh_srp[k]);
+            $display("  hart%0d: retire=%0d pc=%h agent[m_val=%0b m_ts=%0d acks=%0d m_lad=%h d_val=%0b sr_pend=%0b]",
+                     k, hart_retire[k], last_pc[k], sh_mval[k], sh_mts[k], sh_acks[k], sh_mlad[k], sh_dval[k], sh_srp[k]);
     endtask
 
     always_ff @(posedge clk) if (rst_l) begin
@@ -294,7 +307,8 @@ module top
         if (cycle_count % HB_WIN == 0 && cycle_count != 0) begin
             $write("[HB cyc=%0d] dir(busy=%0b st=%0d blad=%h) drop=%0d", cycle_count, sh_busy, sh_st, sh_blad, dst_drop);
             for (int k=0;k<NCORE;k++) begin
-                $write(" h%0d(ret+=%0d mts=%0d ack=%0d)", k, hart_retire[k]-last_hb_retire[k], sh_mts[k], sh_acks[k]);
+                $write(" h%0d(ret+=%0d pc=%h ld=%h:%h st=%h:%h)", k, hart_retire[k]-last_hb_retire[k], last_pc[k],
+                       last_ld_a[k], last_ld_d[k], last_st_a[k], last_st_d[k]);
                 last_hb_retire[k] <= hart_retire[k];
             end
             $write("\n");
