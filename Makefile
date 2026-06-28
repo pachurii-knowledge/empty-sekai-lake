@@ -279,11 +279,14 @@ ccd-xv6-1-build:
 		$(VERILATOR_INC_FLAGS) \
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_xv6.sv)
 
-# NCORE=4 xv6-SMP harness (for usertests-under-4-cores bring-up). Large build: the 2-OoO-core
-# Vtop already needs ~10GB per big file -- 4 cores is bigger, so build with a bounded, detached
-# Mdir make, e.g.:  make -C output/ccd-xv6-4 -j2 -f Vtop.mk  (see OVERNIGHT_BUGLOG.md / plans/smp-4core-bug-surface.md).
+# NCORE=4 xv6-SMP harness (for usertests-under-4-cores bring-up). Large build: NCORE=4 verilates to
+# ~53 root .cpp files, several of which need ~10GB each to compile. On a 32GB machine --build-jobs 2
+# compiles two big files at once (~16-20GB RSS) and SWAPS hard -- measured -- so the safe default is
+# --build-jobs 1 (one ~10GB compile at a time, no swap). On a >=64GB host raise it. Run detached
+# (setsid) so it survives the background-task teardown; to resume a partial build use the cached .o:
+#   make -C output/ccd-xv6-4 -j1 -f Vtop.mk   (see plans/smp-4core-bug-surface.md / OVERNIGHT_BUGLOG.md).
 ccd-xv6-4-build:
-	$(VERILATOR) --sv --timing --binary -j 0 --build-jobs 2 -Wno-fatal --top-module top \
+	$(VERILATOR) --sv --timing --binary -j 0 --build-jobs 1 -Wno-fatal --top-module top \
 		--Mdir $(OUTPUT_BASE_DIR)/ccd-xv6-4 \
 		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DRV64 -DNCORE4 \
 		$(VERILATOR_INC_FLAGS) \
