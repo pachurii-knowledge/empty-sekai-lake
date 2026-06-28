@@ -270,6 +270,16 @@ ccd-xv6-1-build:
 		$(VERILATOR_INC_FLAGS) \
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_xv6.sv)
 
+# NCORE=4 xv6-SMP harness (for usertests-under-4-cores bring-up). Large build: the 2-OoO-core
+# Vtop already needs ~10GB per big file -- 4 cores is bigger, so build with a bounded, detached
+# Mdir make, e.g.:  make -C output/ccd-xv6-4 -j2 -f Vtop.mk  (see OVERNIGHT_BUGLOG.md / plans/smp-4core-bug-surface.md).
+ccd-xv6-4-build:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-xv6-4 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DRV64 -DNCORE4 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_xv6.sv)
+
 # ---- M4-S6a multi-hart shared CLINT/PLIC directed test (standalone; clint NUM_HARTS=4 + plic NCTX=8) ----
 clint-plic-smp-test:
 	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/clint-plic-smp --top-module top \
