@@ -27,7 +27,14 @@ module niigo_dir_gg
     import NIIGO_CCD_M1::*;
 #(
     parameter int CORES    = NIIGO_CMI::NUM_CORES,   // 4 (id widths match ccd_msg_t)
-    parameter int DIR_SETS = 16
+    parameter int DIR_SETS = 16,
+    // S1 (plans/smp-4core-bug-surface.md): set-associative directory. With DIR_WAYS >= the active
+    // core count the dir can track EVERY line each core caches in a given dir set without eviction
+    // -- each core holds <=1 line per dir set (the dir index determines the L1 index), so at most
+    // CORES distinct lines ever collide there. It is therefore inclusive and never silently forgets
+    // a live owner/sharer on an aliasing admit; the old direct-mapped (1-way) dir dropped the
+    // resident entry whenever a different-tag line hit the same set -> stale read / lost dirty WB.
+    parameter int DIR_WAYS = NIIGO_CMI::NUM_CORES
 )(
     input  wire logic clk,
     input  wire logic rst_l,
@@ -49,6 +56,7 @@ module niigo_dir_gg
     localparam int LWB  = NIIGO_Mem::LINE_WORD_BITS;
     localparam int DIDX = $clog2(DIR_SETS);
     localparam int DTAG = MEMORY_ADDR_WIDTH - DIDX - LWB;
+    localparam int WW   = (DIR_WAYS<=1) ? 1 : $clog2(DIR_WAYS);   // way-index width
     /* verilator lint_off ENUMVALUE */
 
     function automatic logic [DIDX-1:0] didx(input logic [MEMORY_ADDR_WIDTH-1:0] la);
@@ -81,7 +89,7 @@ module niigo_dir_gg
     // ---- FSM for the outbound-message sequencer (drives fwd/inv/data/ack one at a time) ----
     typedef enum logic [2:0] { S_IDLE, S_MEMRD, S_MEMWR, S_EMIT, S_INVSEQ, S_DRAINACK } seq_e;
 
-    dent_t              dir_q [DIR_SETS];
+    dent_t              dir_q [DIR_SETS][DIR_WAYS];
     seq_e               st_q;
     // busy tracker
     logic               busy_q;
@@ -104,16 +112,30 @@ module niigo_dir_gg
     // committed stable-update staged for the busy line's finalize
     dir_state_e         nds_q;  logic [CORES-1:0] nsh_q;  logic [CW-1:0] nown_q;  logic nset_q;
     logic [DIDX-1:0]    bidx_q;
+    logic [WW-1:0]      bway_q;     // way of the busy line (set-associative)
 
     // next-state
-    dent_t dir_wval; logic dir_we; logic [DIDX-1:0] dir_widx;
+    dent_t dir_wval; logic dir_we; logic [DIDX-1:0] dir_widx; logic [WW-1:0] dir_wway;
     // (the bulk of next-state is held in the same-named *_n below)
 
-    // ---- current stable lookup for a given laddr ----
+    // ---- current stable lookup for a given laddr (search all ways; miss => DIR_I) ----
     function automatic dent_t look(input logic [MEMORY_ADDR_WIDTH-1:0] la);
-        dent_t e; e = dir_q[didx(la)];
-        if (!e.valid || e.tag != dtag(la)) begin e.dstate=DIR_I; e.sharers='0; e.owner='0; end
+        dent_t e; e='{default:'0}; e.dstate=DIR_I;
+        for (int w=0; w<DIR_WAYS; w++)
+            if (dir_q[didx(la)][w].valid && dir_q[didx(la)][w].tag==dtag(la)) e=dir_q[didx(la)][w];
         return e;
+    endfunction
+    // way to write for `la`: the matching-tag way if resident, else the lowest invalid way. With
+    // DIR_WAYS>=CORES a free way always exists for a new line (<=CORES lines per dir set), so the
+    // '0 fallback is unreachable in correct operation (would be an inclusion overflow).
+    function automatic logic [WW-1:0] look_way(input logic [MEMORY_ADDR_WIDTH-1:0] la);
+        logic [WW-1:0] mw, fw; logic found_m, found_f;
+        mw='0; fw='0; found_m=1'b0; found_f=1'b0;
+        for (int w=DIR_WAYS-1; w>=0; w--) begin
+            if (dir_q[didx(la)][w].valid && dir_q[didx(la)][w].tag==dtag(la)) begin mw=w[WW-1:0]; found_m=1'b1; end
+            if (!dir_q[didx(la)][w].valid) begin fw=w[WW-1:0]; found_f=1'b1; end
+        end
+        return found_m ? mw : (found_f ? fw : '0);
     endfunction
 
     // ====================================================================
@@ -130,6 +152,7 @@ module niigo_dir_gg
     ccd_msg_t           gmsg_n; logic [NODE_ID_W-1:0] gdst_n; logic [LINE_BITS-1:0] gline_n;
     dir_state_e         nds_n; logic [CORES-1:0] nsh_n; logic [CW-1:0] nown_n; logic nset_n;
     logic [DIDX-1:0]    bidx_n;
+    logic [WW-1:0]      bway_n;
 
     nmi_req_t mem_req_c;
     logic     ov_c; ccd_msg_t om_c; logic [NODE_ID_W-1:0] od_c;
@@ -160,8 +183,8 @@ module niigo_dir_gg
         em_data_pend_n=em_data_pend_q; em_data_msg_n=em_data_msg_q; em_data_dst_n=em_data_dst_q;
         inv_todo_n=inv_todo_q; inv_req_n=inv_req_q; inv_lad_n=inv_lad_q;
         gmsg_n=gmsg_q; gdst_n=gdst_q; gline_n=gline_q;
-        nds_n=nds_q; nsh_n=nsh_q; nown_n=nown_q; nset_n=nset_q; bidx_n=bidx_q;
-        dir_we=1'b0; dir_widx=bidx_q; dir_wval='{default:'0};
+        nds_n=nds_q; nsh_n=nsh_q; nown_n=nown_q; nset_n=nset_q; bidx_n=bidx_q; bway_n=bway_q;
+        dir_we=1'b0; dir_widx=bidx_q; dir_wway=bway_q; dir_wval='{default:'0};
         mem_req_c='{default:'0};
         ov_c=1'b0; om_c='{default:'0}; od_c='0;
         req_rdy_c=1'b0; unblk_rdy_c=1'b0; wb_rdy_c=1'b0;
@@ -206,6 +229,7 @@ module niigo_dir_gg
                 if (!busy_q && !same_busy) begin
                     req_rdy_c = 1'b1;
                     bidx_n = didx(m.laddr);
+                    bway_n = look_way(m.laddr);   // matching-tag way if resident, else a free way
                     unique case (m.op)
                     // ---------- GetS ----------
                     OP_GETS: begin
@@ -288,7 +312,13 @@ module niigo_dir_gg
                             // dirty line is embedded in the PutM/PutO -> write it back to memory
                             gline_n = m.line; bidx_n = didx(m.laddr);
                             busy_n=1'b1; bkind_n=K_DRAINPUT; blad_n=m.laddr; breq_n=R;
-                            nds_n = (m.op==OP_PUTO && ((e.sharers & ~bitR)!=0)) ? DIR_S : DIR_I;
+                            // S3 (plans/smp-4core-bug-surface.md): honor remaining sharers for PUTM too,
+                            // not just PUTO. A concurrent FwdGetS that demoted this owner M->O creates a
+                            // sharer the evictor's captured m_vst doesn't reflect (it still sends PUTM);
+                            // forcing DIR_I would DROP that live sharer and a later writer would grant M
+                            // with no INV -> stale copy. The WB makes memory current, so the surviving
+                            // sharer's clean copy stays consistent. Constant-folds to DIR_I single-core.
+                            nds_n = ((e.sharers & ~bitR)!=0) ? DIR_S : DIR_I;
                             nsh_n = e.sharers & ~bitR; nown_n=e.owner; nset_n=1'b0;
                             st_n = S_MEMWR;
                         end else begin
@@ -435,7 +465,7 @@ module niigo_dir_gg
         if (!rst_l) begin
             st_q<=S_IDLE; busy_q<=1'b0; bkind_q<=K_NONE; brefresh_pend_q<=1'b0;
             bwb_seen_q<=1'b0; bub_seen_q<=1'b0; em_data_pend_q<=1'b0; inv_todo_q<='0;
-            for (int s=0;s<DIR_SETS;s++) dir_q[s]<='{default:'0};
+            for (int s=0;s<DIR_SETS;s++) for (int w=0;w<DIR_WAYS;w++) dir_q[s][w]<='{default:'0};
         end else begin
             st_q<=st_n; busy_q<=busy_n; bkind_q<=bkind_n; blad_q<=blad_n; breq_q<=breq_n; bowner_q<=bowner_n;
             brefresh_pend_q<=brefresh_pend_n; brefresh_val_q<=brefresh_val_n;
@@ -443,8 +473,8 @@ module niigo_dir_gg
             em_data_pend_q<=em_data_pend_n; em_data_msg_q<=em_data_msg_n; em_data_dst_q<=em_data_dst_n;
             inv_todo_q<=inv_todo_n; inv_req_q<=inv_req_n; inv_lad_q<=inv_lad_n;
             gmsg_q<=gmsg_n; gdst_q<=gdst_n; gline_q<=gline_n;
-            nds_q<=nds_n; nsh_q<=nsh_n; nown_q<=nown_n; nset_q<=nset_n; bidx_q<=bidx_n;
-            if (dir_we) dir_q[dir_widx]<=dir_wval;
+            nds_q<=nds_n; nsh_q<=nsh_n; nown_q<=nown_n; nset_q<=nset_n; bidx_q<=bidx_n; bway_q<=bway_n;
+            if (dir_we) dir_q[dir_widx][dir_wway]<=dir_wval;
         end
     end
 
@@ -455,6 +485,20 @@ module niigo_dir_gg
     assign req_ready   = req_rdy_c;
     assign unblk_ready = unblk_rdy_c;
     assign wb_ready    = wb_rdy_c;
+
+    // S1 inclusion guards (sim-only): the set-associative directory is inclusive ONLY while
+    // DIR_WAYS >= the active core count AND the dir index is finer-or-equal to the L1 index (so a
+    // core holds <=1 line per dir set). If either is violated, look_way()'s '0 fallback would
+    // silently clobber way 0 -- re-introducing the exact stale-read/lost-WB class S1 killed. Make
+    // both failure modes LOUD instead of silent (no functional effect when the invariant holds).
+`ifndef SYNTHESIS
+    initial if (DIR_WAYS < CORES)
+        $fatal(1, "niigo_dir_gg: DIR_WAYS(%0d) < CORES(%0d) -- directory not inclusive (S1 regression)", DIR_WAYS, CORES);
+    always_ff @(posedge clk) if (rst_l && dir_we && dir_wval.valid &&
+        dir_q[dir_widx][dir_wway].valid && dir_q[dir_widx][dir_wway].tag != dir_wval.tag)
+        $error("niigo_dir_gg: dir set %0d way %0d clobbers a live different-tag line -- inclusion overflow (S1)",
+               dir_widx, dir_wway);
+`endif
     /* verilator lint_on ENUMVALUE */
 endmodule
 `default_nettype wire
