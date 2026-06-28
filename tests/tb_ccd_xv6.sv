@@ -146,11 +146,42 @@ module top
         .ptw_addr   ('0), .ptw_we(1'b0), .ptw_wdata('0), .ptw_rdata(ms_ptw_rdata));
     wire unused_mem = ms_d_excpt | (|ms_d_load_data) | (|ms_ptw_rdata);
 
-    // ===== shared device hub: store arbiter, per-port CLINT/PLIC, single-port UART =====
+    // ===== shared device hub: S2 non-dropping store FIFO, per-port CLINT/PLIC, single-port UART =====
+    // S2 (bug-surface attack-order #1): the previous combinational lowest-index priority MUX
+    // SILENTLY DROPPED simultaneous cross-core device stores -- the loser retired its store as
+    // accepted (ds_en is a 1-cycle pulse, no replay; device stores bypass the directory so they
+    // are genuinely concurrent). At 4 cores all harts hammer mtimecmp re-arm / UART THR /
+    // PLIC-complete / msip into the ONE device store port continuously, so same-cycle collisions
+    // are a certainty over a multi-M-cycle run; a dropped mtimecmp self-heals, but a dropped
+    // PLIC-complete wedges the UART source and a dropped msip permanently loses an IPI. This FIFO
+    // latches EVERY per-core ds_en pulse and drains ONE store/cycle, so no cross-core device store
+    // is ever lost. (Ported from tests/tb_ccd_smp_ipi.sv; dst_drop must stay 0 -- asserted below.)
+    localparam int DQ = 64;
+    logic [MEMORY_ADDR_WIDTH-1:0]  dq_wa [DQ];
+    logic [XLEN-1:0]               dq_wd [DQ];
+    logic [XLEN_BYTES-1:0]         dq_wm [DQ];
+    int                            dq_head = 0, dq_tail = 0;
+    int                            dst_drop = 0;   // FIFO overflow (must stay 0)
+    wire dq_empty = (dq_head == dq_tail);
     always_comb begin
-        dev_st_en=1'b0; dev_st_wa='0; dev_st_wd='0; dev_st_wm='0;
-        for (int c=0;c<NCORE;c++) if (ds_en[c] && !dev_st_en) begin
-            dev_st_en=1'b1; dev_st_wa=ds_wa[c]; dev_st_wd=ds_wd[c]; dev_st_wm=ds_wm[c];
+        dev_st_en = !dq_empty;
+        dev_st_wa = dq_wa[dq_head % DQ];
+        dev_st_wd = dq_wd[dq_head % DQ];
+        dev_st_wm = dq_wm[dq_head % DQ];
+    end
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin dq_head<=0; dq_tail<=0; dst_drop<=0; end
+        else begin
+            int t; t = dq_tail;
+            for (int c=0;c<NCORE;c++) if (ds_en[c]) begin
+                if ((t - dq_head) < DQ) begin
+                    dq_wa[t % DQ] <= ds_wa[c]; dq_wd[t % DQ] <= ds_wd[c]; dq_wm[t % DQ] <= ds_wm[c];
+                    t = t + 1;
+                end else dst_drop <= dst_drop + 1;   // FIFO full (never expected; >NCORE stores backed up)
+            end
+            dq_tail <= t;
+            if (!dq_empty) dq_head <= dq_head + 1;     // drain one this cycle
+            if (dst_drop != 0) $display("[FATAL] device-store FIFO overflow dst_drop=%0d @cyc=%0d", dst_drop, cycle_count);
         end
     end
     // single-port UART: route the lowest-indexed core whose device-load addr is in the UART
@@ -196,6 +227,79 @@ module top
         .store_en(dev_st_en), .store_waddr(dev_st_wa), .store_wdata(dev_st_wd), .store_mask(dev_st_wm),
         .load_addr(ua_la), .load_en(ua_en), .load_off(ua_off),
         .load_hit(ua_hit), .load_data(ua_data), .irq(uart_irq));
+
+    // ====================================================================
+    // Instrumentation (tb-only; this harness is multi-core). Diagnosability for the first
+    // 4-core run per the bug-surface playbook: a fabric-deadlock watchdog (catches S1/S3/S5/G2
+    // hangs), a per-hart liveness/heartbeat (catches global wedge + lets G2 starvation be seen),
+    // and an m_acks snapshot (G1). Internal dir/agent/core state is mirrored into tb arrays via
+    // CONSTANT-index XMR (Verilator can't index a generate hierarchy with a runtime var), then all
+    // checks/dumps run over the runtime-indexable tb arrays.
+    // ====================================================================
+    // dir shadow (scalar XMR; no array index)
+    wire        sh_busy = MEMSYS.CCD.DIR.busy_q;
+    wire [2:0]  sh_st   = MEMSYS.CCD.DIR.st_q;
+    wire [1:0]  sh_bk   = MEMSYS.CCD.DIR.bkind_q;
+    wire [MEMORY_ADDR_WIDTH-1:0] sh_blad = MEMSYS.CCD.DIR.blad_q;
+    // per-agent / per-core shadows (constant-index ladder)
+    logic        sh_mval [NCORE]; logic [3:0] sh_mts [NCORE]; logic signed [15:0] sh_acks [NCORE];
+    logic        sh_dval [NCORE]; logic sh_srp [NCORE]; logic [MEMORY_ADDR_WIDTH-1:0] sh_mlad [NCORE];
+    logic [63:0] hart_retire [NCORE];
+    `define AGSH(K) \
+        assign sh_mval[K] = MEMSYS.CCD.G_AGENT[K].L1D.m_val_q; \
+        assign sh_mts[K]  = MEMSYS.CCD.G_AGENT[K].L1D.m_ts_q; \
+        assign sh_acks[K] = MEMSYS.CCD.G_AGENT[K].L1D.m_acks_q; \
+        assign sh_dval[K] = MEMSYS.CCD.G_AGENT[K].L1D.d_val_q; \
+        assign sh_srp[K]  = MEMSYS.CCD.G_AGENT[K].L1D.sr_pend_q; \
+        assign sh_mlad[K] = MEMSYS.CCD.G_AGENT[K].L1D.m_lad_q;
+    `define HRET(K) \
+        always_ff @(posedge clk or negedge rst_l) \
+            if (!rst_l) hart_retire[K] <= '0; \
+            else hart_retire[K] <= hart_retire[K] + 64'(CORE[K].Core.OoOCore.retire_count);
+    generate
+        `AGSH(0) `HRET(0)
+        if (NCORE > 1) begin : SH1 `AGSH(1) `HRET(1) end
+        if (NCORE > 2) begin : SH2 `AGSH(2) `HRET(2) end
+        if (NCORE > 3) begin : SH3 `AGSH(3) `HRET(3) end
+    endgenerate
+
+    // watchdog / heartbeat state
+    int unsigned stuck_cyc = 0;  logic [MEMORY_ADDR_WIDTH-1:0] last_blad = 0;
+    int unsigned wedge_cyc = 0;  logic [63:0] last_total_retire = 0, tot_retire = 0;
+    logic [63:0] last_hb_retire [NCORE];
+    localparam int unsigned HB_WIN    = 1_000_000;   // heartbeat period (cycles)
+    localparam int unsigned STUCK_LIM = 500_000;     // dir busy on ONE line this long => deadlock
+    localparam int unsigned WEDGE_LIM = 2_000_000;   // zero global retire this long => wedged
+
+    task automatic dump_all(input string why);
+        $display("\n[WATCHDOG] %s @cyc=%0d", why, cycle_count);
+        $display("  DIR: busy=%0b st=%0d bkind=%0d blad=%h", sh_busy, sh_st, sh_bk, sh_blad);
+        for (int k=0;k<NCORE;k++)
+            $display("  hart%0d: retire=%0d agent[m_val=%0b m_ts=%0d acks=%0d m_lad=%h d_val=%0b sr_pend=%0b]",
+                     k, hart_retire[k], sh_mval[k], sh_mts[k], sh_acks[k], sh_mlad[k], sh_dval[k], sh_srp[k]);
+    endtask
+
+    always_ff @(posedge clk) if (rst_l) begin
+        // (1) dir-busy deadlock watchdog: busy held on the SAME line for STUCK_LIM cycles
+        if (sh_busy && sh_blad==last_blad) stuck_cyc <= stuck_cyc + 1; else stuck_cyc <= 0;
+        last_blad <= sh_blad;
+        if (stuck_cyc > STUCK_LIM) begin dump_all("dir busy stuck -- fabric deadlock"); $finish; end
+        // (2) global wedge: no instruction retired ANYWHERE for WEDGE_LIM cycles
+        tot_retire = 0;
+        for (int k=0;k<NCORE;k++) tot_retire = tot_retire + hart_retire[k];
+        if (tot_retire==last_total_retire) wedge_cyc <= wedge_cyc + 1; else wedge_cyc <= 0;
+        last_total_retire <= tot_retire;
+        if (wedge_cyc > WEDGE_LIM) begin dump_all("global wedge -- no retire anywhere"); $finish; end
+        // (3) heartbeat: per-hart retire delta + dir/agent snapshot + m_acks (G1) + dst_drop
+        if (cycle_count % HB_WIN == 0 && cycle_count != 0) begin
+            $write("[HB cyc=%0d] dir(busy=%0b st=%0d blad=%h) drop=%0d", cycle_count, sh_busy, sh_st, sh_blad, dst_drop);
+            for (int k=0;k<NCORE;k++) begin
+                $write(" h%0d(ret+=%0d mts=%0d ack=%0d)", k, hart_retire[k]-last_hb_retire[k], sh_mts[k], sh_acks[k]);
+                last_hb_retire[k] <= hart_retire[k];
+            end
+            $write("\n");
+        end
+    end
 
     // ===== run loop: xv6 never halts; stream the UART ($write) for a cycle budget =====
     int unsigned MAXCYC;
