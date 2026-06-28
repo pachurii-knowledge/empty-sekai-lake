@@ -180,23 +180,35 @@ module top
         if (!ok) begin $display("  [FAIL] %s", what); errors++; end else $display("  [ ok ] %s", what);
     endtask
 
+    // litmus_smp_amo.S as a 32-bit instruction stream. COUNTER=0x140, DONE[h]=0x180+4h.
+    // RV64 uses amoadd.d (the agent amo() does full-XLEN RMW); all else encodes identically.
+    localparam int NPROG = 14;
+    logic [31:0] prog [0:NPROG-1];
     initial begin
         for (int i=0;i<IMEM_WORDS;i++) IMEM[i]='0;
-        // litmus_smp_amo.S, assembled (rv32ima_zicsr). COUNTER=0x140, DONE[h]=0x180+4h.
-        IMEM[ 0] = 32'hf1402473;  // csrr s0,mhartid
-        IMEM[ 1] = 32'h14000293;  // li   t0,320      (COUNTER)
-        IMEM[ 2] = 32'h00300313;  // li   t1,3        (ITERS)
-        IMEM[ 3] = 32'h00100393;  // li   t2,1
-        IMEM[ 4] = 32'h00030863;  // loop: beqz t1,done
-        IMEM[ 5] = 32'h0072a02f;  // amoadd.w zero,t2,(t0)
-        IMEM[ 6] = 32'hfff30313;  // addi t1,t1,-1
-        IMEM[ 7] = 32'hff5ff06f;  // j    loop
-        IMEM[ 8] = 32'h18000f93;  // done: li t6,384
-        IMEM[ 9] = 32'h00241493;  // slli s1,s0,2
-        IMEM[10] = 32'h009f8fb3;  // add  t6,t6,s1
-        IMEM[11] = 32'h00100f13;  // li   t5,1
-        IMEM[12] = 32'h01efa023;  // sw   t5,0(t6)    (DONE[hart]=1)
-        IMEM[13] = 32'h0000006f;  // spin: j spin
+        prog[ 0] = 32'hf1402473;  // csrr s0,mhartid
+        prog[ 1] = 32'h14000293;  // li   t0,320      (COUNTER)
+        prog[ 2] = 32'h00300313;  // li   t1,3        (ITERS)
+        prog[ 3] = 32'h00100393;  // li   t2,1
+        prog[ 4] = 32'h00030863;  // loop: beqz t1,done
+`ifdef RV64
+        prog[ 5] = 32'h0072b02f;  // amoadd.d zero,t2,(t0)
+`else
+        prog[ 5] = 32'h0072a02f;  // amoadd.w zero,t2,(t0)
+`endif
+        prog[ 6] = 32'hfff30313;  // addi t1,t1,-1
+        prog[ 7] = 32'hff5ff06f;  // j    loop
+        prog[ 8] = 32'h18000f93;  // done: li t6,384
+        prog[ 9] = 32'h00241493;  // slli s1,s0,2
+        prog[10] = 32'h009f8fb3;  // add  t6,t6,s1
+        prog[11] = 32'h00100f13;  // li   t5,1
+        prog[12] = 32'h01efa023;  // sw   t5,0(t6)    (DONE[hart]=1; 32b store OK at both widths)
+        prog[13] = 32'h0000006f;  // spin: j spin
+`ifdef RV64
+        for (int k=0;k<NPROG/2;k++) IMEM[k] = {prog[2*k+1], prog[2*k]};
+`else
+        for (int k=0;k<NPROG;k++)   IMEM[k] = prog[k];
+`endif
         for (int c=0;c<NCORE;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wm[c]='1; end
         rst_l=0; repeat(8) @(posedge clk); rst_l=1;
 

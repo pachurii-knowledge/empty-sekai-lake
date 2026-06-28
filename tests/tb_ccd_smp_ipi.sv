@@ -231,12 +231,16 @@ module top
 
     // ===== white-box SENTINEL[h] readout (RAM line owned by whichever agent) =====
     localparam int L1_IDX = $clog2(64);
+    // SENTINEL[h] is a 4-byte `sw` at byte 0x200+4h. At RV64 a machine word is 8 B, so
+    // SENTINEL[0]/[1] (and [2]/[3]) share a word -> lane-select the 32b half by byte[2].
     function automatic logic [XLEN-1:0] read_sentinel(input int h);
+        logic [31:0]               byteaddr;
         logic [MEMORY_ADDR_WIDTH-1:0] wa;
         logic [L1_IDX-1:0]         st;
         logic [LINE_WORD_BITS-1:0] woff;
         logic [XLEN-1:0] v; v='0;
-        wa   = MEMORY_ADDR_WIDTH'((32'h200 + 32'(h)*4) >> ADDR_SHIFT);
+        byteaddr = 32'h200 + 32'(h)*4;
+        wa   = MEMORY_ADDR_WIDTH'(byteaddr >> ADDR_SHIFT);
         st   = wa[LINE_WORD_BITS +: L1_IDX];
         woff = wa[LINE_WORD_BITS-1:0];
         if (CCD.G_AGENT[0].L1D.state_q[st] != CMI_I)
@@ -249,7 +253,11 @@ module top
         else if (CCD.G_AGENT[3].L1D.state_q[st] != CMI_I)
             v = CCD.G_AGENT[3].L1D.data_q[st][woff*XLEN +: XLEN];
 `endif
+`ifdef RV64
+        read_sentinel = XLEN'(byteaddr[2] ? v[63:32] : v[31:0]);  // lane-select the 32b sentinel
+`else
         read_sentinel = v;
+`endif
     endfunction
 
     int errors=0, timeout;
@@ -260,40 +268,50 @@ module top
         if (!ok) begin $display("  [FAIL] %s", what); errors++; end else $display("  [ ok ] %s", what);
     endtask
 
+    // litmus_smp_ipi.S as a 32-bit instruction stream. CLINT 0x0200_0000; SENTINEL 0x200.
+    // hart 0 broadcasts msip[1..3]=1 (2-core: 2,3 are no-ops); each non-0 hart traps.
+    // All encodings (csrr/auipc/addi/csrw/csrs/bnez/lui/sw/add/slli/j) are width-agnostic;
+    // PC-relative handler offset is byte-based, so it is identical at RV32/RV64. The 4-byte
+    // SENTINEL/msip stores stay `sw` (msip is a 32b device reg; read_sentinel lane-selects).
+    localparam int NPROG = 30;
+    logic [31:0] prog [0:NPROG-1];
     initial begin
         for (int i=0;i<IMEM_WORDS;i++) IMEM[i]='0;
-        // litmus_smp_ipi.S, assembled (rv32ima_zicsr). CLINT 0x0200_0000; SENTINEL 0x200.
-        // hart 0 broadcasts msip[1..3]=1 (2-core: 2,3 are no-ops); each non-0 hart traps.
-        IMEM[ 0] = 32'hf1402473;  // csrr s0,mhartid
-        IMEM[ 1] = 32'h00000297;  // auipc t0,0
-        IMEM[ 2] = 32'h04c28293;  // addi t0,t0,76   -> handler
-        IMEM[ 3] = 32'h30529073;  // csrw mtvec,t0
-        IMEM[ 4] = 32'h00800293;  // li   t0,8
-        IMEM[ 5] = 32'h3042a073;  // csrs mie,t0     (MSIE)
-        IMEM[ 6] = 32'h3002a073;  // csrs mstatus,t0 (MIE)
-        IMEM[ 7] = 32'h02041863;  // bnez s0,receiver
-        IMEM[ 8] = 32'h020002b7;  // sender: lui t0,0x2000 (CLINT)
-        IMEM[ 9] = 32'h00100e93;  // li   t4,1
-        IMEM[10] = 32'h00100313;  // li   t1,1       (h)
-        IMEM[11] = 32'h00400393;  // li   t2,4       (limit)
-        IMEM[12] = 32'h00735c63;  // sloop: bge t1,t2,spin0
-        IMEM[13] = 32'h00231e13;  // slli t3,t1,2
-        IMEM[14] = 32'h01c28f33;  // add  t5,t0,t3
-        IMEM[15] = 32'h01df2023;  // sw   t4,0(t5)   (msip[h]=1)
-        IMEM[16] = 32'h00130313;  // addi t1,t1,1
-        IMEM[17] = 32'hfedff06f;  // j    sloop
-        IMEM[18] = 32'h0000006f;  // spin0: j spin0
-        IMEM[19] = 32'h0000006f;  // receiver: j receiver
-        IMEM[20] = 32'hf1402473;  // handler: csrr s0,mhartid
-        IMEM[21] = 32'h00241493;  // slli s1,s0,2
-        IMEM[22] = 32'h20000393;  // li   t2,512     (SENTINEL)
-        IMEM[23] = 32'h009383b3;  // add  t2,t2,s1
-        IMEM[24] = 32'h00100e13;  // li   t3,1
-        IMEM[25] = 32'h01c3a023;  // sw   t3,0(t2)   (SENTINEL[hart]=1)
-        IMEM[26] = 32'h020002b7;  // lui  t0,0x2000
-        IMEM[27] = 32'h009282b3;  // add  t0,t0,s1
-        IMEM[28] = 32'h0002a023;  // sw   zero,0(t0) (msip[hart]=0)
-        IMEM[29] = 32'h0000006f;  // hspin: j hspin
+        prog[ 0] = 32'hf1402473;  // csrr s0,mhartid
+        prog[ 1] = 32'h00000297;  // auipc t0,0
+        prog[ 2] = 32'h04c28293;  // addi t0,t0,76   -> handler
+        prog[ 3] = 32'h30529073;  // csrw mtvec,t0
+        prog[ 4] = 32'h00800293;  // li   t0,8
+        prog[ 5] = 32'h3042a073;  // csrs mie,t0     (MSIE)
+        prog[ 6] = 32'h3002a073;  // csrs mstatus,t0 (MIE)
+        prog[ 7] = 32'h02041863;  // bnez s0,receiver
+        prog[ 8] = 32'h020002b7;  // sender: lui t0,0x2000 (CLINT)
+        prog[ 9] = 32'h00100e93;  // li   t4,1
+        prog[10] = 32'h00100313;  // li   t1,1       (h)
+        prog[11] = 32'h00400393;  // li   t2,4       (limit)
+        prog[12] = 32'h00735c63;  // sloop: bge t1,t2,spin0
+        prog[13] = 32'h00231e13;  // slli t3,t1,2
+        prog[14] = 32'h01c28f33;  // add  t5,t0,t3
+        prog[15] = 32'h01df2023;  // sw   t4,0(t5)   (msip[h]=1)
+        prog[16] = 32'h00130313;  // addi t1,t1,1
+        prog[17] = 32'hfedff06f;  // j    sloop
+        prog[18] = 32'h0000006f;  // spin0: j spin0
+        prog[19] = 32'h0000006f;  // receiver: j receiver
+        prog[20] = 32'hf1402473;  // handler: csrr s0,mhartid
+        prog[21] = 32'h00241493;  // slli s1,s0,2
+        prog[22] = 32'h20000393;  // li   t2,512     (SENTINEL)
+        prog[23] = 32'h009383b3;  // add  t2,t2,s1
+        prog[24] = 32'h00100e13;  // li   t3,1
+        prog[25] = 32'h01c3a023;  // sw   t3,0(t2)   (SENTINEL[hart]=1)
+        prog[26] = 32'h020002b7;  // lui  t0,0x2000
+        prog[27] = 32'h009282b3;  // add  t0,t0,s1
+        prog[28] = 32'h0002a023;  // sw   zero,0(t0) (msip[hart]=0)
+        prog[29] = 32'h0000006f;  // hspin: j hspin
+`ifdef RV64
+        for (int k=0;k<NPROG/2;k++) IMEM[k] = {prog[2*k+1], prog[2*k]};
+`else
+        for (int k=0;k<NPROG;k++)   IMEM[k] = prog[k];
+`endif
         for (int c=0;c<NCORE;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wm[c]='1; end
         rst_l=0; repeat(8) @(posedge clk); rst_l=1;
 

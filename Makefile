@@ -178,6 +178,33 @@ ccd-smp-ipi4-test:
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_ipi.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smp-ipi4/Vtop
 
+# ---- post-M4 P1: RV64-on-CCD. The same three SMP litmi at XLEN=64 (-DRV64): proves the
+#      grant-and-go fabric + agents + the B9 LR/SC and agent-authoritative AMO fixes hold at
+#      64-bit (lr.d/sc.d/ld/sd, amoadd.d). Prerequisite for the RV64 xv6-SMP boot path. ----
+ccd-smp-rv64-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp-rv64 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DRV64 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp-rv64/Vtop
+
+ccd-smp-amo-rv64-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp-amo-rv64 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DRV64 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_amo.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp-amo-rv64/Vtop
+
+ccd-smp-ipi-rv64-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smp-ipi-rv64 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DRV64 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_ipi.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smp-ipi-rv64/Vtop
+
 # ---- M4-S6a multi-hart shared CLINT/PLIC directed test (standalone; clint NUM_HARTS=4 + plic NCTX=8) ----
 clint-plic-smp-test:
 	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/clint-plic-smp --top-module top \

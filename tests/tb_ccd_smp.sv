@@ -249,31 +249,61 @@ module top
         if (!ok) begin $display("  [FAIL] %s", what); errors++; end else $display("  [ ok ] %s", what);
     endtask
 
+    // litmus_smp_lock.S as a 32-bit instruction stream (LOCK=0x100, COUNTER=0x140,
+    // DONE[h]=0x180+h*0x40). RV32 (lr.w/sc.w/lw/sw) vs RV64 (lr.d/sc.d/ld/sd) differ
+    // ONLY on the five width-typed accesses; everything else encodes identically.
+    localparam int NPROG = 22;
+    logic [31:0] prog [0:NPROG-1];
     initial begin
         for (int i=0;i<IMEM_WORDS;i++) IMEM[i]='0;
-        // litmus_smp_lock.S, assembled (rv32ima_zicsr). LOCK=0x100, COUNTER=0x140, DONE[h]=0x180+h*0x40.
-        IMEM[0]  = 32'hf1402473;  // csrr s0,mhartid
-        IMEM[1]  = 32'h10000293;  // li   t0,256       (LOCK)
-        IMEM[2]  = 32'h14000313;  // li   t1,320       (COUNTER)
-        IMEM[3]  = 32'h00300393;  // li   t2,3         (ITERS)
-        IMEM[4]  = 32'h02038863;  // beqz t2,done(+0x40)
-        IMEM[5]  = 32'h1002ae2f;  // acq: lr.w t3,(t0)
-        IMEM[6]  = 32'hfe0e1ee3;  // bnez t3,acq(-8)
-        IMEM[7]  = 32'h00100e93;  // li   t4,1
-        IMEM[8]  = 32'h19d2ae2f;  // sc.w t3,t4,(t0)
-        IMEM[9]  = 32'hfe0e18e3;  // bnez t3,acq(-0x10)
-        IMEM[10] = 32'h00032f03;  // lw   t5,0(t1)
-        IMEM[11] = 32'h001f0f13;  // addi t5,t5,1
-        IMEM[12] = 32'h01e32023;  // sw   t5,0(t1)
-        IMEM[13] = 32'h0002a023;  // sw   zero,0(t0)   (release)
-        IMEM[14] = 32'hfff38393;  // addi t2,t2,-1
-        IMEM[15] = 32'hfd5ff06f;  // j    loop(-0x30)
-        IMEM[16] = 32'h18000f93;  // done: li t6,384   (DONE base)
-        IMEM[17] = 32'h00641493;  // slli s1,s0,0x6
-        IMEM[18] = 32'h009f8fb3;  // add  t6,t6,s1
-        IMEM[19] = 32'h00100f13;  // li   t5,1
-        IMEM[20] = 32'h01efa023;  // sw   t5,0(t6)     (done flag)
-        IMEM[21] = 32'h0000006f;  // spin: j spin
+        prog[0]  = 32'hf1402473;  // csrr s0,mhartid
+        prog[1]  = 32'h10000293;  // li   t0,256       (LOCK)
+        prog[2]  = 32'h14000313;  // li   t1,320       (COUNTER)
+        prog[3]  = 32'h00300393;  // li   t2,3         (ITERS)
+        prog[4]  = 32'h02038863;  // beqz t2,done(+0x40)
+`ifdef RV64
+        prog[5]  = 32'h1002be2f;  // acq: lr.d t3,(t0)
+`else
+        prog[5]  = 32'h1002ae2f;  // acq: lr.w t3,(t0)
+`endif
+        prog[6]  = 32'hfe0e1ee3;  // bnez t3,acq(-8)
+        prog[7]  = 32'h00100e93;  // li   t4,1
+`ifdef RV64
+        prog[8]  = 32'h19d2be2f;  // sc.d t3,t4,(t0)
+`else
+        prog[8]  = 32'h19d2ae2f;  // sc.w t3,t4,(t0)
+`endif
+        prog[9]  = 32'hfe0e18e3;  // bnez t3,acq(-0x10)
+`ifdef RV64
+        prog[10] = 32'h00033f03;  // ld   t5,0(t1)
+        prog[11] = 32'h001f0f13;  // addi t5,t5,1
+        prog[12] = 32'h01e33023;  // sd   t5,0(t1)
+        prog[13] = 32'h0002b023;  // sd   zero,0(t0)   (release)
+`else
+        prog[10] = 32'h00032f03;  // lw   t5,0(t1)
+        prog[11] = 32'h001f0f13;  // addi t5,t5,1
+        prog[12] = 32'h01e32023;  // sw   t5,0(t1)
+        prog[13] = 32'h0002a023;  // sw   zero,0(t0)   (release)
+`endif
+        prog[14] = 32'hfff38393;  // addi t2,t2,-1
+        prog[15] = 32'hfd5ff06f;  // j    loop(-0x30)
+        prog[16] = 32'h18000f93;  // done: li t6,384   (DONE base)
+        prog[17] = 32'h00641493;  // slli s1,s0,0x6
+        prog[18] = 32'h009f8fb3;  // add  t6,t6,s1
+        prog[19] = 32'h00100f13;  // li   t5,1
+`ifdef RV64
+        prog[20] = 32'h01efb023;  // sd   t5,0(t6)     (done flag)
+`else
+        prog[20] = 32'h01efa023;  // sw   t5,0(t6)     (done flag)
+`endif
+        prog[21] = 32'h0000006f;  // spin: j spin
+        // pack into XLEN-wide IMEM words: RV32 = 1 insn/word; RV64 = 2 insns/word
+        // (a 16 B fetch block is MEMORY_READ_WIDTH machine words; lo insn in lo half).
+`ifdef RV64
+        for (int k=0;k<NPROG/2;k++) IMEM[k] = {prog[2*k+1], prog[2*k]};
+`else
+        for (int k=0;k<NPROG;k++)   IMEM[k] = prog[k];   // XLEN==32 lvalue: bit-identical to the old table
+`endif
         for (int c=0;c<NCORE;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wm[c]='1; end
         rst_l=0; repeat(8) @(posedge clk); rst_l=1;
 
