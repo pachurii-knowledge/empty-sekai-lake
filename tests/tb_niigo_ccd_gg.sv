@@ -43,7 +43,9 @@ module tb_niigo_ccd_gg
         .mem_req_o(mreq), .mem_req_ready_i(mreq_ready), .mem_resp_i(mresp));
 
     // ---- behavioural NMI memory ----
-    localparam int MEMLINES = 16;
+    // 1024 lines so mline() spans addr[13:4] -> directory-aliasing lines (same addr[9:4] dir set,
+    // different addr[10+] tag) get DISTINCT backing memory, needed for the S1 capacity test.
+    localparam int MEMLINES = 1024;
     logic [LINE_BITS-1:0] MEM [MEMLINES];
     assign mreq_ready = 1'b1;
     function automatic int mline(input logic [MEMORY_ADDR_WIDTH-1:0] wa);
@@ -70,7 +72,7 @@ module tb_niigo_ccd_gg
     // 4-core coverage: confirm the never-at-2-cores paths are actually exercised, so a PASS is
     // meaningful (not a coverage hole). saw_oma => an upgrade-from-O ran (S4 setup); min_acks<0 =>
     // the signed ack down-counter went negative-then-corrected (the multi-ack G1 ordering hazard).
-    int saw_oma=0, saw_smad=0, saw_ima=0; int min_acks=0; int s4_hit=0, s3_hit=0;
+    int saw_oma=0, saw_smad=0, saw_ima=0; int min_acks=0; int s4_hit=0, s3_hit=0; int s5_orphan=0;
     // ordinals: T_IM_A=3, T_SM_AD=4, T_OM_A=5, T_EVICT=8 (niigo_l1d_gg tstate_e order).
     // s4_hit = a FwdGetM serviced while in an in-flight UPGRADE (T_OM_A/T_SM_AD) -> the exact S4 gap.
     // s3_hit = a snoop serviced for the T_EVICT victim line (m_vlad_q) -> the exact S3 race window.
@@ -83,7 +85,8 @@ module tb_niigo_ccd_gg
             (dut.G_AGENT[K].L1D.m_ts_q==4'd5 || dut.G_AGENT[K].L1D.m_ts_q==4'd4)) s4_hit <= s4_hit+1; \
         if (dut.G_AGENT[K].L1D.snoop_rdy_c && dut.G_AGENT[K].L1D.m_ts_q==4'd8 && \
             dut.G_AGENT[K].L1D.snoop_msg.laddr==dut.G_AGENT[K].L1D.m_vlad_q && \
-            dut.G_AGENT[K].L1D.m_vst_q==CMI_M) s3_hit <= s3_hit+1;
+            dut.G_AGENT[K].L1D.m_vst_q==CMI_M) s3_hit <= s3_hit+1; \
+        if (dut.G_AGENT[K].L1D.m_ts_q==4'd6 && dut.G_AGENT[K].L1D.d_val_q) s5_orphan <= s5_orphan+1;
     always_ff @(posedge clk) if (rst_l) begin `COV(0) `COV(1) `COV(2) `COV(3) end
 `endif
 
@@ -128,6 +131,10 @@ module tb_niigo_ccd_gg
     localparam logic [MEMORY_ADDR_WIDTH-1:0] WV='h10, WW='h11, WZ='h40, WZ2='hC0;
     // 4-core directed-test lines: WG1 (set2), WS4 (set3), WS3A/WS3B (both set1, distinct tags -> alias)
     localparam logic [MEMORY_ADDR_WIDTH-1:0] WG1='hA0, WS4='hB0, WS3A='h90, WS3B='h110;
+    // S1 capacity: WX and WY map to the SAME directory set (addr[9:4]=0x20) but different tags
+    // (addr[10+]) -- a direct-mapped 1-way dir cannot hold both.
+    localparam logic [MEMORY_ADDR_WIDTH-1:0] WX='h200, WY='h600;
+    localparam logic [MEMORY_ADDR_WIDTH-1:0] WS5='h140, WSCR='h150;   // S5 probe + scratch
     logic [XLEN-1:0] r, r1; logic ok;
 
     initial begin
@@ -292,8 +299,37 @@ module tb_niigo_ccd_gg
         cload (0, WS3A, r);  chk(r==64'h55, "S3: core0 sees core1's 0x55 (sharer NOT dropped by stale-M PUTM)");
         cload (3, WS3B, r);  chkv(r, 64'h44, "S3: S3B (the evictor's store) is coherent");
 
-        $display("[coverage] saw_oma=%0d saw_smad=%0d saw_ima=%0d min_acks=%0d s4_hit=%0d s3_hit=%0d defers=%0d",
-                 saw_oma, saw_smad, saw_ima, min_acks, s4_hit, s3_hit, defer_cnt);
+        $display("== S1cap: directory capacity aliasing -- two live lines collide in one dir set ==");
+        // WX and WY map to the same dir set (addr[9:4]) but different tags. core0 owns X dirty; core1
+        // then caches Y (aliasing). A direct-mapped 1-way dir treats Y as a miss and OVERWRITES X's
+        // entry with no recall -> it forgets core0 owns X dirty. core2's read of X then misses in the
+        // dir and is granted from STALE memory (core0's dirty X is lost; two owners now exist).
+        cstore(0, WX, 8'h51);             // core0 -> M(X), dir set 0x20, owner0 dirty (mem still 0)
+        cstore(1, WY, 8'h62);             // core1 -> M(Y), SAME dir set -> overwrites X's dir entry
+        cload (2, WX, r); chk(r==64'h51, "S1cap: core2 reads core0's dirty X=0x51 (owner not forgotten on aliasing admit)");
+        // and a writer to X must still find + INV core0's stale copy
+        cstore(3, WX, 8'h73);
+        cload (0, WX, r); chk(r==64'h73, "S1cap: core0 sees core3's 0x73 (its stale X copy was invalidated)");
+
+        $display("== S5: probe deferred-snoop-on-ReachM orphan (multi-ack acquire + phase-swept snoop) ==");
+        // The S5 hazard needs a FwdGetS/INV to land on the EXACT cycle a multi-ack acquire ReachMs
+        // (block C defers it while block E's serve_deferred reads the stale d_val_q=0 -> orphan ->
+        // the snooping peer + the dir busy slot hang). We can't do cycle-precise control here, so we
+        // PHASE-SWEEP core0's snoop across core3's acquire window by `it` scratch transactions and
+        // watch s5_orphan (an agent stuck in T_UNBLK with d_val_q set) + the harness hang watchdog.
+        for (int it=0; it<10; it++) begin
+            cstore(0, WS5, 8'h10);
+            cload(0, WS5, r); cload(1, WS5, r); cload(2, WS5, r);   // DIR_S {0,1,2}
+            fork
+                cstore(3, WS5, 8'hC0);                              // core3 GetM (acks=3) -> acquiring
+                begin for (int d=0; d<it; d++) cload(0, WSCR, r); cload(0, WS5, r); end  // phase-swept snoop
+            join
+            cload(3, WS5, r); chkv(r, 64'hC0, "S5: core3's store stands after the concurrent snoop");
+            cload(0, WS5, r); chkv(r, 64'hC0, "S5: core0 reads coherent value after the race");
+        end
+
+        $display("[coverage] saw_oma=%0d saw_smad=%0d saw_ima=%0d min_acks=%0d s4_hit=%0d s3_hit=%0d s5_orphan=%0d defers=%0d",
+                 saw_oma, saw_smad, saw_ima, min_acks, s4_hit, s3_hit, s5_orphan, defer_cnt);
         chk(min_acks < 0, "[cov] multi-ack down-counter went negative (G1 path exercised)");
         chk(s4_hit > 0,  "[cov] a FwdGetM landed on an in-flight UPGRADE T_OM_A/T_SM_AD (S4 window hit)");
         chk(s3_hit > 0,  "[cov] a snoop hit a T_EVICT victim line (S3 window hit)");
@@ -305,6 +341,6 @@ module tb_niigo_ccd_gg
         $finish;
     end
 
-    initial begin repeat(40000) @(posedge clk); $display("WATCHDOG TIMEOUT"); $finish; end
+    initial begin repeat(200000) @(posedge clk); $display("WATCHDOG TIMEOUT (possible S5 deadlock -- check s5_orphan)"); $finish; end
 endmodule
 `default_nettype wire
