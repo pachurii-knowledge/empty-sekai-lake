@@ -48,9 +48,9 @@ infrastructures of the same course.
   protocol is independently model-checked in CMurphi (`formal/moesi_ccd*.m`). The
   coherent CCD is validated in RTL/Verilator simulation (FPGA emulation of a >2-core
   cluster is descoped pending a larger target part).
-- **FPGA emulation**: The full core and the full SoC (`niigo_soc` = core + L1 caches + memory subsystem + AXI4-512 master) synthesize in Vivado for the AMD Virtex UltraScale+ HBM VU47P (AWS F2 instances), and are wrapped into the F2 Custom Logic shell (`fpga/rtl/cl_niigo.sv`) with an OCL control plane, a virtual UART console, and a post-mortem debug window for on-card bring-up. Timing closure (tracked as FB2b) currently clears **62.5 MHz at Quick-place** (worst negative slack ≈ −7.7 ns ⇒ 63.7 MHz) after three targeted pipeline cuts — a 2-stage ROB commit, a registered LSQ head-translate, and a 2-stage CVFPU FMA — versus an earlier **~60MHz post-route** measurement; the routed/on-card confirmation is the next build. Target frequency is 125MHz. (FPGA
+- **FPGA emulation**: The full core and the full SoC (`niigo_soc` = core + L1 caches + memory subsystem + AXI4-512 master) synthesize in Vivado for the AMD Virtex UltraScale+ HBM VU47P (AWS F2 instances), and are wrapped into the F2 Custom Logic shell (`fpga/rtl/cl_niigo.sv`) with an OCL control plane, a virtual UART console, and a post-mortem debug window for on-card bring-up. Timing closure (tracked as FB2b) currently clears **62.5 MHz at Quick-place** (worst negative slack ≈ −7.7 ns ⇒ 63.7 MHz) after three targeted pipeline cuts: a 2-stage ROB commit, a registered LSQ head-translate, and a 2-stage CVFPU FMA, versus an earlier **~60MHz post-route** measurement; the routed/on-card confirmation is the next build. Target frequency is 125MHz. (FPGA
 synth/timing covers the single-core `niigo_soc`; the multicore coherent CCD is validated
-in RTL/Verilator simulation — see *Multicore / SMP* above.)
+in RTL/Verilator simulation : see *Multicore / SMP* above.)
 
 ## Future Roadmap
 
@@ -390,8 +390,8 @@ parameter; cross-hart IPIs are uncached `msip` stores to the shared CLINT.
 - `scripts/`: ACT build/run helpers, memory-image and DTB tooling, OS-image loaders
 - `act-config/`: version-controlled niigo ACT DUT config (RV32 and RV64), synced into the
   test checkout
-- `plans/`: design/bring-up plans (e.g. `rv64-linux.md`, `multicore-ccd.md`)
 - `references/`: upstream/reference material and generated RISC-V test artifacts
+**To be changed:** dependencies located in `references/` will be moved outside later
 - `tests/`: local project tests (incl. the `tb_ccd_*.sv` coherence/SMP harnesses)
 - `output/`: generated build, simulation, and test output
 
