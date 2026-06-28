@@ -375,6 +375,21 @@ module niigo_l1d_gg
             m_unon_n=ON_NA; m_ts_n=T_UNBLK; m_issued_n=0;
         end
 
+        // (E2) S5: drain a deferred snoop orphaned on the install/ReachM cycle. If block C deferred a
+        // snoop (d_val_n=1) the SAME cycle the acquire installed (block D T_IS_D) or reached M (block
+        // E), serve_deferred there read the REGISTERED d_val_q==0 and missed it, so the FSM advanced
+        // to T_UNBLK -- which never serves -- and the transaction would retire (m_val->0) with d_val_q
+        // still set, STRANDING the snoop forever (the snooping peer + the single dir busy slot then
+        // hang: the NCORE=4 boot deadlock, reproduced deterministically by ccd-gg4-test Bstorm).
+        // T_UNBLK/T_UNBLK_WB hold >=1 cycle to send the UNBLOCK/refresh-WB, so drain the orphan here
+        // against the now-committed line before the retire. Guarded so it never collides with a
+        // same-cycle new-snoop service (block C) or any state-write port. Inert single-core.
+        if (m_val_q && (m_ts_q==T_UNBLK || m_ts_q==T_UNBLK_WB) && d_val_q && !sr_pend_q
+            && !snoop_rdy_c && !cs_we && !cw_we && !css_we) begin
+            automatic logic [IDX-1:0] ix2=ixf(m_lad_q);
+            serve_deferred(ix2, state_q[ix2], m_lad_q, data_q[ix2]);
+        end
+
         // (G) inbound INV_ACK / WB_ACK
         if (ack_valid) begin
             ack_rdy_c=1;
