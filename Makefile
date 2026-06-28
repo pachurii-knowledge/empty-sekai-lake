@@ -252,6 +252,24 @@ ccd-memsys-rv64-test:
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_memsys.sv)
 	$(OUTPUT_BASE_DIR)/ccd-memsys-rv64/Vtop
 
+# ---- post-M4 P6: xv6-SMP boot harness (build only; run from a staged xv6 image dir).
+#      NCORE real RV64 cores over niigo_ccd_memsys + nmi_mem_adapter->main_memory + a shared
+#      CLINT/PLIC/UART hub. Stage the image (scripts/load_elf_mem.py + fs.img manifest) into a
+#      run dir, then:  cd output/xv6m2 && <Mdir>/Vtop +no_ecall_halt +uart_in=$'ls\n' ----
+ccd-xv6-build:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-xv6 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DRV64 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_xv6.sv)
+
+ccd-xv6-1-build:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-xv6-1 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DRV64 -DNCORE1 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_xv6.sv)
+
 # ---- M4-S6a multi-hart shared CLINT/PLIC directed test (standalone; clint NUM_HARTS=4 + plic NCTX=8) ----
 clint-plic-smp-test:
 	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/clint-plic-smp --top-module top \
