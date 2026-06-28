@@ -283,7 +283,7 @@ ccd-xv6-1-build:
 # Vtop already needs ~10GB per big file -- 4 cores is bigger, so build with a bounded, detached
 # Mdir make, e.g.:  make -C output/ccd-xv6-4 -j2 -f Vtop.mk  (see OVERNIGHT_BUGLOG.md / plans/smp-4core-bug-surface.md).
 ccd-xv6-4-build:
-	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+	$(VERILATOR) --sv --timing --binary -j 0 --build-jobs 2 -Wno-fatal --top-module top \
 		--Mdir $(OUTPUT_BASE_DIR)/ccd-xv6-4 \
 		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DRV64 -DNCORE4 \
 		$(VERILATOR_INC_FLAGS) \
