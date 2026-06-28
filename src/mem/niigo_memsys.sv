@@ -312,10 +312,10 @@ module niigo_memsys
     assign l1i_snoop_valid = present_dmem && dmem_req_write && l1d_req_fire;
     assign l1i_snoop_waddr = l1d_req_waddr;
 `elsif CCD_AGENT
-    // C4 I/D-coherence (committed-store -> L1I snoop) is deferred for M3d Stage 1;
-    // fence.i drives the agent writeback flush + ifetch_inval, which covers SMC.
-    assign l1i_snoop_valid = 1'b0;
-    assign l1i_snoop_waddr = '0;
+    // P2 I/D-coherence: the L1I snoop is driven in the CCD data-side block below -- a local
+    // committed store OR a remote write-snoop (directory FwdGetM/INV) invalidates any L1I copy
+    // of that line. Combined with the agent probe (coherent refill), this covers exec / SMC
+    // WITHOUT a cross-hart fence.i (which xv6 never issues). (decl-only here; assigned below.)
 `else
     assign l1i_snoop_valid = dmem_store_fire;
     assign l1i_snoop_waddr = dmem_req_addr;
@@ -721,6 +721,23 @@ module niigo_memsys
 
     wire ad_done = ad_busy_q && c_req_ready[0];   // grant-and-go completion pulse
 
+    // ---- P2 I/D-coherence: agent probe (coherent L1I refill) + L1I snoop-invalidate ----
+    // probe[0] is driven by the L1I's pending RD_LINE: if the agent holds that line, the
+    // refill is satisfied from the agent's CURRENT data (probe_serve, below) so freshly
+    // written code (exec) is fetched coherently. A committed store (or a remote write-snoop)
+    // invalidates any stale L1I copy of its line.
+    logic                          ccd_probe_v   [1];
+    logic [MEMORY_ADDR_WIDTH-1:0]  ccd_probe_wa  [1];
+    logic                          ccd_probe_hit [1];
+    logic [LINE_BITS-1:0]          ccd_probe_line[1];
+    assign ccd_probe_v[0]  = l1i_nmi_req.valid && (l1i_nmi_req.op == NMI_RD_LINE);
+    assign ccd_probe_wa[0] = l1i_nmi_req.waddr;
+    // a committed agent WRITE (store / AMO / SC) -> invalidate the local L1I copy (local SMC);
+    // a remote write-snoop (ccd_sk_v[0], directory FwdGetM/INV; inert single-core) does the same.
+    wire ad_commit_write = ad_done && (ad_op_q == COP_STORE || ad_is_amo_q || ad_is_sc_q);
+    assign l1i_snoop_valid = ad_commit_write || ccd_sk_v[0];
+    assign l1i_snoop_waddr = ad_commit_write ? ad_addr_q : ccd_sk_la[0];
+
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin ad_busy_q <= 1'b0; ad_resp_pend_q <= 1'b0; end
         else begin
@@ -787,6 +804,9 @@ module niigo_memsys
         .flush_req(ccd_flush_req), .flush_done(dcache_flush_done),
         // M4 S1: the wrapper exposes a per-agent snoop_kill array; single-core uses index [0].
         .snoop_kill_valid(ccd_sk_v), .snoop_kill_laddr(ccd_sk_la),
+        // P2: coherent L1I refill probe (single-core uses index [0]).
+        .probe_valid(ccd_probe_v), .probe_waddr(ccd_probe_wa),
+        .probe_hit(ccd_probe_hit), .probe_line(ccd_probe_line),
         .mem_req_o(ccd_nmi_req), .mem_req_ready_i(ccd_nmi_ready), .mem_resp_i(ccd_nmi_resp)
     );
     logic                          ccd_sk_v [1];
@@ -830,16 +850,35 @@ module niigo_memsys
     assign arb_m_req[0]  = ccd_nmi_req;
     assign ccd_nmi_ready = arb_m_ready[0];
     assign ccd_nmi_resp  = arb_m_resp[0];
-    // No clean-before-refill probe (C4 deferred): the L1I refills freely; fence.i
-    // writeback-flush + ifetch_inval covers self-modifying code.
-    assign arb_m_req[1]  = l1i_nmi_req;
-    assign l1i_nmi_ready = arb_m_ready[1];
+    // P2 coherent L1I refill: if the agent holds the requested line (probe_hit), serve the
+    // refill from the agent's CURRENT data (incl. dirty bytes) and SKIP the memory read, so
+    // exec'd / self-modified code is fetched coherently without a fence.i. Otherwise the L1I
+    // refills from memory through the arbiter as usual. A probe serve completes in 2 cycles
+    // (accept, then deliver) like a 1-beat memory read. (Multi-core remote-dirty -> P4.)
+    logic                 pserve_q;
+    logic [LINE_BITS-1:0] pserve_line_q;
+    wire l1i_probe_serve  = ccd_probe_v[0] && ccd_probe_hit[0];
+    assign arb_m_req[1]   = l1i_probe_serve ? '0 : l1i_nmi_req;
+    assign l1i_nmi_ready  = l1i_probe_serve ? !pserve_q : arb_m_ready[1];
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l)                                 pserve_q <= 1'b0;
+        else if (l1i_probe_serve && !pserve_q) begin pserve_q <= 1'b1; pserve_line_q <= ccd_probe_line[0]; end
+        else if (pserve_q)                          pserve_q <= 1'b0;
+    end
+    nmi_resp_t l1i_resp_mux;
+    always_comb begin
+        l1i_resp_mux = arb_m_resp[1];
+        if (pserve_q) begin l1i_resp_mux.valid = 1'b1; l1i_resp_mux.rdata = pserve_line_q; l1i_resp_mux.err = 1'b0; end
+    end
+    assign l1i_nmi_resp  = l1i_resp_mux;
 `else
     assign arb_m_req[0] = '0;          // L1D / CCD agent attaches here at L1D=1 / CCD=1
     assign arb_m_req[1]  = l1i_nmi_req;
     assign l1i_nmi_ready = arb_m_ready[1];
 `endif
+`ifndef CCD_AGENT
     assign l1i_nmi_resp  = arb_m_resp[1];
+`endif
 
     nmi_arbiter #(.N_MASTERS(2)) Arb (
         .clk, .rst_l,

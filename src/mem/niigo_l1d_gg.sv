@@ -43,6 +43,18 @@ module niigo_l1d_gg
     input  wire logic [XLEN/8-1:0]             c_req_wmask,   // M3d: per-byte write-enable (sub-word stores)
     output logic [XLEN-1:0]                     c_resp_rdata,
     output logic                               c_resp_sc_ok,
+    // ---- P2 I/D-coherence probe: a read-only line lookup for the L1I refill. niigo_memsys
+    //      asserts probe_valid with the line word-addr the L1I is about to refill; if THIS
+    //      agent holds that line in any valid MOESI state, probe_hit + the CURRENT line data
+    //      (incl. dirty M/O bytes not yet written to memory) are returned, so the L1I installs
+    //      coherent code WITHOUT a fence.i (xv6 exec / self-modifying code). Pure combinational
+    //      array read -- no state change, single demand MSHR untouched. Constant 0 when
+    //      probe_valid is tied off (litmus harnesses) -> those paths bit-identical. (Multi-core:
+    //      a REMOTE owner's dirty line is pulled through the directory instead -- P4.) ----
+    input  wire logic                          probe_valid,
+    input  wire logic [MEMORY_ADDR_WIDTH-1:0]  probe_waddr,
+    output logic                               probe_hit,
+    output logic [LINE_BITS-1:0]               probe_line,
     // ---- M3d Stage 3 (S1): snoop-kill tap to the core LSQ. Pulses when this agent ACCEPTS
     //      an inbound remote-WRITE snoop (FwdGetM/INV) -- the RVWMO event that must kill a
     //      reservation / squash a speculatively-completed load to that line. Excludes FwdGetS
@@ -509,6 +521,13 @@ module niigo_l1d_gg
     assign dmd_valid=dmd_v_c; assign dmd_msg=dmd_m_c;
     assign c_req_ready=creq_rdy_c; assign c_resp_rdata=crd_c; assign c_resp_sc_ok=csc_c;
     assign flush_done=flush_done_c;
+    // P2 I/D-coherence probe (combinational, read-only): the L1I refill obtains the agent's
+    // current line (dirty or clean) for coherent code fetch. A probe never changes state.
+    always_comb begin
+        automatic logic [IDX-1:0] pix = ixf(probe_waddr);
+        probe_hit  = probe_valid && (state_q[pix]!=CMI_I) && (tag_q[pix]==tgf(probe_waddr));
+        probe_line = data_q[pix];
+    end
     // S1: snoop-kill tap -- an ACCEPTED inbound FwdGetM/INV (a remote write) for the LSQ to
     // act on (reservation-kill in S2, spec-load squash in S5). snoop_rdy_c is asserted in both
     // the defer and the service branch of block C, so this fires exactly once per accepted snoop.

@@ -50,6 +50,14 @@ module niigo_ccd_gg_direct
     // use index [0]. (M3d Stage 3 exposed only core 0; M4 widens to the array for SMP.)
     output logic                               snoop_kill_valid [NACTIVE],
     output logic [MEMORY_ADDR_WIDTH-1:0]       snoop_kill_laddr [NACTIVE],
+    // ---- P2 I/D-coherence probe (per-agent): niigo_memsys drives agent[c]'s probe with the
+    //      L1I refill line-addr; probe_hit[c]/probe_line[c] return that core's current copy so
+    //      the L1I installs coherent code. Tied off (probe_valid=0) in the litmus harnesses
+    //      -> inert there. (Single-core today; the multi-core SoC drives one per core.) ----
+    input  wire logic                          probe_valid [NACTIVE],
+    input  wire logic [MEMORY_ADDR_WIDTH-1:0]  probe_waddr [NACTIVE],
+    output logic                               probe_hit   [NACTIVE],
+    output logic [LINE_BITS-1:0]               probe_line  [NACTIVE],
     output nmi_req_t   mem_req_o,
     input  wire logic  mem_req_ready_i,
     input  nmi_resp_t  mem_resp_i
@@ -89,6 +97,8 @@ module niigo_ccd_gg_direct
             .c_req_op(c_req_op[gi]), .c_req_amo(c_req_amo[gi]),
             .c_req_waddr(c_req_waddr[gi]), .c_req_wdata(c_req_wdata[gi]), .c_req_wmask(c_req_wmask[gi]),
             .c_resp_rdata(c_resp_rdata[gi]), .c_resp_sc_ok(c_resp_sc_ok[gi]),
+            .probe_valid(probe_valid[gi]), .probe_waddr(probe_waddr[gi]),
+            .probe_hit(probe_hit[gi]), .probe_line(probe_line[gi]),
             .flush_req((gi==0) ? flush_req : 1'b0), .flush_done(fl_done_a[gi]),
             .snoop_kill_valid(snoop_kill_valid[gi]), .snoop_kill_laddr(snoop_kill_laddr[gi]),
             .dmd_valid(dmd_v[gi]), .dmd_msg(dmd_m[gi]), .dmd_ready(dmd_r[gi]),
