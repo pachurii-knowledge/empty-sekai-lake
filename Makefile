@@ -205,6 +205,34 @@ ccd-smp-ipi-rv64-test:
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smp_ipi.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smp-ipi-rv64/Vtop
 
+# ---- post-M4 P4: cross-core self-modifying-code litmus. NCORE real cores, each with a REAL
+#      l1_icache behind the directory; the remote-dirty I-fetch (probe local L1D, COP_LOAD on
+#      miss, probe-serve) lets hart 1 fetch hart 0's freshly-patched (dirty) code line coherently
+#      with no fence.i -- the mechanism xv6-SMP needs for cross-hart exec. RESULT==0x222. ----
+ccd-smc-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smc \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smc.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smc/Vtop
+
+ccd-smc-rv64-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smc-rv64 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DRV64 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smc.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smc-rv64/Vtop
+
+ccd-smc4-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-smc4 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNCORE4 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smc.sv)
+	$(OUTPUT_BASE_DIR)/ccd-smc4/Vtop
+
 # ---- M4-S6a multi-hart shared CLINT/PLIC directed test (standalone; clint NUM_HARTS=4 + plic NCTX=8) ----
 clint-plic-smp-test:
 	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/clint-plic-smp --top-module top \
