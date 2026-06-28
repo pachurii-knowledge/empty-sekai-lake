@@ -7,8 +7,13 @@
 // ONE shared CLINT(NUM_HARTS)/PLIC(NCTX=2*NCORE)/UART hub lives here (NIIGO_EXT_DEVICES); the
 // UART auto-$write's the console and reads +uart_in for stdin.
 //
-//   Build:  make ccd-xv6-test        (NCORE=2)  |  ccd-xv6-1-test (NCORE=1, module/boot sanity)
-//   Run:    cd output/xv6m2 && <Mdir>/Vtop +no_ecall_halt +uart_in=$'ls\n'
+//   Build:  make ccd-xv6-build       (NCORE=2)  |  ccd-xv6-1-build (NCORE=1, module/boot sanity)
+//   Run:    cd output/xv6m2 && <Mdir>/Vtop +no_ecall_halt +uart_in=$'ls\n' [+maxcyc=N]
+//
+// VERIFIED: NCORE=2 boots xv6-SMP to the interactive `$` shell and runs `ls` -- two real
+// coherent harts over the grant-and-go directory exec init -> sh -> ls and read the fs.img
+// ramdisk through the coherent path (xv6 kernel is booting / init: starting sh / $ . .. README
+// cat echo forktest grep init kill ...). NCORE=1 likewise boots to $.
 `include "niigo_mem.vh"
 `include "niigo_cmi.vh"
 `include "niigo_ccd_m1.vh"
