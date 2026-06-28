@@ -14,18 +14,26 @@ module tb_niigo_ccd_gg
     import NIIGO_CMI::*;
     import NIIGO_CCD_M1::*;
 ;
+    // NC: core count. Default 2 (the proven message-level baseline, ccd-gg-test). -DNC4 builds the
+    // SAME programs over NACTIVE=4 plus the 4-core-only directed tests (G1 multi-ack, S4, S3) that
+    // the 2-core path structurally cannot reach. The NC=2 build is behaviorally unchanged.
+`ifdef NC4
+    localparam int NC = 4;
+`else
+    localparam int NC = 2;
+`endif
     logic clk=0, rst_l=0;
     always #5 clk=~clk;
 
     nmi_req_t mreq; logic mreq_ready; nmi_resp_t mresp;
 
-    logic        creq_v   [2];  l1_core_op_e creq_op [2]; l1_amo_op_e creq_amo[2];
-    logic [MEMORY_ADDR_WIDTH-1:0] creq_wa[2]; logic [XLEN-1:0] creq_wd[2]; logic [XLEN/8-1:0] creq_wm[2];
-    logic        creq_rdy [2];  logic [XLEN-1:0] cresp_rd[2]; logic cresp_sc[2];
+    logic        creq_v   [NC];  l1_core_op_e creq_op [NC]; l1_amo_op_e creq_amo[NC];
+    logic [MEMORY_ADDR_WIDTH-1:0] creq_wa[NC]; logic [XLEN-1:0] creq_wd[NC]; logic [XLEN/8-1:0] creq_wm[NC];
+    logic        creq_rdy [NC];  logic [XLEN-1:0] cresp_rd[NC]; logic cresp_sc[NC];
 
     // DIR_SETS >> L1_SETS so an L1 conflict-evict does not also evict the directory entry (a NINE
     // directory-capacity / backup-dir concern, OPEN-3, out of M3c scope).
-    niigo_ccd_gg_direct #(.NACTIVE(2), .DIR_SETS(64), .L1_SETS(8), .RESP_DLY(4)) dut (
+    niigo_ccd_gg_direct #(.NACTIVE(NC), .DIR_SETS(64), .L1_SETS(8), .RESP_DLY(4)) dut (
         .clk, .rst_l,
         .c_req_valid(creq_v), .c_req_ready(creq_rdy), .c_req_op(creq_op), .c_req_amo(creq_amo),
         .c_req_waddr(creq_wa), .c_req_wdata(creq_wd), .c_req_wmask(creq_wm),
@@ -58,6 +66,26 @@ module tb_niigo_ccd_gg
         if (dut.G_AGENT[0].L1D.d_val_n && !dut.G_AGENT[0].L1D.d_val_q) defer_cnt<=defer_cnt+1;
         if (dut.G_AGENT[1].L1D.d_val_n && !dut.G_AGENT[1].L1D.d_val_q) defer_cnt<=defer_cnt+1;
     end
+`ifdef NC4
+    // 4-core coverage: confirm the never-at-2-cores paths are actually exercised, so a PASS is
+    // meaningful (not a coverage hole). saw_oma => an upgrade-from-O ran (S4 setup); min_acks<0 =>
+    // the signed ack down-counter went negative-then-corrected (the multi-ack G1 ordering hazard).
+    int saw_oma=0, saw_smad=0, saw_ima=0; int min_acks=0; int s4_hit=0, s3_hit=0;
+    // ordinals: T_IM_A=3, T_SM_AD=4, T_OM_A=5, T_EVICT=8 (niigo_l1d_gg tstate_e order).
+    // s4_hit = a FwdGetM serviced while in an in-flight UPGRADE (T_OM_A/T_SM_AD) -> the exact S4 gap.
+    // s3_hit = a snoop serviced for the T_EVICT victim line (m_vlad_q) -> the exact S3 race window.
+    `define COV(K) \
+        if (dut.G_AGENT[K].L1D.m_ts_q==4'd5) saw_oma  <= saw_oma+1;  \
+        if (dut.G_AGENT[K].L1D.m_ts_q==4'd4) saw_smad <= saw_smad+1; \
+        if (dut.G_AGENT[K].L1D.m_ts_q==4'd3) saw_ima  <= saw_ima+1;  \
+        if (dut.G_AGENT[K].L1D.m_acks_q < min_acks) min_acks <= dut.G_AGENT[K].L1D.m_acks_q; \
+        if (dut.G_AGENT[K].L1D.snoop_rdy_c && dut.G_AGENT[K].L1D.snoop_msg.op==OP_FWD_GETM && \
+            (dut.G_AGENT[K].L1D.m_ts_q==4'd5 || dut.G_AGENT[K].L1D.m_ts_q==4'd4)) s4_hit <= s4_hit+1; \
+        if (dut.G_AGENT[K].L1D.snoop_rdy_c && dut.G_AGENT[K].L1D.m_ts_q==4'd8 && \
+            dut.G_AGENT[K].L1D.snoop_msg.laddr==dut.G_AGENT[K].L1D.m_vlad_q && \
+            dut.G_AGENT[K].L1D.m_vst_q==CMI_M) s3_hit <= s3_hit+1;
+    always_ff @(posedge clk) if (rst_l) begin `COV(0) `COV(1) `COV(2) `COV(3) end
+`endif
 
     int errors=0;
     task automatic chk(input bit ok, input string what);
@@ -98,11 +126,13 @@ module tb_niigo_ccd_gg
     endtask
 
     localparam logic [MEMORY_ADDR_WIDTH-1:0] WV='h10, WW='h11, WZ='h40, WZ2='hC0;
+    // 4-core directed-test lines: WG1 (set2), WS4 (set3), WS3A/WS3B (both set1, distinct tags -> alias)
+    localparam logic [MEMORY_ADDR_WIDTH-1:0] WG1='hA0, WS4='hB0, WS3A='h90, WS3B='h110;
     logic [XLEN-1:0] r, r1; logic ok;
 
     initial begin
         for (int i=0;i<MEMLINES;i++) MEM[i]='0;
-        for (int c=0;c<2;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wa[c]='0; creq_wd[c]='0; creq_wm[c]='1; end
+        for (int c=0;c<NC;c++) begin creq_v[c]=0; creq_op[c]=COP_LOAD; creq_amo[c]=AMO_ADD; creq_wa[c]='0; creq_wd[c]='0; creq_wm[c]='1; end
         rst_l=0; repeat(4) @(posedge clk); rst_l=1; repeat(2) @(posedge clk);
 
         $display("== S1: core0 store V=100, core1 load V (cross-core coherence over the grant-and-go direct interconnect) ==");
@@ -199,6 +229,75 @@ module tb_niigo_ccd_gg
         cload  (0, 'h70, r); chkv(r, 32'hAABBCC11, "C8: hit byte-store merges (AABBCC11)");
         cstoreb(1, 'h80, 32'h0000EE00, 4'b0010);     // MISS + byte1 <- 0xEE onto a fresh (0) line
         cload  (1, 'h80, r); chkv(r, 32'h0000EE00, "C8: miss byte-store merges onto fresh line");
+
+`ifdef NC4
+        // ================= 4-CORE DIRECTED TESTS (G1 multi-ack, S4, S3) =================
+        // These exercise the directory/agent paths that are STRUCTURALLY unreachable at 2 cores:
+        // ack-to-requester fan > 1 (G1), an owner-in-O upgrade racing a peer GetM (S4), and a
+        // dirty-shared (O) line evicted while a peer snoops the victim (S3). See plans/smp-4core-bug-surface.md.
+
+        $display("== G1: multi-sharer GetM ack-to-requester (3 sharers -> core3 STORE, acks=3) ==");
+        // The dir fans INVs to {0,1,2} BEFORE fetching the grant DATA, so core3's signed ack
+        // down-counter legitimately goes -3 then is corrected by +3 from the DATA -> ReachM. An
+        // off-by-one in any arrival order either fires ReachM early (write-atomicity break) or hangs.
+        cstore(0, WG1, 0);
+        cload (0, WG1, r);   // core0 holds it
+        cload (1, WG1, r);   // + core1 shares
+        cload (2, WG1, r);   // + core2 shares  => DIR_S {0,1,2}
+        cstore(3, WG1, 777); // GetM: INV 3 sharers, DATA carries acks=3
+        cload (3, WG1, r); chkv(r, 777, "G1: core3 store applied after 3-sharer INV");
+        cload (0, WG1, r); chkv(r, 777, "G1: core0 re-reads coherent value (was INV'd)");
+        cload (1, WG1, r); chkv(r, 777, "G1: core1 re-reads coherent value");
+        cload (2, WG1, r); chkv(r, 777, "G1: core2 re-reads coherent value");
+
+        $display("== G1b: multi-sharer AMO (3 sharers, core3 amoadd -> acks=3 on the AMO acquire) ==");
+        cstore(0, WG1, 10);
+        cload(0,WG1,r); cload(1,WG1,r); cload(2,WG1,r);   // DIR_S {0,1,2}, value 10
+        camo(3, AMO_ADD, WG1, 5, r); chkv(r, 10, "G1b: core3 amoadd returns old 10 (acks=3)");
+        cload(0, WG1, r); chkv(r, 15, "G1b: amo result 15 coherent to core0");
+
+        $display("== S4: owner-in-O UPGRADE vs INVALID-peer GetM (FwdGetM lands in T_OM_A) ==");
+        // The S4 gap is specifically a *FwdGetM* (not INV) arriving at an owner in T_OM_A. That needs
+        // the writing peer to be INVALID (a sharer-store would be an UPGRADE -> the dir sends INV,
+        // which IS demoted today). So: core1 owns dirty + core2 shares (DIR_O owner1), then the
+        // owner core1 UPGRADEs while the INVALID core0 GetMs -- core0 (lower idx) wins arb, the dir
+        // sends FwdGetM to core1 mid-T_OM_A. Two DIFFERENT words expose a skipped line-install:
+        // if core1's upgrade skips installing core0's line, word0 reverts to the stale 0.
+        cstore(1, WS4,   8'h0);           // word0 = 0
+        cstore(1, WS4+1, 8'h0);           // word1 = 0  (core1 -> M)
+        cload (2, WS4,   r);              // core2 reads -> core1 M->O (DIR_O owner1, sharers{1,2})
+        fork
+            cstore(1, WS4+1, 8'hB1);      // owner core1 UPGRADE from O (T_OM_A), writes WORD1
+            cstore(0, WS4,   8'hA0);      // INVALID core0 GetM (lower idx) -> FwdGetM to core1, writes WORD0
+        join
+        cload(2, WS4,   r);  chk(r==64'hA0, "S4: word0 holds core0's 0xA0 (line install not skipped)");
+        cload(2, WS4+1, r1); chk(r1==64'hB1, "S4: word1 holds core1's 0xB1");
+        cload(3, WS4,   r);  chk(r==64'hA0, "S4: word0 coherent to core3");
+        cload(1, WS4,   r);  chk(r==64'hA0, "S4: word0 coherent to core1 (the upgrader)");
+
+        $display("== S3: dirty-EXCLUSIVE (M) line evicted while a peer GetS snoops it (T_EVICT, M->O) ==");
+        // The reported S3 variant: core3 holds S3A in M (DIR_EM, NO other sharers) and conflict-evicts
+        // it (PUTM, captured m_vst=M) while the fresh low-index core0 GetSs S3A -- core0's GetS wins
+        // arb -> FwdGetS to core3's M victim mid-T_EVICT. core3 M->O demotes and forwards a copy to
+        // core0 (creating a sharer), but its captured m_vst stays M so it still sends OP_PUTM. If the
+        // dir's PUTM path forces DIR_I regardless of the just-created core0 sharer, core0 is dropped:
+        // a later writer then grants M with no INV and core0 keeps a stale copy.
+        cstore(3, WS3A, 8'h33);           // core3 -> M(S3A), DIR_EM owner3, no sharers
+        fork
+            cstore(3, WS3B, 8'h44);       // core3 (idx3): conflict-evict the M victim (PUTM, m_vst=M)
+            cload (0, WS3A, r1);          // core0 (idx0, fresh): GetS -> FwdGetS to core3's M victim -> M->O
+        join
+        cload(0, WS3A, r);  chk(r==64'h33, "S3: core0 reads dirty S3A=0x33 via the evict-vs-snoop forward");
+        cstore(1, WS3A, 8'h55);           // core1 writes S3A -> must INV core0 (the FwdGetS-created sharer)
+        cload (0, WS3A, r);  chk(r==64'h55, "S3: core0 sees core1's 0x55 (sharer NOT dropped by stale-M PUTM)");
+        cload (3, WS3B, r);  chkv(r, 64'h44, "S3: S3B (the evictor's store) is coherent");
+
+        $display("[coverage] saw_oma=%0d saw_smad=%0d saw_ima=%0d min_acks=%0d s4_hit=%0d s3_hit=%0d defers=%0d",
+                 saw_oma, saw_smad, saw_ima, min_acks, s4_hit, s3_hit, defer_cnt);
+        chk(min_acks < 0, "[cov] multi-ack down-counter went negative (G1 path exercised)");
+        chk(s4_hit > 0,  "[cov] a FwdGetM landed on an in-flight UPGRADE T_OM_A/T_SM_AD (S4 window hit)");
+        chk(s3_hit > 0,  "[cov] a snoop hit a T_EVICT victim line (S3 window hit)");
+`endif
 
         $display("");
         if (errors==0) $display("==== tb_niigo_ccd_gg: ALL CHECKS PASSED ====");

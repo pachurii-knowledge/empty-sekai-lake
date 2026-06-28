@@ -95,6 +95,15 @@ ccd-gg-test:
 		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_gg.sv
 	$(OUTPUT_BASE_DIR)/ccd-gg/Vtb_niigo_ccd_gg
 
+# ---- 4-core grant-and-go directed protocol tests (NACTIVE=4): the SAME S1-S6/C1-C8 programs PLUS
+#      G1 (multi-sharer ack-to-requester, acks>1), S4 (owner-in-O upgrade vs peer GetM), and S3
+#      (dirty-shared O line evicted while a peer snoops) -- the paths unreachable at 2 cores. ----
+ccd-gg4-test:
+	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/ccd-gg4 --top-module tb_niigo_ccd_gg \
+		-Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT -Wno-ASCRANGE \
+		-DLAB_18447='"4b"' -DNC4 -Isrc -Isrc/mem tests/tb_niigo_ccd_gg.sv
+	$(OUTPUT_BASE_DIR)/ccd-gg4/Vtb_niigo_ccd_gg
+
 # ---- M3c-D grant-and-go MOESI coherence over the real wheel NoC (dir/agent on the hub-funnel + ring) ----
 ccd-gg-wheel-test:
 	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/ccd-gg-wheel --top-module tb_niigo_ccd_gg_wheel \
