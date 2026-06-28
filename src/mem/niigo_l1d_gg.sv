@@ -280,6 +280,16 @@ module niigo_l1d_gg
                         sr_pend_n=1; sr_dst_n=cnode(snoop_msg.req);
                         sr_msg_n=umsg(OP_DATA,CMI_M,ON_NA,snoop_msg.req,snoop_msg.acks,data_q[si],snoop_msg.laddr);
                         css_we=1; css_idx=si; css_val=CMI_I;
+                        // S4 (plans/smp-4core-bug-surface.md): a FwdGetM to an in-flight UPGRADE on
+                        // this line (owner in T_OM_A, or sharer in T_SM_AD) just handed our copy to
+                        // the remote writer. Demote to a re-fetch-WITH-install GetM so block-D
+                        // installs the now remote-modified line before ReachM applies our store --
+                        // else block-D's no-data T_OM_A/T_SM_AD grant keeps the stale line and ReachM
+                        // corrupts the un-written words. Mirrors the existing OP_INV demote (only the
+                        // INV case was covered; the FwdGetM case was the gap). Inert single-core.
+                        if (m_val_q && m_lad_q==snoop_msg.laddr && (m_ts_q==T_SM_AD||m_ts_q==T_OM_A)) begin
+                            m_ts_n=T_IM_AD; m_data_n=0; m_issued_n=0;
+                        end
                     end
                     OP_INV: begin
                         sr_pend_n=1; sr_dst_n=cnode(snoop_msg.req);
