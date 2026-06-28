@@ -135,6 +135,7 @@ module tb_niigo_ccd_gg
     // (addr[10+]) -- a direct-mapped 1-way dir cannot hold both.
     localparam logic [MEMORY_ADDR_WIDTH-1:0] WX='h200, WY='h600;
     localparam logic [MEMORY_ADDR_WIDTH-1:0] WS5='h140, WSCR='h150;   // S5 probe + scratch
+    localparam logic [MEMORY_ADDR_WIDTH-1:0] HA='h160, HB='h260;      // B-storm: alias in L1 set 6
     logic [XLEN-1:0] r, r1; logic ok;
 
     initial begin
@@ -328,6 +329,33 @@ module tb_niigo_ccd_gg
             cload(0, WS5, r); chkv(r, 64'hC0, "S5: core0 reads coherent value after the race");
         end
 
+        $display("== Bstorm: 4-core hot-line churn (evict vs multi cross-core GetS, the boot pattern) ==");
+        // Reproduce the NCORE=4 boot deadlock (dir busy K_SD on a hot line, requester stuck in T_IS_D
+        // with no data) at the protocol level: HA and HB ALIAS in one L1 set, so a core that owns HA
+        // and then touches HB enters T_EVICT(victim=HA) exactly as two OTHER cores GetS HA -> the dir
+        // forwards FwdGetS to the evicting owner while a second snoop also lands. Rotate roles so every
+        // core takes each part. A hang here = the harness 200k watchdog fires (== the boot deadlock).
+        for (int rr=0; rr<40; rr++) begin
+            cstore(rr%4, HA, 64'(rr));            // core (rr%4) -> M(HA)
+            fork
+                cstore(rr%4,     HB, 64'(rr+100));   // owner evicts HA (T_EVICT victim=HA), fetches HB
+                cload ((rr+1)%4, HA, r);             // peer GetS HA -> FwdGetS to the evicting owner
+                cload ((rr+2)%4, HA, r1);            // a 2nd peer GetS HA (second snoop)
+                cstore((rr+3)%4, HB, 64'(rr+200));   // a 4th core also contends HB
+            join
+            cload(rr%4, HA, r); chkv(r, 64'(rr), "Bstorm: HA holds the owner's write after the churn");
+        end
+        // Bstorm2: atomic + GetM contention on one hot line (T_OM_A/T_SM_AD/AMO acquire under churn).
+        for (int rr=0; rr<24; rr++) begin
+            logic okx;
+            fork
+                camo ((rr+0)%4, AMO_ADD, HA, 1, r);  // 4 cores hammer one line with AMO/GetM/LR-SC
+                cstore((rr+1)%4, HA, 64'(rr));        // GetM contender
+                begin clr((rr+2)%4, HA, r1); csc((rr+2)%4, HA, 64'(rr+1), okx); end
+                cload((rr+3)%4, HB, r);               // a peer churns the aliasing line (evictions)
+            join
+        end
+        cload(0, HA, r);  // drains/coherence after the atomic storm (value is contention-dependent)
         $display("[coverage] saw_oma=%0d saw_smad=%0d saw_ima=%0d min_acks=%0d s4_hit=%0d s3_hit=%0d s5_orphan=%0d defers=%0d",
                  saw_oma, saw_smad, saw_ima, min_acks, s4_hit, s3_hit, s5_orphan, defer_cnt);
         chk(min_acks < 0, "[cov] multi-ack down-counter went negative (G1 path exercised)");
@@ -341,6 +369,25 @@ module tb_niigo_ccd_gg
         $finish;
     end
 
-    initial begin repeat(200000) @(posedge clk); $display("WATCHDOG TIMEOUT (possible S5 deadlock -- check s5_orphan)"); $finish; end
+`ifdef NC4
+    task automatic dump_dl(input string why);
+        $display("\n[DEADLOCK] %s", why);
+        $display("  DIR: busy=%0b st=%0d bkind=%0d blad=%h breq=%0d bowner=%0d bub=%0b bwb=%0b out(v=%0b op=%0d dst=%0d)",
+            dut.DIR.busy_q, dut.DIR.st_q, dut.DIR.bkind_q, dut.DIR.blad_q, dut.DIR.breq_q, dut.DIR.bowner_q,
+            dut.DIR.bub_seen_q, dut.DIR.bwb_seen_q, dut.dout_v, dut.dout_m.op, dut.dout_d);
+        `define DLAG(K) $display("  hart%0d: m_val=%0b m_ts=%0d m_lad=%h m_vlad=%h m_vst=%0d m_issued=%0b d_val=%0b sr_pend=%0b | ch dmd(v=%0b op=%0d r=%0b) snoop(v=%0b op=%0d) resp(v=%0b) snp(v=%0b op=%0d dst=%0d)", \
+            K, dut.G_AGENT[K].L1D.m_val_q, dut.G_AGENT[K].L1D.m_ts_q, dut.G_AGENT[K].L1D.m_lad_q, dut.G_AGENT[K].L1D.m_vlad_q, \
+            dut.G_AGENT[K].L1D.m_vst_q, dut.G_AGENT[K].L1D.m_issued_q, dut.G_AGENT[K].L1D.d_val_q, dut.G_AGENT[K].L1D.sr_pend_q, \
+            dut.dmd_v[K], dut.dmd_m[K].op, dut.dmd_r[K], dut.snoop_v[K], dut.snoop_m[K].op, dut.resp_v[K], dut.snp_v[K], dut.snp_m[K].op, dut.snp_d[K]);
+        `DLAG(0) `DLAG(1) `DLAG(2) `DLAG(3)
+    endtask
+`endif
+    initial begin
+        repeat(200000) @(posedge clk);
+`ifdef NC4
+        dump_dl("gg4 watchdog timeout");
+`endif
+        $display("WATCHDOG TIMEOUT"); $finish;
+    end
 endmodule
 `default_nettype wire
