@@ -233,6 +233,25 @@ ccd-smc4-test:
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smc.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smc4/Vtop
 
+# ---- post-M4 P4-incr2: the reusable niigo_ccd_memsys multi-core memsys, validated by the SMC
+#      litmus run THROUGH the module (per-core L1I+launch-adapter+iref+probe factored in; PTW +
+#      device-bypass paths included for the xv6-SMP harness). RESULT==0x222. ----
+ccd-memsys-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-memsys \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_memsys.sv)
+	$(OUTPUT_BASE_DIR)/ccd-memsys/Vtop
+
+ccd-memsys-rv64-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-memsys-rv64 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DRV64 \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_memsys.sv)
+	$(OUTPUT_BASE_DIR)/ccd-memsys-rv64/Vtop
+
 # ---- M4-S6a multi-hart shared CLINT/PLIC directed test (standalone; clint NUM_HARTS=4 + plic NCTX=8) ----
 clint-plic-smp-test:
 	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/clint-plic-smp --top-module top \
