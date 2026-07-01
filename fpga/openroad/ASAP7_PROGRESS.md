@@ -15,6 +15,8 @@ period-independent Fmax; ASAP7 Liberty `time_unit=1ps`).
 |--------|--------|----------|-----------------|
 | `ec0db90` | **RAS 128 → 32 entries** (`riscv_core_ooo.sv`) | ACT 289/289 + priv 14/15 | Pure prediction hint (mispredict recovered at JALR resolve → architecturally inert). 4× cut on the `ras_stack` flop array (~6 Kbit at RV64) + 128:1 → 32:1 top-of-stack read mux. |
 | `88b25e3` | **CVFPU FMA `PipeRegs` 2 → 3** (`niigo_fp_unit.sv`) | ACT 289/289 + priv 14/15 | **Whole-core binding floor 41.7 → 69.9 MHz (+67%)** — see sweep below. +1 FMA latency (negligible IPC: FP serialized + rare). |
+| `c62e2fd` | **L1 data arrays → single-port SRAM** (`l1_data_array.sv`, `NIIGO_SRAM_MACRO`) | ACT 289/289 (default path bit-identical) | 131072-bit data array (per cache) → 256 `niigo_sram_64x8` byte-lane macros. `l1_dcache`/`l1_icache` go from **TIMEOUT(2400s) → synthesize in seconds**. |
+| `84d30a2` | **L1D tag array → single-port SRAM** (`l1_tag_array.sv` `SNOOP_PORT` param) | ACT 289/289 (default path bit-identical) | L1D tag → 4 `niigo_sram_64x52`. Fully-mapped `l1_dcache` = **7802 µm²** (data-only 13994; inferred did not synthesize), only ~1942 control flops left. L1I tag stays inferred (snoop arbitration deferred). |
 
 ### FMA PipeRegs sweep (niigo_fp_unit, char.sh @5 ns, placed parasitics)
 
@@ -68,22 +70,21 @@ per-array mappability to the available **single-port (1RW)** ASAP7 macros:
 | **L1I tag** | **NEEDS DUPLICATE-TAGS** — the C4 snoop read (`ren2`) runs concurrently with fetch reads every committed D-store, which a single 1RW macro cannot serve. Map as two 1RW copies (fetch copy clean; snoop copy needs 1-cycle arbitration vs `S_INSTALL` write). |
 
 **RTL risk is zero** (the default inference stays bit-identical for Verilator; a macro path is
-`ifdef NIIGO_SRAM_MACRO`-gated, synth-only). **The blocker is macro geometry/tooling, not RTL:**
-- The shipped `asap7/asap7_sram_0p0` set is **1024-deep, ≥16-bit-wide, single-port, no byte-write** — it
-  does **not** fit the L1 geometry (64 deep × 512 wide, byte-writable). LIB/LEF exist for several
-  `srambank_*` geometries but the depths/widths are wrong and none is byte-writable or 8-bit-wide.
-- The **FakeRAM2.0 generator is not installed**, so the needed geometries (e.g. 64×8 byte-lanes,
-  64-deep full-line banks) cannot be generated here.
+`ifdef NIIGO_SRAM_MACRO`-gated, synth-only).
 
-**Path to unblock (future work), in priority order:**
-1. Obtain/build **FakeRAM2.0**; generate the L1 geometries (byte-lane 64×8 for L1D data; full-line banks
-   for L1I data; narrow tag banks). Add their LIB/LEF to the flow, `NIIGO_SRAM_MACRO`-gate a banked macro
-   path in `l1_data_array.sv`/`l1_tag_array.sv`, keep the default inference bit-identical.
-2. Alternatively, **blackbox the array modules** in a `timing_flow.tcl` variant (empty blackbox + the
-   nearest `srambank_*` LIB for a placeholder) purely to *measure the L1 controller logic Fmax* — this
-   also unblocks the `l1_dcache`/`l1_icache` standalone synth that currently TIMEOUTs at 2400 s because
-   of the flop-mapped array mass.
-3. Handle **L1I tag** via the duplicate-tags structure (two 1RW copies, snoop-copy arbitration).
+**UNBLOCKED + DONE (`c62e2fd`, `84d30a2`).** FakeRAM2.0 (pure-Python, no deps) was cloned and used to
+generate the exact ASAP7 geometries (`fpga/openroad/sram/`, see its README): `niigo_sram_64x8` (byte-lane
+for data) and `niigo_sram_64x52` (RV64 tag). `timing_flow.tcl` reads them via `SRAM_LIB`/`SRAM_LEF`.
+Landed: L1 **data** (both caches) + **L1D tag** map to single-port SRAM; the default (Verilator) path is
+bit-identical (ACT 289/289). `l1_dcache` synthesizes (was TIMEOUT), fully-mapped area **7802 µm²**, only
+~1942 control flops left.
+
+**Remaining memory-cell work:**
+1. **L1I tag** — duplicate-tags (two 1RW copies) with snoop-copy arbitration vs the `S_INSTALL` write
+   (a 1RW macro can't serve the concurrent fetch-read + C4 snoop-read).
+2. **ITTAGE / TAGE** predictor tables (~306 + ~46 Kbit) — async-read today; register the read (sync)
+   then map. Adds a fetch-redirect cycle → verify beyond ACT (xv6 + riscv-dv branch stress).
+3. **phys_reg_file / ROB / RAS** — multiport / associative, correctly stay flops (not SRAM targets).
 
 ## Open levers (need a direction decision)
 
