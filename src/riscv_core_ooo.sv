@@ -131,7 +131,15 @@ module riscv_core_ooo
     import MemorySegments::USER_TEXT_START;
 
     localparam int PHYS_READ_PORTS = FU_ISSUE_PORTS + OOO_WIDTH;
-    localparam int RAS_DEPTH = 128;
+    // Return-address stack depth. This is a pure prediction hint: a RAS
+    // mispredict is caught and recovered at JALR resolve, so depth affects
+    // accuracy (call-nesting reach) but never architectural correctness.
+    // 128 was heavily over-provisioned -- typical call-nesting that the RAS
+    // usefully predicts is shallow. 32 is a standard depth and cuts the
+    // ras_stack flop array 4x (128->32 entries x XLEN) plus the fetch-cycle
+    // 128:1 top-of-stack read mux down to 32:1 (ASAP7 area+timing; the array
+    // maps to flops, not SRAM, since push/pop/checkpoint want parallel access).
+    localparam int RAS_DEPTH = 32;
     localparam int RAS_INDEX_BITS = $clog2(RAS_DEPTH);
     localparam int RAS_COUNT_BITS = $clog2(RAS_DEPTH + 1);
     localparam int DIRECT_HISTORY_BITS = 30;
