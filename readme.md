@@ -247,26 +247,100 @@ accumulates `fflags` through the CSR file. A synchronous exception, interrupt,
 `mret`/`sret`, or `sfence.vma` taken at commit flushes the pipeline and redirects the
 frontend, keeping architectural state precise.
 
+### Caches and the memory subsystem
+
+The OoO core speaks three handshaked, latency-agnostic ports into the memory subsystem
+(`src/mem/niigo_memsys.sv`): an instruction-fetch port (one 16-byte block at a time), a
+word-granular data load/store port, and a page-table-walk request/ack port. The default
+OoO build wires these straight through to the word-addressed `main_memory` model (legacy
+fixed-latency timing). The FPGA-oriented build flags insert real caches behind the same
+ports: `L1=1` adds the L1 instruction cache; `L1D=1` adds the write-back L1 data cache
+(and routes the PTW through it so page tables stay coherent); `L2=1` interposes a shared
+write-back L2 on the memory-side backend, behind the L1s (see below); `AXI=1` routes the
+cache miss/writeback traffic through an NMI→AXI4-512 bridge onto a simulated AXI slave.
+Devices (CLINT/PLIC/UART) always bypass the caches.
+
+The L1I and L1D share one geometry (`src/mem/niigo_mem.vh`, `l1_icache.sv`/`l1_dcache.sv`,
+`l1_data_array.sv`/`l1_tag_array.sv`):
+
+| Parameter | Value |
+|---|---|
+| Capacity | 16 KiB each (L1I, L1D) |
+| Organisation | 4-way set-associative, 64 sets, 64 B (512-bit) lines |
+| Indexing | VIPT, alias-free; physically tagged |
+| Replacement | tree-PLRU (3 state bits per 4-way set, `l1_plru.sv`) |
+| Tag/data arrays | synchronous-read (infer BRAM on FPGA) |
+| L1I refill | read-only; refill on miss, snoop-invalidated for I/D coherence |
+| L1D write policy | write-back, write-allocate, per-line dirty |
+
+The L1 way size is exactly one Sv32/Sv39 base page (64 sets × 64 B = 4096 B), so the cache
+index lies entirely within the page offset and is identical in the virtual and physical
+address. The caches are therefore virtually indexed but synonym-free, with the physical
+tag still resolving aliases. This `L1_VIPT_ALIAS_FREE` property is `initial assert`-checked
+in the cache RTL, so the geometry cannot silently grow past a page and break VIPT.
+
+An optional **shared L2** (`src/mem/niigo_l2.sv`; enabled by `L2=1` / `-DL2_CACHE`, default
+off) can be interposed on the memory-side backend, below the L1s. It is a transparent,
+write-back / write-allocate, **NINE** (non-inclusive/non-exclusive) line cache — 512 KiB,
+8-way, 64 B PIPT lines, 8-way tree-PLRU (`l2_plru.sv`) — reusing the same synchronous-read
+tag/data arrays as the L1s (`l1_tag_array.sv`/`l1_data_array.sv`, at 1024 sets × 8 ways). It
+is an NMI slave upward and an NMI master downward, so it drops onto the *shared* memory
+boundary of the subsystem: in the single-core cache builds, between the L1I/L1D-or-directory
+arbiter and `main_memory`; in the multicore CCD path, on the directory's single NMI master
+(below). Placing it on the merged request stream — rather than one L1's leg — keeps it
+coherent with the L1I refill path, so a store written back into the L2 is still seen by a
+later I-fetch (an L2 on the directory leg alone would be bypassed by the separate L1I refill
+and break `fence.i`). The L2 is *value-transparent*: it changes only memory-leg latency, so
+architectural results are identical with it on or off, and every build is bit-identical when
+it is off. It is validated on both paths — the single-core CCD suite (`247/247`, including
+`fence.i`) and the **4-core xv6-SMP boot to `$` + `ls`** both pass with the L2 on, and
+`make ccd-l2-test` unit-checks the cache directly (fill/hit, dirty-victim writeback
+round-trip, write-allocate, write-read coherence).
+
+With `L2=1` unset there is no L2: L1 misses and writebacks travel line-granular over the
+internal line bus (NMI) directly to `main_memory`, or — under `AXI=1` — through the
+NMI→AXI4-512 bridge.
+
+Instruction/data coherence for self-modifying code is maintained with *and* without
+`fence.i`. `fence.i` writes back the L1D and then invalidates the L1I. Independently, a
+committed data store snoop-invalidates any stale L1I copy of the written line (via a second
+read port on the L1I tag array), and an L1I refill is held until the L1D first writes back
+any dirty copy of that line (clean-before-refill). This keeps cold code and
+patch-then-call-later sequences (e.g. xv6 `exec`) coherent with no explicit fence; only
+tight in-place patching of an *already-fetched* line still needs `fence.i`. The load/store
+queue allows a single outstanding load and tracks it by an in-flight tag, so cache
+responses need no address matching at any latency.
+
 ### Multicore cache coherence (CCD)
 
 Multiple OoO cores share memory through a directory-based MOESI coherence fabric
 (`src/mem/`, design tracked in `plans/multicore-ccd.md`). It is built under `CCD_AGENT`
 and gated so that single-core / `COHERENT=0` builds are bit-identical to the
-pre-coherence core (the CCD modules are otherwise parsed but not elaborated).
+pre-coherence core (the CCD modules are otherwise parsed but not elaborated). The protocol
+carries the five stable MOESI line states — Invalid, Shared, Exclusive, Owned
+(dirty-shared, the reason it is MOESI rather than MESI), and Modified
+(`CMI_I=0 … CMI_M=4`, `src/mem/niigo_cmi.vh`) — and is machine-checked in CMurphi.
 
-- **L1D agent** (`niigo_l1d_gg.sv`): each core's L1D is a non-blocking MOESI agent with
-  one outstanding demand transaction (an MSHR), acquire/evict transients, deferred snoops
-  (the acquire-side deferred-snoop matrix), and an ack-to-requester down-counter for write
-  atomicity.
-- **Directory** (`niigo_dir_gg.sv`): the per-line coherence/serialization point. It is
-  *grant-and-go* — an L2/memory-sourced grant commits the new stable state and returns
-  ready in the same step (no transient); only cache-to-cache forwards and Upgrades go
-  transient and wait for the requester's UNBLOCK.
+- **L1D agent** (`niigo_l1d_gg.sv`): each core's L1D is a non-blocking, direct-mapped
+  (64 sets × 64 B lines in the configured builds) MOESI agent with one outstanding demand
+  transaction (an MSHR), acquire/evict transients, deferred snoops (the acquire-side
+  deferred-snoop matrix), and an ack-to-requester down-counter for write atomicity.
+- **Directory** (`niigo_dir_gg.sv`): the per-line coherence/serialization point. It is a
+  set-associative metadata directory (256 sets × 4 ways in the configured builds — far
+  larger than the L1s to avoid directory-capacity evictions) that tracks each line's MOESI
+  state and sharer vector but holds **no data of its own** — line data is sourced
+  cache-to-cache (owner forwarding), or, on a memory-sourced grant, from the optional shared
+  L2 / memory over the NMI bus (the L2 sits *below* the coherence point on the directory's
+  memory leg, so coherence is unchanged whether or not it is enabled). It is *grant-and-go* — a memory-sourced
+  grant commits the new stable state and returns ready in the same step (no transient);
+  only cache-to-cache forwards and Upgrades go transient and wait for the requester's
+  UNBLOCK.
 - **SMP memsys** (`niigo_ccd_memsys.sv`): packages N cores (each a real `l1_icache` + a
   registered launch adapter that muxes cacheable dmem + PTW onto the agent's one `c_req`
   and bypasses device MMIO + the L1D agent) onto one directory, with the directory's single
   NMI master as the data-side backend (`nmi_mem_adapter` → `main_memory`, or the AXI4-512
-  bridge under `AXI=1`).
+  bridge under `AXI=1`; the optional shared L2 interposes on this NMI master when `L2=1`,
+  and since every L1I refill here is agent-served this leg carries all memory traffic).
 - **Cross-core I/D coherence, no `fence.i`** — the *remote-dirty I-fetch*: an L1I refill
   first probes the local L1D agent, and on a miss injects a `COP_LOAD` so the directory's
   GetS pulls the line cold-from-memory **or dirty-from-the-owner** before serving the
@@ -279,8 +353,13 @@ pre-coherence core (the CCD modules are otherwise parsed but not elaborated).
   port coherence-invalidates LR/SC reservations on remote writes.
 - **Fabric-agnostic**: the same directory/agents run over a behavioural combinational
   interconnect (`niigo_ccd_gg_direct.sv`, parameter `NACTIVE`) for protocol validation, and
-  over a real **wheel NoC** (4 core routers in a ring + a radix-5 hub, 128b multi-flit
-  SerDes: `cmi_router.sv`/`cmi_wheel.sv`/`niigo_ccd_gg_wheel.sv`) for transport validation.
+  over a real **wheel NoC** (`cmi_router.sv`/`cmi_wheel.sv`/`niigo_ccd_gg_wheel.sv`) for
+  transport validation. The wheel is four radix-4 core routers wired in a ring — each router
+  has two ring links, a local port to its core, and a spoke to a central radix-5 hub router
+  whose fifth port is the internal leg to the directory/memory controller. Links are 128-bit
+  flits (a 512-bit line = four body flits, multi-flit SerDes) with credit-based flow control
+  over five logical virtual channels (request, forward/invalidate, response-data, ack, and
+  writeback on its own VC) plus a ring dateline sub-VC for deadlock freedom.
 - **Shared SoC devices**: under `NIIGO_EXT_DEVICES` the CLINT/PLIC/UART become one shared
   top-level instance fed by every core (per-hart `mhartid` via the `HART_ID` parameter); a
   cross-hart IPI is an uncached `msip` store to the shared CLINT.
@@ -319,9 +398,11 @@ core.
   exact access that launched it — matched on `(VPN, privilege, satp)` — so a speculative
   out-of-order fetch or load cannot consume a walk that another access started.
 - `mmu_tlb.sv`: a 16-entry fully-associative TLB, instantiated separately as the ITLB and
-  DTLB. Lookups are combinational; fills and flushes are synchronous. Superpages (Sv32:
-  4 MiB; Sv39: 1 GiB / 2 MiB) and the global bit are supported; `sfence.vma` is modeled
-  as a full flush.
+  the DTLB (16 entries each), with round-robin replacement. Each entry caches a VPN→PPN
+  mapping tagged by ASID and permission/level bits. Lookups are combinational; fills and
+  flushes are synchronous. Superpages (Sv32: 4 MiB; Sv39: 1 GiB / 2 MiB) and the global bit
+  are supported; `sfence.vma` is modeled as a full flush (no hardware TLB-shootdown — the
+  CCD subsystem treats cross-hart `sfence.vma` as a software shootdown).
 - `pmp_checker.sv`: a 16-entry Physical Memory Protection checker (TOR/NA4/NAPOT,
   R/W/X/L, lowest-match-wins). It is instantiated on both the scalar core and the OoO
   core. On the OoO core it guards three paths: implicit PTE accesses during a walk
