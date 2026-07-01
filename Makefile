@@ -316,6 +316,16 @@ ccd-xv6-4-build:
 		$(VERILATOR_INC_FLAGS) \
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_xv6.sv)
 
+# Same NCORE=4 xv6-SMP harness with the shared L2 turned on (-DL2_CACHE): the L2 sits on
+# niigo_ccd_memsys's directory NMI master, so all 4 harts' memory traffic flows through it.
+# Value-transparent -> must still boot to `$` + run `ls`. Same --build-jobs 1 memory caveat.
+ccd-xv6-4-l2-build:
+	$(VERILATOR) --sv --timing --binary -j 0 --build-jobs 1 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-xv6-4-l2 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES -DRV64 -DNCORE4 -DL2_CACHE \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_xv6.sv)
+
 # ---- M4-S6a multi-hart shared CLINT/PLIC directed test (standalone; clint NUM_HARTS=4 + plic NCTX=8) ----
 clint-plic-smp-test:
 	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/clint-plic-smp --top-module top \
