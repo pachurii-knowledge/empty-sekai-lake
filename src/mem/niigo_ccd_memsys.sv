@@ -259,6 +259,12 @@ module niigo_ccd_memsys
     end endgenerate
 
     // ===== the shared grant-and-go CCD subsystem (agents + directory + interconnect) =====
+    // The directory's single NMI master is the shared-memory boundary here: every L1I
+    // refill is agent-served (COP_LOAD -> directory), so ALL memory traffic exits via
+    // this leg. The optional shared L2 (plans/l2-integration.md) therefore interposes
+    // right here; default OFF -> passthrough (bit-identical), -DL2_CACHE turns it on.
+    nmi_req_t  ccd_mreq;  logic ccd_mready;  nmi_resp_t ccd_mresp;
+
     niigo_ccd_gg_direct #(.NACTIVE(NACTIVE), .L1_SETS(L1_SETS), .DIR_SETS(DIR_SETS), .RESP_DLY(RESP_DLY)) CCD (
         .clk, .rst_l,
         .c_req_valid(c_req_valid), .c_req_ready(c_req_ready),
@@ -269,7 +275,19 @@ module niigo_ccd_memsys
         .snoop_kill_valid(ccd_sk_v), .snoop_kill_laddr(ccd_sk_la),
         .probe_valid(ccd_probe_v), .probe_waddr(ccd_probe_wa),
         .probe_hit(ccd_probe_hit), .probe_line(ccd_probe_line),
-        .mem_req_o(mem_req_o), .mem_req_ready_i(mem_req_ready_i), .mem_resp_i(mem_resp_i)
+        .mem_req_o(ccd_mreq), .mem_req_ready_i(ccd_mready), .mem_resp_i(ccd_mresp)
     );
+
+`ifdef L2_CACHE
+    niigo_l2 L2 (
+        .clk, .rst_l,
+        .s_req(ccd_mreq), .s_req_ready(ccd_mready), .s_resp(ccd_mresp),
+        .m_req(mem_req_o), .m_req_ready(mem_req_ready_i), .m_resp(mem_resp_i)
+    );
+`else
+    assign mem_req_o = ccd_mreq;
+    assign ccd_mready = mem_req_ready_i;
+    assign ccd_mresp  = mem_resp_i;
+`endif
 endmodule: niigo_ccd_memsys
 `default_nettype wire

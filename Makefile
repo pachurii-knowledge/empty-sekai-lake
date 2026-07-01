@@ -236,6 +236,20 @@ ccd-smc-test:
 		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_smc.sv)
 	$(OUTPUT_BASE_DIR)/ccd-smc/Vtop
 
+# ---- L2 Inc 3: L2-ON value-transparency variant of the reusable SMP memsys
+#      (niigo_ccd_memsys, tb_ccd_memsys SMC litmus). The L2 sits on the directory's NMI
+#      master here (-DL2_CACHE). A correct transparent L2 changes only latency, so the
+#      result must match the L2-OFF ccd-memsys-test (RESULT==0x222). The single-core
+#      CCD+L2 path is exercised by `make verilator-build OOO=1 CCD=1 L2=1` + the ACT
+#      suite (niigo_memsys's arbiter-output L2). ----
+ccd-memsys-l2-test:
+	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
+		--Mdir $(OUTPUT_BASE_DIR)/ccd-memsys-l2 \
+		-DSIMULATION_18447 -DLAB_18447='"4b"' -DOOO_4WIDE -DCCD_AGENT -DL1_CACHES -DL2_CACHE \
+		$(VERILATOR_INC_FLAGS) \
+		$(filter-out %/testbench.sv,$(VERILATOR_DESIGN_SRC)) $(abspath tests/tb_ccd_memsys.sv)
+	$(OUTPUT_BASE_DIR)/ccd-memsys-l2/Vtop
+
 ccd-smc-rv64-test:
 	$(VERILATOR) --sv --timing --binary -j 0 -Wno-fatal --top-module top \
 		--Mdir $(OUTPUT_BASE_DIR)/ccd-smc-rv64 \

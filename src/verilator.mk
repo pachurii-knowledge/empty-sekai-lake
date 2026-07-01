@@ -96,6 +96,14 @@ ifeq ($(CCD),1)
 	VERILATOR_CFLAGS += -DCCD_AGENT -DL1_CACHES
 endif
 
+# L2=1 (plans/l2-integration.md) interposes the transparent write-back NINE L2
+# (niigo_l2) on the directory's NMI memory leg via niigo_ccd_gg_direct's L2_ENABLE
+# param (-DL2_CACHE). Compose with CCD=1 (the single-core CCD arm) or an SMP ccd-*
+# target. Value-transparent: changes only memory-leg latency, not results.
+ifeq ($(L2),1)
+	VERILATOR_CFLAGS += -DL2_CACHE
+endif
+
 ifeq ($(AXI),1)
 	VERILATOR_CFLAGS += -DAXI_MEMSYS
 endif

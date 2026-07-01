@@ -886,6 +886,26 @@ module niigo_memsys
         .d_req(arb_d_req), .d_ready(arb_d_ready), .d_resp(arb_d_resp)
     );
 
+    // ---- Optional shared write-back NINE L2 (plans/l2-integration.md) between the
+    //      arbiter and the memory controller. This is the TRUE shared-memory boundary:
+    //      the arbiter has already merged the L1I refill leg with the {L1D | directory}
+    //      leg, so the L2 sees BOTH. An L2 on the directory leg alone (inside gg_direct)
+    //      would miss the separate L1I refill and break I/D coherence (a fence.i store
+    //      written back into the L2 would leave memory stale for a bypassing I-fetch).
+    //      Default OFF -> passthrough (bit-identical net); -DL2_CACHE interposes the L2.
+    nmi_req_t  mc_req;  logic mc_ready;  nmi_resp_t mc_resp;
+`ifdef L2_CACHE
+    niigo_l2 L2 (
+        .clk, .rst_l,
+        .s_req(arb_d_req), .s_req_ready(arb_d_ready), .s_resp(arb_d_resp),
+        .m_req(mc_req), .m_req_ready(mc_ready), .m_resp(mc_resp)
+    );
+`else
+    assign mc_req      = arb_d_req;
+    assign arb_d_ready = mc_ready;
+    assign arb_d_resp  = mc_resp;
+`endif
+
     logic                          adp_wr_en;
     logic [MEMORY_ADDR_WIDTH-1:0]  adp_wr_addr;
     logic [XLEN-1:0]               adp_wr_data;
@@ -921,7 +941,7 @@ module niigo_memsys
 
     nmi_axi_bridge Bridge (
         .clk, .rst_l,
-        .nmi_req(arb_d_req), .nmi_req_ready(arb_d_ready), .nmi_resp(arb_d_resp),
+        .nmi_req(mc_req), .nmi_req_ready(mc_ready), .nmi_resp(mc_resp),
         .axi_awvalid(ax_awvalid), .axi_awready(ax_awready), .axi_awaddr(ax_awaddr),
         .axi_awid(ax_awid), .axi_awlen(ax_awlen), .axi_awsize(ax_awsize), .axi_awburst(ax_awburst),
         .axi_wvalid(ax_wvalid), .axi_wready(ax_wready), .axi_wdata(ax_wdata),
@@ -989,7 +1009,7 @@ module niigo_memsys
 `else
     nmi_mem_adapter Adapter (
         .clk, .rst_l,
-        .nmi_req(arb_d_req), .nmi_req_ready(arb_d_ready), .nmi_resp(arb_d_resp),
+        .nmi_req(mc_req), .nmi_req_ready(mc_ready), .nmi_resp(mc_resp),
         .mem_rd_addr(mem_i_addr),
         .mem_rd_data(mem_i_load_data),
         .mem_rd_excpt(mem_i_excpt),
