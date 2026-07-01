@@ -40,8 +40,17 @@ module niigo_fp_unit
     // at 1. FP is infrequent (xv6/Linux are integer-heavy), so the extra FMA
     // latency is a negligible IPC cost. The wrapper's abort-at-output + flush_i
     // (clears all internal stages) are pipeline-depth/structure agnostic.
+    //
+    // ASAP7 (asap7-synth): the FMA is the whole-core binding Fmax floor on the 7nm
+    // ASIC flow (generic ABC, no DSP/retiming). Bumping ADDMUL to 3 distributed
+    // stages lifts the placed-parasitic Fmax 41.7 -> 69.9 MHz. Measured sweep:
+    // PR2 41.7, PR3 69.9, PR4 46.4, PR6 32.9 MHz -- NON-monotonic because
+    // DISTRIBUTED cuts the fixed FMA datapath at CVFPU's internal boundaries and
+    // 3 aligns best with the mantissa-mul / align-add / normalize-round segments;
+    // 4+ split balanced logic unevenly and add register area/congestion. The extra
+    // FMA latency vs PR2 is a negligible IPC cost (serialized + infrequent FP).
     localparam fpnew_pkg::fpu_implementation_t NIIGO_CVFPU_IMPL = '{
-        PipeRegs:   '{'{default: 2},   // ADDMUL (FMA): 2 distributed stages
+        PipeRegs:   '{'{default: 3},   // ADDMUL (FMA): 3 distributed stages (ASAP7)
                       '{default: 1},   // DIVSQRT
                       '{default: 1},   // NONCOMP
                       '{default: 1}},  // CONV
