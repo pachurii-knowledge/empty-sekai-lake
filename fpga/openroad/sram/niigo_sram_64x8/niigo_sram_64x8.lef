@@ -1,0 +1,303 @@
+VERSION 5.7 ;
+BUSBITCHARS "[]" ;
+MACRO niigo_sram_64x8
+  FOREIGN niigo_sram_64x8 0 0 ;
+  SYMMETRY X Y R90 ;
+  SIZE 1.140 BY 16.800 ;
+  CLASS BLOCK ;
+  PIN rd_out[0]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 0.048 0.024 0.072 ;
+    END
+  END rd_out[0]
+  PIN rd_out[1]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 0.672 0.024 0.696 ;
+    END
+  END rd_out[1]
+  PIN rd_out[2]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 1.296 0.024 1.320 ;
+    END
+  END rd_out[2]
+  PIN rd_out[3]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 1.920 0.024 1.944 ;
+    END
+  END rd_out[3]
+  PIN rd_out[4]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 2.544 0.024 2.568 ;
+    END
+  END rd_out[4]
+  PIN rd_out[5]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 3.168 0.024 3.192 ;
+    END
+  END rd_out[5]
+  PIN rd_out[6]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 3.792 0.024 3.816 ;
+    END
+  END rd_out[6]
+  PIN rd_out[7]
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 4.416 0.024 4.440 ;
+    END
+  END rd_out[7]
+  PIN wd_in[0]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 4.656 0.024 4.680 ;
+    END
+  END wd_in[0]
+  PIN wd_in[1]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 5.280 0.024 5.304 ;
+    END
+  END wd_in[1]
+  PIN wd_in[2]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 5.904 0.024 5.928 ;
+    END
+  END wd_in[2]
+  PIN wd_in[3]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 6.528 0.024 6.552 ;
+    END
+  END wd_in[3]
+  PIN wd_in[4]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 7.152 0.024 7.176 ;
+    END
+  END wd_in[4]
+  PIN wd_in[5]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 7.776 0.024 7.800 ;
+    END
+  END wd_in[5]
+  PIN wd_in[6]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 8.400 0.024 8.424 ;
+    END
+  END wd_in[6]
+  PIN wd_in[7]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 9.024 0.024 9.048 ;
+    END
+  END wd_in[7]
+  PIN addr_in[0]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 9.264 0.024 9.288 ;
+    END
+  END addr_in[0]
+  PIN addr_in[1]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 9.888 0.024 9.912 ;
+    END
+  END addr_in[1]
+  PIN addr_in[2]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 10.512 0.024 10.536 ;
+    END
+  END addr_in[2]
+  PIN addr_in[3]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 11.136 0.024 11.160 ;
+    END
+  END addr_in[3]
+  PIN addr_in[4]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 11.760 0.024 11.784 ;
+    END
+  END addr_in[4]
+  PIN addr_in[5]
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 12.384 0.024 12.408 ;
+    END
+  END addr_in[5]
+  PIN we_in
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 12.624 0.024 12.648 ;
+    END
+  END we_in
+  PIN ce_in
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 13.248 0.024 13.272 ;
+    END
+  END ce_in
+  PIN clk
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    SHAPE ABUTMENT ;
+    PORT
+      LAYER M4 ;
+      RECT 0.000 13.872 0.024 13.896 ;
+    END
+  END clk
+  PIN VSS
+    DIRECTION INOUT ;
+    USE GROUND ;
+    PORT
+      LAYER M4 ;
+      RECT 0.048 0.000 1.092 0.096 ;
+      RECT 0.048 0.768 1.092 0.864 ;
+      RECT 0.048 1.536 1.092 1.632 ;
+      RECT 0.048 2.304 1.092 2.400 ;
+      RECT 0.048 3.072 1.092 3.168 ;
+      RECT 0.048 3.840 1.092 3.936 ;
+      RECT 0.048 4.608 1.092 4.704 ;
+      RECT 0.048 5.376 1.092 5.472 ;
+      RECT 0.048 6.144 1.092 6.240 ;
+      RECT 0.048 6.912 1.092 7.008 ;
+      RECT 0.048 7.680 1.092 7.776 ;
+      RECT 0.048 8.448 1.092 8.544 ;
+      RECT 0.048 9.216 1.092 9.312 ;
+      RECT 0.048 9.984 1.092 10.080 ;
+      RECT 0.048 10.752 1.092 10.848 ;
+      RECT 0.048 11.520 1.092 11.616 ;
+      RECT 0.048 12.288 1.092 12.384 ;
+      RECT 0.048 13.056 1.092 13.152 ;
+      RECT 0.048 13.824 1.092 13.920 ;
+      RECT 0.048 14.592 1.092 14.688 ;
+      RECT 0.048 15.360 1.092 15.456 ;
+      RECT 0.048 16.128 1.092 16.224 ;
+    END
+  END VSS
+  PIN VDD
+    DIRECTION INOUT ;
+    USE POWER ;
+    PORT
+      LAYER M4 ;
+      RECT 0.048 0.384 1.092 0.480 ;
+      RECT 0.048 1.152 1.092 1.248 ;
+      RECT 0.048 1.920 1.092 2.016 ;
+      RECT 0.048 2.688 1.092 2.784 ;
+      RECT 0.048 3.456 1.092 3.552 ;
+      RECT 0.048 4.224 1.092 4.320 ;
+      RECT 0.048 4.992 1.092 5.088 ;
+      RECT 0.048 5.760 1.092 5.856 ;
+      RECT 0.048 6.528 1.092 6.624 ;
+      RECT 0.048 7.296 1.092 7.392 ;
+      RECT 0.048 8.064 1.092 8.160 ;
+      RECT 0.048 8.832 1.092 8.928 ;
+      RECT 0.048 9.600 1.092 9.696 ;
+      RECT 0.048 10.368 1.092 10.464 ;
+      RECT 0.048 11.136 1.092 11.232 ;
+      RECT 0.048 11.904 1.092 12.000 ;
+      RECT 0.048 12.672 1.092 12.768 ;
+      RECT 0.048 13.440 1.092 13.536 ;
+      RECT 0.048 14.208 1.092 14.304 ;
+      RECT 0.048 14.976 1.092 15.072 ;
+      RECT 0.048 15.744 1.092 15.840 ;
+      RECT 0.048 16.512 1.092 16.608 ;
+    END
+  END VDD
+  OBS
+    LAYER M1 ;
+    RECT 0 0 1.140 16.800 ;
+    LAYER M2 ;
+    RECT 0 0 1.140 16.800 ;
+    LAYER M3 ;
+    RECT 0 0 1.140 16.800 ;
+    LAYER M4 ;
+    RECT 0 0 1.140 16.800 ;
+  END
+END niigo_sram_64x8
+
+END LIBRARY

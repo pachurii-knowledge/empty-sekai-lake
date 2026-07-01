@@ -34,6 +34,15 @@ foreach lib {
 # tech LEF FIRST (cells inherit its DBU=1x), then the matched RVT (R) std-cell LEF.
 read_lef $PLAT/lef/asap7_tech_1x_201209.lef
 read_lef $PLAT/lef/asap7sc7p5t_28_R_1x_220121a.lef
+# Optional SRAM-macro collateral (colon-separated .lib / .lef paths) for the
+# NIIGO_SRAM_MACRO memory-cell mapping. Liberty gives the macro timing/area so
+# blackboxed arrays no longer flop-map; LEF gives its footprint for placement.
+if {[info exists ::env(SRAM_LIB)]} {
+  foreach l [split $::env(SRAM_LIB) ":"] { if {$l ne ""} { read_liberty $l; puts "  + SRAM lib $l" } }
+}
+if {[info exists ::env(SRAM_LEF)]} {
+  foreach f [split $::env(SRAM_LEF) ":"] { if {$f ne ""} { read_lef $f; puts "  + SRAM lef $f" } }
+}
 puts "==== STAGE DONE: libs ===="
 
 # ---------------------------------------------------------------- synthesis (integrated syn)

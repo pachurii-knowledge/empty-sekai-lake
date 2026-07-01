@@ -32,6 +32,37 @@ module l1_data_array #(
 
     localparam int BYTES = LINE_BITS/8;
 
+`ifdef NIIGO_SRAM_MACRO
+    // ------------------------------------------------------------------ ASAP7
+    // Single-port SRAM macro mapping. Each (way, byte-lane) is a niigo_sram_64x8
+    // (64 words x 8 bits, 1RW; FakeRAM-generated, LIB/LEF under fpga/openroad/
+    // sram/). Both L1 controllers drive READ and WRITE in DISJOINT cycles
+    // (l1_icache: S_SERVE/S_REPLAY read vs S_INSTALL write; l1_dcache: S_IDLE/
+    // S_FLUSH_READ read vs store-hit/S_INSTALL write), so the single shared
+    // address port is muxed (this lane's write index when it is being written,
+    // else the read index). Byte writes map to per-lane we_in (wmask[b]); a read
+    // presents all WAYS*BYTES lanes at ridx. Real SRAM holds rd_out between
+    // accesses, matching the inferred array's registered read. Logically
+    // identical to the inferred array below, which the Verilator/functional
+    // build (no NIIGO_SRAM_MACRO) uses. Requires SETS==64, LINE_BITS==512
+    // (the L1 geometry; the niigo_sram_64x8 depth/width are fixed to match).
+    genvar w, b;
+    generate
+        for (w = 0; w < WAYS; w += 1) begin : ways
+            for (b = 0; b < BYTES; b += 1) begin : lanes
+                wire lane_wr = wen && (wway == w[$clog2(WAYS)-1:0]) && wmask[b];
+                niigo_sram_64x8 u_lane (
+                    .clk    (clk),
+                    .ce_in  (ren || lane_wr),
+                    .we_in  (lane_wr),
+                    .addr_in(lane_wr ? widx : ridx),
+                    .wd_in  (wdata[b*8 +: 8]),
+                    .rd_out (rdata[w][b*8 +: 8])
+                );
+            end
+        end
+    endgenerate
+`else
     genvar w;
     generate
         for (w = 0; w < WAYS; w += 1) begin : ways
@@ -48,6 +79,7 @@ module l1_data_array #(
             end
         end
     endgenerate
+`endif
 
 endmodule : l1_data_array
 
