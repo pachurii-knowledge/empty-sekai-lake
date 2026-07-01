@@ -37,9 +37,10 @@ infrastructures of the same course.
   enough paging and interrupt pressure to expose out-of-order edge cases the architectural
   tests do not: several were found and fixed in store-commit handshaking, load-return
   matching under paging, and page-walk result attribution.
-- **Multicore / SMP**: two real `riscv_core_ooo` cores over the `niigo_ccd_memsys`
+- **Multicore / SMP**: two and four real `riscv_core_ooo` cores over the `niigo_ccd_memsys`
   coherent memory subsystem boot **xv6-riscv (RV64G + Sv39) SMP** to the interactive `$`
-  shell and run `ls` (commit `b5e9bc6`); single-core CCD likewise boots (`0b00906`). The
+  shell and run `ls` — all harts reaching `$`, with or without the optional shared L2
+  (2-core commit `b5e9bc6`); single-core CCD likewise boots (`0b00906`). The
   grant-and-go MOESI directory (`src/mem/niigo_dir_gg.sv`) + non-blocking L1D agents
   (`src/mem/niigo_l1d_gg.sv`) pass 2- and 4-core LR/SC-spinlock, AMO-atomicity, and
   cross-hart IPI litmus tests (`make ccd-smp-test` → mutual-exclusion counter == 6;
@@ -60,7 +61,7 @@ in RTL/Verilator simulation : see *Multicore / SMP* above.)
   - TAGE-SC-L correctness: The current branch predictor (`src/tage_sc_l_predictor.sv`) is only an approximation of the structure proposed in Seznec14. The goal is to implement the 32Kb variant after complete validation on VU47P at target frequency.
   - VIPT L1D/I caches: Currently both caches are PIPT, requiring a TLB lookup and then PMP permission check before cache access. The caching and VM paging geometries allow alias-free L1$ indexing using virtual addresses instead of physical addresses, thus parallelizing the TLB lookup with L1$ access and saving one cycle off L1 hits. This will become the next critical path after the current LSQ path is broken up.
   - Cache parameter sweep: Self-explanatory.
-- **Multicore scale-out**: the 2-/4-core directory-coherent cluster is **built and boots xv6-SMP** in RTL/Verilator simulation today (see *Bring-up status* and *Multicore cache coherence (CCD)* below); the NMI line bus is now the committed transport under a full grant-and-go MOESI directory + CMI coherence layer. The remaining work is (a) the deferred directory-robustness hardening (P5: WB-vs-Fwd evict-snoop, snoop-slot/ServeDeferred liveness, snoop-drain stale-Inv, directory-capacity broadcast-Inv), torture/RVWMO-litmus stress, and >2-core boot; and (b) FPGA emulation of the cluster — a >2-core CCD does not fit a single VU47P and AWS F2 has no PCIe P2P, so a larger target part may be needed.
+- **Multicore scale-out**: the 2- and 4-core directory-coherent cluster is **built and boots xv6-SMP to the interactive `$` shell** in RTL/Verilator simulation today — all four harts reach `$` and run `ls`, with or without the optional shared L2 (see *Bring-up status* and *Multicore cache coherence (CCD)* below); the NMI line bus is now the committed transport under a full grant-and-go MOESI directory + CMI coherence layer, with the shared L2 as an optional tier on its memory leg. The remaining work is (a) the deferred directory-robustness hardening (P5: WB-vs-Fwd evict-snoop, snoop-slot/ServeDeferred liveness, snoop-drain stale-Inv, directory-capacity broadcast-Inv), torture/RVWMO-litmus stress, and usertests-under-SMP; and (b) FPGA emulation of the cluster — a multi-core CCD does not fit a single VU47P and AWS F2 has no PCIe P2P, so a larger target part may be needed.
   
 ## ISA Coverage
 
