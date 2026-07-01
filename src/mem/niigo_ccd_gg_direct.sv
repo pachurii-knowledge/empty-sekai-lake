@@ -29,7 +29,19 @@ module niigo_ccd_gg_direct
     // COH_FORCE: extra cycles to hold an L2-sourced (directory) DATA grant before delivering it,
     // so a peer's snoop can land on a requester still mid-acquire (IS_D/IM_*) -> exercises the
     // deferred-snoop matrix deterministically. 0 = a single registered delay (still correct).
-    parameter int RESP_DLY = 0
+    parameter int RESP_DLY = 0,
+    // L2 (plans/l2-integration.md Inc 2): interpose a transparent write-back NINE L2 (niigo_l2) on
+    // the directory's NMI memory leg. Default OFF -> the generate-else ties mem_req_o straight to
+    // the directory (bit-identical net). -DL2_CACHE flips the default ON for EVERY gg_direct
+    // instance (single-core CCD, SMP litmus, niigo_ccd_memsys, xv6-SMP) with no call-site edit --
+    // all CCD machinery stays ifdef/param-gated, so the single-core/COHERENT=0 path is bit-identical
+    // whenever L2_CACHE is undefined. The L2 is BELOW the coherence point (cache-to-cache owner
+    // forwarding never reaches this leg), so it changes only memory-leg latency, not coherence.
+`ifdef L2_CACHE
+    parameter bit L2_ENABLE = 1'b1
+`else
+    parameter bit L2_ENABLE = 1'b0
+`endif
 )(
     input  wire logic clk,
     input  wire logic rst_l,
@@ -78,14 +90,31 @@ module niigo_ccd_gg_direct
     logic       dwb_v;   ccd_msg_t dwb_m;   logic dwb_r;
     logic       dout_v;  ccd_msg_t dout_m;  logic [NODE_ID_W-1:0] dout_d; logic dout_r;
 
+    // Directory NMI memory leg -- routed through the L2 (below) when enabled, else
+    // tied straight to the module's mem port (the original, bit-identical net).
+    nmi_req_t  l2u_req;  logic l2u_req_ready;  nmi_resp_t l2u_resp;
+
     niigo_dir_gg #(.CORES(CORES), .DIR_SETS(DIR_SETS)) DIR (
         .clk, .rst_l,
         .req_valid(dreq_v), .req_msg(dreq_m), .req_ready(dreq_r),
         .unblk_valid(dunb_v), .unblk_msg(dunb_m), .unblk_ready(dunb_r),
         .wb_valid(dwb_v), .wb_msg(dwb_m), .wb_ready(dwb_r),
         .out_valid(dout_v), .out_msg(dout_m), .out_dst(dout_d), .out_ready(dout_r),
-        .mem_req_o(mem_req_o), .mem_req_ready_i(mem_req_ready_i), .mem_resp_i(mem_resp_i)
+        .mem_req_o(l2u_req), .mem_req_ready_i(l2u_req_ready), .mem_resp_i(l2u_resp)
     );
+
+    // Transparent write-back NINE L2 on the directory's memory leg, or passthrough.
+    generate if (L2_ENABLE) begin : G_L2
+        niigo_l2 L2 (
+            .clk, .rst_l,
+            .s_req(l2u_req), .s_req_ready(l2u_req_ready), .s_resp(l2u_resp),   // slave up (to DIR)
+            .m_req(mem_req_o), .m_req_ready(mem_req_ready_i), .m_resp(mem_resp_i) // master down (to MC)
+        );
+    end else begin : G_NOL2
+        assign mem_req_o     = l2u_req;
+        assign l2u_req_ready = mem_req_ready_i;
+        assign l2u_resp      = mem_resp_i;
+    end endgenerate
 
     logic fl_done_a [NACTIVE];
     assign flush_done = fl_done_a[0];
