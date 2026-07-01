@@ -95,6 +95,16 @@ ccd-gg-test:
 		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_gg.sv
 	$(OUTPUT_BASE_DIR)/ccd-gg/Vtb_niigo_ccd_gg
 
+# ---- L2 Inc 1: standalone niigo_l2 unit test (transparent write-back NINE L2) ----
+# Drives the L2's NMI slave with RD/WR line sequences against a random-latency
+# behavioural backing memory; checks fill/hit/dirty-writeback/write-allocate/
+# write-read-coherence/held-valid. Expect "L2-TB: ALL CHECKS PASSED".
+ccd-l2-test:
+	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/ccd-l2 --top-module tb_ccd_l2 \
+		-Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT -Wno-ASCRANGE \
+		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_ccd_l2.sv
+	$(OUTPUT_BASE_DIR)/ccd-l2/Vtb_ccd_l2
+
 # ---- 4-core grant-and-go directed protocol tests (NACTIVE=4): the SAME S1-S6/C1-C8 programs PLUS
 #      G1 (multi-sharer ack-to-requester, acks>1), S4 (owner-in-O upgrade vs peer GetM), and S3
 #      (dirty-shared O line evicted while a peer snoops) -- the paths unreachable at 2 cores. ----
