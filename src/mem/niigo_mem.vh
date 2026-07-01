@@ -73,6 +73,38 @@ package NIIGO_Mem;
                         {LINE_WORD_BITS{1'b0}}};
     endfunction
 
+    // ---- Shared L2 cache geometry (512 KiB, 8-way, 64 B lines, PIPT, NINE) ----
+    // 512 KiB / 64 B = 8192 lines; / 8 ways = 1024 sets. The L2 is a transparent
+    // write-back tier on the directory's NMI memory leg (plans/multicore-ccd.md
+    // §2): the directory (niigo_dir_gg) is oblivious to it. PIPT — the L2 sees
+    // only physical line (word) addresses, so every core indexes one set per PA.
+    // These are the full-size constants; a smaller sim-only L2 is selected by
+    // niigo_l2's own SETS/WAYS params (it derives its index/tag internally), so
+    // shrinking for Verilator needs no edit here.
+    localparam int L2_SETS       = 1024;
+    localparam int L2_WAYS       = 8;
+    localparam int L2_INDEX_BITS = $clog2(L2_SETS);           // 10
+    localparam int L2_WAY_BITS   = $clog2(L2_WAYS);           // 3
+    localparam int L2_TAG_BITS   = MEMORY_ADDR_WIDTH - L2_INDEX_BITS - LINE_WORD_BITS;
+
+    // Word-address field extraction, same [ tag | index | line_word_offset ]
+    // layout as the L1 (a word address is MEMORY_ADDR_WIDTH bits).
+    function automatic logic [L2_INDEX_BITS-1:0]
+            l2_index(input logic [MEMORY_ADDR_WIDTH-1:0] wa);
+        l2_index = wa[LINE_WORD_BITS +: L2_INDEX_BITS];
+    endfunction
+    function automatic logic [L2_TAG_BITS-1:0]
+            l2_tag(input logic [MEMORY_ADDR_WIDTH-1:0] wa);
+        l2_tag = wa[MEMORY_ADDR_WIDTH-1 : L2_INDEX_BITS + LINE_WORD_BITS];
+    endfunction
+    // Line-base word address (low LINE_WORD_BITS cleared) — identical granularity
+    // to l1_line_base (both 64 B lines); provided for L2-side symmetry.
+    function automatic logic [MEMORY_ADDR_WIDTH-1:0]
+            l2_line_base(input logic [MEMORY_ADDR_WIDTH-1:0] wa);
+        l2_line_base = {wa[MEMORY_ADDR_WIDTH-1 : LINE_WORD_BITS],
+                        {LINE_WORD_BITS{1'b0}}};
+    endfunction
+
     // ---- AXI4 geometry (phase X1): one 64 B line == one 512 b beat ----
     localparam int AXI_ADDR_W = 64;
     localparam int AXI_DATA_W = LINE_BITS;       // 512
