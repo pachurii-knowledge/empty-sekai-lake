@@ -24,3 +24,9 @@ vivado*.jou
 clockInfo.txt
 cong/
 fpga/synth/triage
+# OpenROAD/ABC + Vivado scratch dumped in CWD
+abc.history
+iter_*_CongestedCLBsAndNets.txt
+# OpenROAD/ASAP7 flow: large external clones + extracted PDK collateral (NOT source)
+fpga/openroad/orfs_platform/
+fpga/openroad/lib_tt/
