@@ -85,9 +85,8 @@ module niigo_l2
     logic [LB/8-1:0]               dat_wmask;
     logic [WAYS-1:0][LB-1:0]       dat_rdata;
 
-    l1_tag_array #(.SETS(SETS), .WAYS(WAYS), .TAG_BITS(TAG_BITS)) Tags (
+    l1_tag_array #(.SETS(SETS), .WAYS(WAYS), .TAG_BITS(TAG_BITS)) Tags (  // NINE: no back-invalidate
         .clk, .ren(tag_ren), .ridx(tag_ridx), .rtag(tag_rdata),
-        .ren2(1'b0), .ridx2('0), .rtag2(),   // no snoop port (NINE: no back-invalidate)
         .wen(tag_wen), .widx(tag_widx), .wway(tag_wway), .wtag(tag_wtag)
     );
     l1_data_array #(.SETS(SETS), .WAYS(WAYS), .LINE_BITS(LB)) Data (

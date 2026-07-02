@@ -38,8 +38,10 @@ module l1_icache
     input wire logic                                    inval_all,
 
     // ---- C4b coherence snoop: a committed D-store to snoop_waddr invalidates
-    //      any L1I copy of that line (single-cycle pulse; word address). Uses
-    //      the tag array's 2nd read port, so it never stalls the fetch port. ----
+    //      any L1I copy of that line (single-cycle pulse; word address). The
+    //      snoop read interleaves onto the single tag port (occasionally
+    //      deferring a fetch accept by a cycle -- the fetch path is handshaked
+    //      and tolerates variable latency). ----
     input wire logic                                    snoop_valid,
     input wire logic [MEMORY_ADDR_WIDTH-1:0]            snoop_waddr,
 
@@ -59,10 +61,6 @@ module l1_icache
     logic [L1_WAY_BITS-1:0]         tag_wway;
     logic [L1_TAG_BITS-1:0]         tag_wtag;
     logic [L1_WAYS-1:0][L1_TAG_BITS-1:0] tag_rdata;
-    // 2nd tag read port (C4b snoop).
-    logic                           tag_ren2;
-    logic [L1_INDEX_BITS-1:0]       tag_ridx2;
-    logic [L1_WAYS-1:0][L1_TAG_BITS-1:0] tag_rdata2;
 
     logic                           dat_ren, dat_wen;
     logic [L1_INDEX_BITS-1:0]       dat_ridx, dat_widx;
@@ -73,7 +71,6 @@ module l1_icache
 
     l1_tag_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .TAG_BITS(L1_TAG_BITS)) Tags (
         .clk, .ren(tag_ren), .ridx(tag_ridx), .rtag(tag_rdata),
-        .ren2(tag_ren2), .ridx2(tag_ridx2), .rtag2(tag_rdata2),
         .wen(tag_wen), .widx(tag_widx), .wway(tag_wway), .wtag(tag_wtag)
     );
     l1_data_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .LINE_BITS(LINE_BITS)) Data (
@@ -116,30 +113,79 @@ module l1_icache
     logic                 refill_err_q,  refill_err_n;
     logic                 miss_inval_q,  miss_inval_n;  // inval seen mid-refill
 
-    // ---------------- C4b snoop pipeline (2 stages, always-running) ----------
-    // Stage 1 (this cycle): present the snoop index to the 2nd tag read port.
-    // Stage 2 (next cycle): compare the registered tag and clear the matching
-    // valid bit. Decoupled from the fetch read port, so it never bubbles fetch.
+    // ---------------- C4b snoop pipeline (single-port interleave) -------------
+    // The coherence snoop shares the ONE 1RW tag port with fetch, priority
+    // install-write > snoop-read > fetch/replay-read. A snoop read launched in
+    // cycle X changes tag_rdata only at X+1, and servicing a snoop deasserts
+    // ifetch_req_ready at X so no fetch consumes tag_rdata at X+1 (the hit served
+    // at X already used the X-1 read) -- so a steal never corrupts an in-flight
+    // fetch and never reorders/drops a response (the core pairs responses to its
+    // in-order fmeta FIFO). A depth-1 skid holds a snoop blocked by an install
+    // write; it is empty entering S_INSTALL because the I-miss that leads there
+    // could only be accepted on a snoop-gap cycle (req_fire needs !snp_service),
+    // which zeroes the skid, and it stays zero through the port-free miss.
+    // Stage 1: present the serviced snoop index to the shared read port.
+    // Stage 2 (next cycle): compare the registered tag and clear the valid bit.
     logic                      snp_v_q,   snp_v_n;
     logic [L1_INDEX_BITS-1:0]  snp_idx_q, snp_idx_n;
     logic [L1_TAG_BITS-1:0]    snp_tag_q, snp_tag_n;
-    assign tag_ren2  = snoop_valid;
-    assign tag_ridx2 = l1_index(snoop_waddr);
-    assign snp_v_n   = snoop_valid;
-    assign snp_idx_n = l1_index(snoop_waddr);
-    assign snp_tag_n = l1_tag(snoop_waddr);
+    // Depth-1 skid: a snoop that arrived while the port was doing an install write.
+    logic                          snp_pend_v_q,    snp_pend_v_n;
+    logic [MEMORY_ADDR_WIDTH-1:0]  snp_pend_addr_q, snp_pend_addr_n;
 
-    // Stage 2 hit detection against the registered (port-2) tags.
+    // A snoop wants the port this cycle (fresh pulse or skidded); pending wins.
+    logic                          snp_want_v;
+    logic [MEMORY_ADDR_WIDTH-1:0]  snp_svc_a;
+    assign snp_want_v = snp_pend_v_q || snoop_valid;
+    assign snp_svc_a  = snp_pend_v_q ? snp_pend_addr_q : snoop_waddr;
+
+    // Stage 2 hit detection against the shared-port registered tags, plus the
+    // combinational refill-race drop.
     logic [L1_WAYS-1:0] snp_hit_oh;
     logic               snp_hit_refill;  // snoop targets the line being refilled
     always_comb begin
         for (int w = 0; w < L1_WAYS; w += 1)
             snp_hit_oh[w] = snp_v_q && valid_q[snp_idx_q][w] &&
-                            (tag_rdata2[w] == snp_tag_q);
+                            (tag_rdata[w] == snp_tag_q);
         // A store to the line currently in refill makes the pending install
-        // stale (it may predate the store) -> drop it, just like inval_all.
-        snp_hit_refill = snp_v_q && (state_q != S_SERVE) &&
-                         (snp_idx_q == p_idx) && (snp_tag_q == p_tag);
+        // stale (it may predate the store) -> drop it, just like inval_all. This
+        // is COMBINATIONAL over two terms so a snoop landing exactly at S_INSTALL
+        // still drops the install: (1) an earlier snoop now registered in stage 2
+        // while state != S_SERVE, and (2) a fresh/pending snoop arriving at
+        // S_INSTALL (before it can reach stage 2).
+        snp_hit_refill =
+            ( snp_v_q    && (state_q != S_SERVE)   &&
+              (snp_idx_q == p_idx)                 && (snp_tag_q == p_tag) ) ||
+            ( snp_want_v && (state_q == S_INSTALL) &&
+              (l1_index(snp_svc_a) == p_idx)       && (l1_tag(snp_svc_a) == p_tag) );
+    end
+
+    // Port arbitration: install-write > snoop-read > fetch/replay-read.
+    logic install_go;   // the install write actually happens this cycle
+    logic snp_service;  // the snoop reads the shared tag port this cycle
+    assign install_go  = (state_q == S_INSTALL) && !miss_inval_q && !snp_hit_refill;
+    assign snp_service = snp_want_v && !install_go;
+
+    // Stage-1 capture: register the serviced snoop for next-cycle compare.
+    assign snp_v_n   = snp_service;
+    assign snp_idx_n = l1_index(snp_svc_a);
+    assign snp_tag_n = l1_tag(snp_svc_a);
+
+    // Depth-1 skid update: hold a snoop blocked by an install write, or a fresh
+    // snoop arriving the same cycle a pending one is serviced.
+    always_comb begin
+        snp_pend_v_n    = snp_pend_v_q;
+        snp_pend_addr_n = snp_pend_addr_q;
+        if (snp_service) begin
+            snp_pend_v_n = 1'b0;
+            if (snp_pend_v_q && snoop_valid) begin
+                snp_pend_v_n    = 1'b1;
+                snp_pend_addr_n = snoop_waddr;
+            end
+        end else if (snoop_valid) begin
+            snp_pend_v_n    = 1'b1;
+            snp_pend_addr_n = snoop_waddr;
+        end
     end
 
     // ---------------- hit detection (stage 2) ----------------
@@ -191,7 +237,9 @@ module l1_icache
     assign serve_hit  = (state_q == S_SERVE) && p_valid_q &&  any_hit;
     assign serve_miss = (state_q == S_SERVE) && p_valid_q && !any_hit;
 
-    assign ifetch_req_ready = (state_q == S_SERVE) && (!p_valid_q || any_hit);
+    // A snoop stealing the shared tag read port this cycle blocks a new fetch
+    // accept (the fetch requester simply waits -- variable latency tolerated).
+    assign ifetch_req_ready = (state_q == S_SERVE) && (!p_valid_q || any_hit) && !snp_service;
     assign req_fire = ifetch_req_valid && ifetch_req_ready;
 
     assign ifetch_resp_valid = serve_hit;
@@ -213,13 +261,18 @@ module l1_icache
         nmi_req.id    = {NMI_SRC_IFILL, gen_q};
     end
 
-    // Array read presentation.
+    // Array read presentation. A snoop service steals the tag read port (tag
+    // only -- the data array stays idle; the snoop just needs the tags). It has
+    // priority over a fetch accept (gated out of ifetch_req_ready) and over a
+    // replay read (which is deferred by staying in S_REPLAY, below).
     always_comb begin
         tag_ren  = 1'b0;
         tag_ridx = p_idx;
         dat_ren  = 1'b0;
         dat_ridx = p_idx;
-        if ((state_q == S_SERVE) && req_fire) begin
+        if (snp_service) begin
+            tag_ren  = 1'b1; tag_ridx = l1_index(snp_svc_a);
+        end else if ((state_q == S_SERVE) && req_fire) begin
             tag_ren  = 1'b1; tag_ridx = l1_index(ifetch_req_addr);
             dat_ren  = 1'b1; dat_ridx = l1_index(ifetch_req_addr);
         end else if (state_q == S_REPLAY) begin
@@ -239,7 +292,7 @@ module l1_icache
         dat_wway  = victim;
         dat_wdata = refill_line_q;
         dat_wmask = '1;
-        if ((state_q == S_INSTALL) && !miss_inval_q) begin
+        if (install_go) begin
             tag_wen = 1'b1;
             dat_wen = 1'b1;
         end
@@ -252,7 +305,7 @@ module l1_icache
         if (serve_hit) begin
             plru_upd_en  = 1'b1;
             plru_acc_way = hit_way;
-        end else if ((state_q == S_INSTALL) && !miss_inval_q) begin
+        end else if (install_go) begin
             plru_upd_en  = 1'b1;
             plru_acc_way = victim;
         end
@@ -303,8 +356,10 @@ module l1_icache
             end
 
             S_REPLAY: begin
-                // Re-present the (now installed, or re-missing) index.
-                state_n = S_SERVE;
+                // Re-present the (now installed, or re-missing) index -- unless a
+                // snoop stole the tag read port this cycle (the replay read did
+                // not happen), in which case stay one more cycle to redo it.
+                state_n = snp_service ? S_REPLAY : S_SERVE;
             end
 
             default: state_n = S_SERVE;
@@ -320,17 +375,17 @@ module l1_icache
     // valid-bit next state (flash invalidate + install set).
     always_comb begin
         for (int s = 0; s < L1_SETS; s += 1) valid_n[s] = valid_q[s];
-        // Flash invalidate: fence.i in SERVE, or the dropped-install case.
+        // Flash invalidate: fence.i in SERVE, or the dropped-install case (a
+        // fence.i or a snoop to the in-refill line raced the refill).
         if ((inval_all) ||
-            ((state_q == S_INSTALL) && miss_inval_q)) begin
+            ((state_q == S_INSTALL) && (miss_inval_q || snp_hit_refill))) begin
             for (int s = 0; s < L1_SETS; s += 1) valid_n[s] = '0;
         end
         // C4b snoop: clear any way whose tag matches a committed-store line.
         for (int w = 0; w < L1_WAYS; w += 1)
             if (snp_hit_oh[w]) valid_n[snp_idx_q][w] = 1'b0;
-        // Install sets the victim way valid (overrides a same-cycle clear only
-        // when this is a clean install).
-        if ((state_q == S_INSTALL) && !miss_inval_q) begin
+        // Install sets the victim way valid (only on a clean, non-dropped install).
+        if (install_go) begin
             valid_n[p_idx][victim] = 1'b1;
         end
     end
@@ -346,6 +401,8 @@ module l1_icache
             snp_v_q       <= 1'b0;
             snp_idx_q     <= '0;
             snp_tag_q     <= '0;
+            snp_pend_v_q    <= 1'b0;
+            snp_pend_addr_q <= '0;
             gen_q         <= '0;
             for (int s = 0; s < L1_SETS; s += 1) begin
                 valid_q[s] <= '0;
@@ -361,9 +418,20 @@ module l1_icache
             snp_v_q       <= snp_v_n;
             snp_idx_q     <= snp_idx_n;
             snp_tag_q     <= snp_tag_n;
+            snp_pend_v_q    <= snp_pend_v_n;
+            snp_pend_addr_q <= snp_pend_addr_n;
             if (state_q == S_MISS_REQ && nmi_req_ready) gen_q <= gen_q + 2'd1;
             for (int s = 0; s < L1_SETS; s += 1) valid_q[s] <= valid_n[s];
             if (plru_upd_en) plru_q[p_idx] <= plru_next;
+            // Depth-1 skid invariant: the skid is empty entering S_INSTALL (the
+            // I-miss that leads there could only be accepted on a snoop-gap cycle,
+            // which zeroes the skid, and it stays zero through the port-free
+            // miss). If this fires, a second concurrent snoop could be dropped ->
+            // the skid must be deepened.
+            // synopsys translate_off
+            assert (!(snp_pend_v_q && (state_q == S_INSTALL)))
+                else $error("l1_icache: snoop skid non-empty at S_INSTALL (depth-1 invariant violated)");
+            // synopsys translate_on
         end
     end
 

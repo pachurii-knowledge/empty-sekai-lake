@@ -85,14 +85,10 @@ module l1_dcache
     logic [LBY-1:0]                 dat_wmask;
     logic [L1_WAYS-1:0][LB-1:0]     dat_rdata;
 
-    // SNOOP_PORT(0): the L1D ties ren2 off (probe reuses the main port), so the
-    // ASAP7 macro build maps this tag array to a clean single-port SRAM.
-    l1_tag_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .TAG_BITS(L1_TAG_BITS),
-                   .SNOOP_PORT(0)) Tags (
+    // The L1D probe (C4a) reuses the main read port in S_PROBE_LOOK, so the tag
+    // array is a clean single-port (1RW) SRAM under the ASAP7 macro build.
+    l1_tag_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .TAG_BITS(L1_TAG_BITS)) Tags (
         .clk, .ren(tag_ren), .ridx(tag_ridx), .rtag(tag_rdata),
-        // 2nd read port unused here: the L1D probe (C4a) reuses the main read
-        // port in S_PROBE_LOOK, so the snoop port is tied off (optimized away).
-        .ren2(1'b0), .ridx2('0), .rtag2(),
         .wen(tag_wen), .widx(tag_widx), .wway(tag_wway), .wtag(tag_wtag)
     );
     l1_data_array #(.SETS(L1_SETS), .WAYS(L1_WAYS), .LINE_BITS(LB)) Data (
