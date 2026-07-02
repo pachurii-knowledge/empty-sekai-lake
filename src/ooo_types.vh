@@ -67,6 +67,21 @@ package OOO_Types;
         logic [9:0]  tag1;
         logic [9:0]  tag2;
         logic [9:0]  sc_history;
+        // Carried counter/useful reads from the lookup snapshot, so the resolve
+        // update can be WRITE-ONLY (no array read) -> the predictor tables map to
+        // sync-read SRAM. All at the same indices the lookup read (update_pc ==
+        // lookup_pc, carried indices/sc_history), so these are the values the
+        // update's async read would have returned (modulo staleness, which the
+        // self-correcting best-effort tables tolerate). TAGE uses base_ctr / ctr*
+        // (counters) / use* / sc_bias; ITTAGE reuses ctr* as confidences + use*.
+        logic [1:0]  base_ctr;
+        logic [1:0]  ctr0;
+        logic [1:0]  ctr1;
+        logic [1:0]  ctr2;
+        logic [1:0]  use0;
+        logic [1:0]  use1;
+        logic [1:0]  use2;
+        logic signed [5:0] sc_bias;
     } predictor_info_t;
 
     typedef struct packed {

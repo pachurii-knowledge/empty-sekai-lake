@@ -260,6 +260,29 @@ module riscv_core_ooo
     logic [DIRECT_HISTORY_BITS-1:0] ghr_checkpoint_next [BRANCH_STACK_SIZE];
     logic [DIRECT_HISTORY_BITS-1:0] ghr_branch_snapshot;
 
+    // Predictor sync-read hold. The TAGE/ITTAGE tables are sync-read, so the
+    // prediction for the presented group's lookup_pc is registered and available
+    // the NEXT cycle. When a branch-bearing group first appears we hold it one
+    // cycle (suppress dispatch -> also freezes fetch via frontend_stall, and
+    // freezes pc_q/ghr_q) so B2 consumes the registered prediction matched to the
+    // SAME (fgrp_pc, ghr_q). Architecturally inert: predictions are hints and
+    // every branch is precisely recovered at resolve, so a mismatched/stale/late
+    // prediction can only change cycle counts, never a committed result. The
+    // (pc, ghr) key is exact because ghr_q cannot change during a non-flush hold
+    // (the speculative push is under dispatch_valid; a restore implies a flush
+    // that discards the held group).
+    logic pred_ready_q;
+    logic [XLEN-1:0] pred_key_pc_q;
+    logic [DIRECT_HISTORY_BITS-1:0] pred_key_ghr_q;
+    logic pred_launch, prediction_ready, predict_stall;
+    // A branch-bearing group is presented and its sync-read lookup is in flight.
+    assign pred_launch = fgrp_valid && !halted_q &&
+                         (direct_lookup_valid || indirect_lookup_valid);
+    // The registered prediction is ready and matches THIS held group's key.
+    assign prediction_ready = pred_ready_q && (pred_key_pc_q == fgrp_pc) &&
+                              (pred_key_ghr_q == ghr_q);
+    assign predict_stall = pred_launch && !prediction_ready;
+
     logic direct_lookup_valid;
     logic [XLEN-1:0] direct_lookup_pc;
     logic direct_prediction;
@@ -1250,7 +1273,7 @@ module riscv_core_ooo
         .free_list_available(free_count_snapshot),
         .suppress_dispatch(redirect_valid || terminal_pending_q ||
             control_pending_q || serial_pending_q || halted_q || irq_drain_q ||
-            wfi_wait_q || commit_take_trap || fencei_block),
+            wfi_wait_q || commit_take_trap || fencei_block || predict_stall),
         .dispatch_valid,
         .dispatch_stall
     );
@@ -2503,6 +2526,9 @@ module riscv_core_ooo
                 ras_checkpoint_count_q[i] <= '0;
             end
             ghr_q <= '0;
+            pred_ready_q <= 1'b0;
+            pred_key_pc_q <= '0;
+            pred_key_ghr_q <= '0;
             for (int i = 0; i < BRANCH_STACK_SIZE; i += 1) begin
                 ghr_checkpoint_q[i] <= '0;
             end
@@ -2540,6 +2566,13 @@ module riscv_core_ooo
                 ras_checkpoint_count_q[i] <= ras_checkpoint_count_next[i];
             end
             ghr_q <= ghr_next;
+            // Predictor sync-read key: remember the group/history the in-flight
+            // lookup was launched for, so next cycle prediction_ready can confirm
+            // the registered prediction matches the (still-held) group. Cleared on
+            // any redirect (the held group is discarded) as belt-and-suspenders.
+            pred_ready_q <= redirect_valid ? 1'b0 : pred_launch;
+            pred_key_pc_q <= fgrp_pc;
+            pred_key_ghr_q <= ghr_q;
             for (int i = 0; i < 32; i += 1) begin
                 arch_map_q[i] <= arch_map_next[i];
             end
