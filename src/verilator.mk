@@ -118,6 +118,19 @@ ifeq ($(RV64),1)
 	VERILATOR_CFLAGS += -DRV64
 endif
 
+# RVC=1 enables the RV64C compressed (16-bit) instruction extension: a two-wide
+# expand-before-decode realign frontend (rvc_realign) + a pure-combinational
+# 16->32 expander (rvc_expand), all -DRVC gated. RV64GC only -- RVC requires
+# RV64 (the RV32C-only encoding slots are not implemented). Composes with
+# OOO/L1/L1D/AXI/CCD (purely a core-frontend change). The non-RVC build stays
+# bit-identical. See the RV64C plan.
+ifeq ($(RVC),1)
+ifneq ($(RV64),1)
+$(error RVC=1 requires RV64=1 (RV64GC only); the RV32C encoding slots are not implemented)
+endif
+	VERILATOR_CFLAGS += -DRVC
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

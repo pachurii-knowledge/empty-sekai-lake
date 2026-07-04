@@ -171,6 +171,11 @@ package OOO_Types;
         logic          exception;
         logic [4:0]    exc_cause;
         logic          halted;
+`ifdef RVC
+        // RV64C: instruction length flag for branch-predictor training (the
+        // "taken" test compares redirect_pc against pc + ILEN, not pc + 4).
+        logic          is_compressed;
+`endif
     } writeback_packet_t;
 
     typedef struct packed {
@@ -198,6 +203,14 @@ package OOO_Types;
         logic          halted;
         logic          exception;
         logic [4:0]    exc_cause;
+`ifdef RVC
+        // RV64C: is_compressed feeds ILEN and rvc_parcel is the original 16-bit
+        // parcel used for the illegal-compressed mtval (the .instr field stays
+        // the canonical expanded 32-bit word). Both allocated at dispatch,
+        // carried through the ROB like .instr.
+        logic          is_compressed;
+        logic [15:0]   rvc_parcel;
+`endif
     } commit_packet_t;
 
     // FB1 debug-observability probe (FPGA bring-up). A pure tap off existing

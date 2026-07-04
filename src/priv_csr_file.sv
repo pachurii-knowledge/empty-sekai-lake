@@ -228,6 +228,9 @@ module priv_csr_file
     localparam logic [MXLEN-1:0] MISA_VALUE =
         (MXLEN'(MXLEN == 64 ? 2 : 1) << (MXLEN - 2)) |   // MXL
         (MXLEN'(1) << 0)  |   // A
+`ifdef RVC
+        (MXLEN'(1) << 2)  |   // C (RV64C, read-only 1)
+`endif
         (MXLEN'(1) << 3)  |   // D
         (MXLEN'(1) << 5)  |   // F
         (MXLEN'(1) << 8)  |   // I
@@ -466,14 +469,24 @@ module priv_csr_file
                 // Trap entry. Save state into the target privilege's CSRs.
                 // The cause interrupt flag lives at bit MXLEN-1.
                 if (trap_target_priv == PRIV_M) begin
+                    // RV64C (IALIGN=16) preserves epc bit[1]; without C, epc is
+                    // 4-byte aligned. bit[0] is always 0.
+`ifdef RVC
+                    mepc_q   <= {trap_epc[MXLEN-1:1], 1'b0};
+`else
                     mepc_q   <= {trap_epc[MXLEN-1:2], 2'b0};
+`endif
                     mcause_q <= {trap_is_interrupt, {(MXLEN-6){1'b0}}, trap_cause};
                     mtval_q  <= trap_tval;
                     st_mpie_q <= st_mie_q;
                     st_mie_q  <= 1'b0;
                     st_mpp_q  <= priv_q;
                 end else begin
+`ifdef RVC
+                    sepc_q   <= {trap_epc[MXLEN-1:1], 1'b0};
+`else
                     sepc_q   <= {trap_epc[MXLEN-1:2], 2'b0};
+`endif
                     scause_q <= {trap_is_interrupt, {(MXLEN-6){1'b0}}, trap_cause};
                     stval_q  <= trap_tval;
                     st_spie_q <= st_sie_q;
@@ -546,7 +559,11 @@ module priv_csr_file
             CSR_STVEC:  stvec_q <= {wdata[MXLEN-1:2], 1'b0, wdata[0]};
             CSR_SCOUNTEREN: scounteren_q <= wdata & COUNTEREN_MASK;
             CSR_SSCRATCH: sscratch_q <= wdata;
+`ifdef RVC
+            CSR_SEPC:   sepc_q <= {wdata[MXLEN-1:1], 1'b0};
+`else
             CSR_SEPC:   sepc_q <= {wdata[MXLEN-1:2], 2'b0};
+`endif
             CSR_SCAUSE: scause_q <= wdata;
             CSR_STVAL:  stval_q <= wdata;
             CSR_SIP: begin
@@ -597,7 +614,11 @@ module priv_csr_file
             CSR_MENVCFGH: menvcfg_adue_q <= wdata[29];   // WARL: only ADUE
 `endif
             CSR_MSCRATCH: mscratch_q <= wdata;
+`ifdef RVC
+            CSR_MEPC:    mepc_q <= {wdata[MXLEN-1:1], 1'b0};
+`else
             CSR_MEPC:    mepc_q <= {wdata[MXLEN-1:2], 2'b0};
+`endif
             CSR_MCAUSE:  mcause_q <= wdata;
             CSR_MTVAL:   mtval_q <= wdata;
             CSR_MIP: begin

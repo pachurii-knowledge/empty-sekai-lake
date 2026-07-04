@@ -17,6 +17,20 @@ module ooo_fetch_decode
     input wire logic [4:0]       fetch_fault_cause,  // EXC_INSTR_PAGE_FAULT/ACCESS
     input wire logic [XLEN-1:0]  fetch_pc,
     input wire logic [3:0][31:0] instr,
+`ifdef RVC
+    // RV64C: pre-aligned + expanded lanes from rvc_realign (2-wide). Under -DRVC
+    // these fully replace the fixed 4-byte window: instr/fetch_pc/fetch_fault_lane
+    // are ignored and the realigner supplies each lane's PC, canonical 32-bit
+    // encoding, length flag, per-instruction fetch fault, and raw parcel.
+    input wire logic [1:0]            rvc_valid,
+    input wire logic [1:0][XLEN-1:0]  rvc_pc,
+    input wire logic [1:0][31:0]      rvc_instr,
+    input wire logic [1:0]            rvc_is_compressed,
+    input wire logic [1:0]            rvc_fetch_fault,
+    input wire logic [1:0]            rvc_fetch_fault_hi,
+    input wire logic [1:0][4:0]       rvc_fault_cause,
+    input wire logic [1:0][15:0]      rvc_parcel,
+`endif
     output decode_lane_t     decode_lanes [OOO_WIDTH]
 );
 
@@ -29,11 +43,62 @@ module ooo_fetch_decode
     logic [OOO_WIDTH-1:0][31:0] raw_decode_instr;
     logic [OOO_WIDTH-1:0][31:0] decode_instr;
 
+    // Per-lane sources, `ifdef-selected from the RVC realigner or the fixed
+    // 4-byte fetch window. All downstream logic (control-squash chain, fault
+    // chain, decode, immediate/rs/rd extraction) is shared and identical.
+    logic [OOO_WIDTH-1:0]           lane_present;      // lane holds a real slot
+    logic [OOO_WIDTH-1:0][XLEN-1:0] lane_pc;
+    logic [OOO_WIDTH-1:0]           lane_fault;        // this lane's fetch fault
+    logic [OOO_WIDTH-1:0][4:0]      lane_fault_cause_v;
+`ifdef RVC
+    logic [OOO_WIDTH-1:0]           lane_is_comp;
+    logic [OOO_WIDTH-1:0]           lane_fault_hi;
+    logic [OOO_WIDTH-1:0][15:0]     lane_parcel;
+`endif
+
     assign fetch_lane_offset = fetch_pc[3:2];
 
-    // base_valid / block_fault / prefix_fault depend only on raw_decode_instr and
-    // the fault mask, so they are resolved before decode_instr (no comb cycle).
     always_comb begin
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+`ifdef RVC
+            // Only lanes 0/1 exist (the realigner is two-wide); 2/3 are forced
+            // invalid NOPs so the control/fault chains and dispatch accounting
+            // stay well-defined against the 4-wide backend.
+            if (i < 2) begin
+                lane_present[i]       = rvc_valid[i];
+                raw_decode_instr[i]   = rvc_valid[i] ? rvc_instr[i] : 32'h0000_0013;
+                lane_pc[i]            = rvc_pc[i];
+                lane_fault[i]         = rvc_fetch_fault[i];
+                lane_fault_cause_v[i] = rvc_fault_cause[i];
+                lane_is_comp[i]       = rvc_is_compressed[i];
+                lane_fault_hi[i]      = rvc_fetch_fault_hi[i];
+                lane_parcel[i]        = rvc_parcel[i];
+            end else begin
+                lane_present[i]       = 1'b0;
+                raw_decode_instr[i]   = 32'h0000_0013;
+                lane_pc[i]            = '0;
+                lane_fault[i]         = 1'b0;
+                lane_fault_cause_v[i] = 5'd0;
+                lane_is_comp[i]       = 1'b0;
+                lane_fault_hi[i]      = 1'b0;
+                lane_parcel[i]        = 16'h0000;
+            end
+`else
+            lane_present[i] = fetch_valid &&
+                (int'(fetch_lane_offset) + i < OOO_WIDTH);
+            raw_decode_instr[i] =
+                (fetch_valid && !instr_mem_excpt &&
+                 (int'(fetch_lane_offset) + i < OOO_WIDTH)) ?
+                instr[int'(fetch_lane_offset) + i] : 32'h0000_0013;
+            lane_pc[i]            = fetch_pc + (i * 32'd4);
+            lane_fault[i]         = fetch_fault_lane[i];
+            lane_fault_cause_v[i] = fetch_fault_cause;
+`endif
+        end
+
+        // A JAL/JALR in an older lane squashes the younger lanes of the same
+        // fetch group (their PCs are wrong-path). The expander turns c.j/c.jr/
+        // c.jalr into JAL/JALR, so this chain is C-transparent.
         prefix_unpredicted_control = '0;
         for (int i = 1; i < OOO_WIDTH; i += 1) begin
             prefix_unpredicted_control[i] =
@@ -42,10 +107,9 @@ module ooo_fetch_decode
                 (raw_decode_instr[i - 1][6:0] == RISCV_ISA::OP_JALR);
         end
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            base_valid[i] = fetch_valid &&
-                (int'(fetch_lane_offset) + i < OOO_WIDTH) &&
+            base_valid[i] = fetch_valid && lane_present[i] &&
                 !prefix_unpredicted_control[i];
-            block_fault[i] = base_valid[i] && fetch_fault_lane[i];
+            block_fault[i] = base_valid[i] && lane_fault[i];
         end
         prefix_fault = '0;
         for (int i = 1; i < OOO_WIDTH; i += 1)
@@ -55,10 +119,6 @@ module ooo_fetch_decode
     genvar lane;
     generate
         for (lane = 0; lane < OOO_WIDTH; lane += 1) begin : decode_gen
-            assign raw_decode_instr[lane] =
-                (fetch_valid && !instr_mem_excpt &&
-                 (int'(fetch_lane_offset) + lane < OOO_WIDTH)) ?
-                instr[int'(fetch_lane_offset) + lane] : 32'h0000_0013;
             // NOP a lane that is control-squashed, that is the fault carrier, or
             // that follows an older faulting lane in the same group. The fault
             // carrier is re-stamped below to carry the fault to the ALU/commit.
@@ -81,15 +141,21 @@ module ooo_fetch_decode
             // older lanes execute normally, younger lanes are squashed. The fault
             // carrier (block_fault & !prefix_fault) retires as a trapping NOP.
             decode_lanes[i].valid = fetch_valid && !instr_mem_excpt &&
-                (int'(fetch_lane_offset) + i < OOO_WIDTH) &&
+                lane_present[i] &&
                 !prefix_unpredicted_control[i] && !prefix_fault[i];
             decode_lanes[i].kill = 1'b0;
-            decode_lanes[i].pc = fetch_pc + (i * 32'd4);
+            decode_lanes[i].pc = lane_pc[i];
             decode_lanes[i].instr = decode_instr[i];
             decode_lanes[i].ctrl = lane_ctrl[i];
             decode_lanes[i].ctrl.fetch_fault =
                 block_fault[i] && !prefix_fault[i];
-            decode_lanes[i].ctrl.fetch_fault_cause = fetch_fault_cause;
+            decode_lanes[i].ctrl.fetch_fault_cause = lane_fault_cause_v[i];
+`ifdef RVC
+            decode_lanes[i].ctrl.is_compressed = lane_is_comp[i];
+            decode_lanes[i].ctrl.fetch_fault_hi =
+                lane_fault_hi[i] && block_fault[i] && !prefix_fault[i];
+            decode_lanes[i].ctrl.rvc_parcel = lane_parcel[i];
+`endif
             decode_lanes[i].rs1 = lane_ctrl[i].syscall ? 5'd10 :
                 decode_instr[i][19:15];
             decode_lanes[i].rs2 = decode_instr[i][24:20];

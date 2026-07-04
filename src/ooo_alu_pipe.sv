@@ -47,6 +47,11 @@ module ooo_alu_pipe
             wb_next.active_id = issue_entry.active_id;
             wb_next.pc = issue_entry.pc;
             wb_next.instr = issue_entry.instr;
+`ifdef RVC
+            // RV64C: carry the instruction length flag to commit so the branch
+            // predictor trains on pc + ILEN (not pc + 4) for compressed branches.
+            wb_next.is_compressed = issue_entry.ctrl.is_compressed;
+`endif
             wb_next.prd = issue_entry.prd;
             wb_next.has_dest = issue_entry.has_dest;
             wb_next.data = result_for(issue_entry, rs1_data, rs2_data);
@@ -77,23 +82,28 @@ module ooo_alu_pipe
             wb_next.halted = ecall_halt_en && issue_entry.ctrl.syscall &&
                 ((rs1_data == 32'ha) || (rs1_data == 32'hb));
 
-            // Instruction-address-misaligned (IALIGN=32, no C extension): a
-            // taken branch or jump whose target is not 4-byte aligned faults on
-            // the control-transfer instruction itself (epc = its PC, tval =
-            // target). JALR already forces target bit[0] to 0; JAL/branch
-            // immediates are even, so the only way to misalign is target bit[1].
-            // Reported here as an exception that the ROB takes precisely at
-            // commit; fetch is kept on an aligned path meanwhile since the
-            // misaligned target is never actually executed.
+            // Instruction-address-misaligned: a taken branch or jump whose
+            // target violates IALIGN faults on the control-transfer instruction
+            // itself (epc = its PC, tval = target). Without C (IALIGN=32) the
+            // only way to misalign is target bit[1] (JALR forces bit[0]=0;
+            // JAL/branch immediates are even). With C (IALIGN=16) only bit[0]
+            // can misalign -- and every target is even, so this is dead code but
+            // kept for exactness. Reported as an exception the ROB takes
+            // precisely at commit; fetch stays on an aligned path meanwhile.
             // wb_next.redirect_pc already holds actual_target_for(...) from above;
             // reuse it (indexing a struct field, not a function call -- Vivado
             // rejects a bit-select directly on a function call, Synth 8-12513).
             if (control_taken(issue_entry, rs1_data, rs2_data) &&
+`ifdef RVC
+                    wb_next.redirect_pc[0]) begin
+`else
                     wb_next.redirect_pc[1]) begin
+`endif
                 wb_next.exception = 1'b1;
                 wb_next.exc_cause = 5'd0;   // EXC_INSTR_MISALIGNED
                 wb_next.data = wb_next.redirect_pc;
-                wb_next.redirect_pc = issue_entry.pc + 32'd4;
+                wb_next.redirect_pc = issue_entry.pc +
+                    `ILEN_INC(issue_entry.ctrl.is_compressed);
             end
 
             // Instruction-fetch page/access fault: the frontend translated this
@@ -104,7 +114,14 @@ module ooo_alu_pipe
             if (issue_entry.ctrl.fetch_fault) begin
                 wb_next.exception = 1'b1;
                 wb_next.exc_cause = issue_entry.ctrl.fetch_fault_cause;
+`ifdef RVC
+                // RV64C: a straddling instruction whose HIGH half faults reports
+                // m/stval = PC+2 (the faulting VA); a low-half/whole fault -> PC.
+                wb_next.data = issue_entry.pc +
+                    (issue_entry.ctrl.fetch_fault_hi ? XLEN'(2) : XLEN'(0));
+`else
                 wb_next.data = issue_entry.pc;
+`endif
             end
         end
     end
@@ -127,7 +144,7 @@ module ooo_alu_pipe
         alu_a = entry.ctrl.usePC ? entry.pc : src1;
         alu_b = entry.ctrl.useImm ? entry.imm : src2;
         unique case (entry.ctrl.rd_source)
-            RD_PC4: result_for = entry.pc + XLEN'(4);
+            RD_PC4: result_for = entry.pc + `ILEN_INC(entry.ctrl.is_compressed);
             RD_IMM: result_for = entry.imm;
             RD_CMP: result_for = {{(XLEN-1){1'b0}}, branch_cmp(src1,
                 entry.ctrl.useImm ? entry.imm : src2, entry.ctrl.alu_op)};
@@ -388,7 +405,7 @@ module ooo_alu_pipe
             branch_mispredict_for = 1'b1;
         end else begin
             branch_mispredict_for = actual_target_for(entry, src1, src2) !=
-                (entry.pc + XLEN'(4));
+                (entry.pc + `ILEN_INC(entry.ctrl.is_compressed));
         end
     endfunction
 
@@ -410,7 +427,7 @@ module ooo_alu_pipe
                 branch_cmp(src1, src2, entry.ctrl.alu_op)) begin
             actual_target_for = entry.pc + entry.imm;
         end else begin
-            actual_target_for = entry.pc + XLEN'(4);
+            actual_target_for = entry.pc + `ILEN_INC(entry.ctrl.is_compressed);
         end
     endfunction
 

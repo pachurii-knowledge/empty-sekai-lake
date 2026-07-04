@@ -9,7 +9,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-CONFIGS=(niigo-rv32g niigo-rv64g)
+CONFIGS=(niigo-rv32g niigo-rv64g niigo-rv64gc)
 
 sync_one() {
     local name="$1" direction="$2"

@@ -94,6 +94,10 @@ module active_list
         logic halted;
         logic [XLEN-1:0] pc;
         logic [31:0] instr;
+`ifdef RVC
+        logic is_compressed;
+        logic [15:0] rvc_parcel;
+`endif
         logic [XLEN-1:0] data;
         logic fp_write;
         arch_reg_t fp_rd;
@@ -319,6 +323,12 @@ module active_list
                 commit_packet_next[i].has_dest = entries_q[commit_idx].has_dest;
                 commit_packet_next[i].pc = entries_q[commit_idx].pc;
                 commit_packet_next[i].instr = entries_q[commit_idx].instr;
+`ifdef RVC
+                commit_packet_next[i].is_compressed =
+                    entries_q[commit_idx].is_compressed;
+                commit_packet_next[i].rvc_parcel =
+                    entries_q[commit_idx].rvc_parcel;
+`endif
                 commit_packet_next[i].data = entries_q[commit_idx].data;
                 commit_packet_next[i].fp_write = entries_q[commit_idx].fp_write;
                 commit_packet_next[i].fp_rd = entries_q[commit_idx].fp_rd;
@@ -402,6 +412,12 @@ module active_list
                     allocate_packet_q[i].pc;
                 entries_next[allocate_packet_q[i].active_id].instr =
                     allocate_packet_q[i].instr;
+`ifdef RVC
+                entries_next[allocate_packet_q[i].active_id].is_compressed =
+                    allocate_packet_q[i].ctrl.is_compressed;
+                entries_next[allocate_packet_q[i].active_id].rvc_parcel =
+                    allocate_packet_q[i].ctrl.rvc_parcel;
+`endif
                 entries_next[allocate_packet_q[i].active_id].rd =
                     allocate_packet_q[i].rd;
                 entries_next[allocate_packet_q[i].active_id].prd =

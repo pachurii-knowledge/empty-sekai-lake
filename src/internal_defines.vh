@@ -229,9 +229,37 @@ typedef struct packed {
     // faulting virtual address (= PC) is reported in m/stval.
     logic       fetch_fault;
     logic [4:0] fetch_fault_cause; // EXC_INSTR_PAGE_FAULT or EXC_INSTR_ACCESS
+`ifdef RVC
+    // RV64C (compressed) frontend carriers. All `ifdef RVC-gated so the non-C
+    // packed layout is byte-identical (no $bits shift). is_compressed: this lane
+    // decoded from a 16-bit parcel, so its instruction length is 2 -- used at
+    // every +ilen site (RD_PC4 link, RAS push, branch fall-through) via
+    // ILEN_INC. fetch_fault_hi: the fetch fault is on the HIGH 16 bits of a
+    // (block/line/page/word) straddling instruction, so mtval = PC+2. rvc_parcel:
+    // the ORIGINAL 16-bit parcel, carried so an illegal/reserved compressed op
+    // reports mtval = zext16(parcel) (the expanded .instr word must stay the
+    // canonical 32-bit form -- it is a live CSR/fence/predictor decode input).
+    logic        is_compressed;
+    logic        fetch_fault_hi;
+    logic [15:0] rvc_parcel;
+`endif
 } ctrl_signals_t;
 
 endpackage : Internal_Defines
+
+// ILEN_INC(isc): architectural instruction length (in bytes) added to a PC to
+// form the next-sequential / link / return address. Under -DRVC it is 2 for a
+// compressed lane and 4 otherwise; with RVC unset it is a literal XLEN'(4) and
+// the (isc) argument text is never evaluated, so non-C sites emit exactly the
+// current expression. XLEN must be in scope at the expansion site (it is in the
+// OoO datapath/ALU). Guarded so multiple `include of this header is idempotent.
+`ifndef ILEN_INC
+`ifdef RVC
+`define ILEN_INC(isc) ((isc) ? (XLEN)'(2) : (XLEN)'(4))
+`else
+`define ILEN_INC(isc) ((XLEN)'(4))
+`endif
+`endif
 
 // Re-export into $unit for backward compatibility: modules that `include` this
 // header use the types unqualified (e.g. `alu_op_t`, `ctrl_signals_t`).

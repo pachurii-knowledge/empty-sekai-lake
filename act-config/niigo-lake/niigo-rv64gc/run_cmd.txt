@@ -1,0 +1,1 @@
+/home/mizuki/Desktop/workspace/niigo-lake/scripts/run_riscv_test.sh

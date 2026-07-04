@@ -123,6 +123,11 @@ module riscv_decode
                 illegal_instr: 1'b0,
                 fetch_fault: 1'b0,
                 fetch_fault_cause: 5'd0
+`ifdef RVC
+                , is_compressed: 1'b0
+                , fetch_fault_hi: 1'b0
+                , rvc_parcel: 16'd0
+`endif
             };
 
             if(~rst_l) begin
@@ -165,6 +170,11 @@ module riscv_decode
                     illegal_instr: 1'b0,
                     fetch_fault: 1'b0,
                     fetch_fault_cause: 5'd0
+`ifdef RVC
+                    , is_compressed: 1'b0
+                    , fetch_fault_hi: 1'b0
+                    , rvc_parcel: 16'd0
+`endif
                 };
             end
         

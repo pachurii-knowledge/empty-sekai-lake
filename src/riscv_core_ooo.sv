@@ -560,6 +560,50 @@ module riscv_core_ooo
 `endif
     end
 
+`ifdef RVC
+    // RV64C: the two-wide expand-before-decode realign stage drains the
+    // presented 16-byte group as 2-byte parcels and emits up to two canonical
+    // 32-bit instructions/cycle with true 2-byte-granular PCs. Under -DRVC the
+    // fgrp_fault_lane carried through the buffer is ABSOLUTE per-4B-word (see the
+    // FetchPMP fork below), which the realigner maps to each instruction.
+    logic [1:0]            rvc_lane_valid;
+    logic [1:0][XLEN-1:0]  rvc_lane_pc;
+    logic [1:0][31:0]      rvc_lane_instr;
+    logic [1:0]            rvc_lane_is_comp;
+    logic [1:0]            rvc_lane_fault;
+    logic [1:0]            rvc_lane_fault_hi;
+    logic [1:0][4:0]       rvc_lane_cause;
+    logic [1:0][15:0]      rvc_lane_parcel;
+    logic                  rvc_consume_block;
+    logic                  rvc_oldest_valid;
+    logic [XLEN-1:0]       rvc_oldest_pc;
+
+    rvc_realign RvcRealign (
+        .clk,
+        .rst_l,
+        .fgrp_valid(fgrp_valid && !halted_q),
+        .fgrp_pc,
+        .fgrp_data,
+        .fgrp_excpt,
+        .fgrp_fault_word(fgrp_fault_lane & {OOO_WIDTH{fgrp_valid}}),
+        .fgrp_fault_cause,
+        .dispatch_count,
+        .frontend_hold(dispatch_stall || halted_q),
+        .fetch_flush,
+        .out_valid(rvc_lane_valid),
+        .out_pc(rvc_lane_pc),
+        .out_instr(rvc_lane_instr),
+        .out_is_compressed(rvc_lane_is_comp),
+        .out_fetch_fault(rvc_lane_fault),
+        .out_fetch_fault_hi(rvc_lane_fault_hi),
+        .out_fault_cause(rvc_lane_cause),
+        .out_rvc_parcel(rvc_lane_parcel),
+        .rvc_consume_block,
+        .frontend_oldest_valid(rvc_oldest_valid),
+        .frontend_oldest_pc(rvc_oldest_pc)
+    );
+`endif
+
     ooo_fetch_decode FetchDecode (
         .rst_l,
         .fetch_valid(fgrp_valid && !halted_q),
@@ -568,6 +612,16 @@ module riscv_core_ooo
         .fetch_fault_cause(fgrp_fault_cause),
         .fetch_pc(fgrp_pc),
         .instr(decode_fetch_instr),
+`ifdef RVC
+        .rvc_valid(rvc_lane_valid),
+        .rvc_pc(rvc_lane_pc),
+        .rvc_instr(rvc_lane_instr),
+        .rvc_is_compressed(rvc_lane_is_comp),
+        .rvc_fetch_fault(rvc_lane_fault),
+        .rvc_fetch_fault_hi(rvc_lane_fault_hi),
+        .rvc_fault_cause(rvc_lane_cause),
+        .rvc_parcel(rvc_lane_parcel),
+`endif
         .decode_lanes
     );
 
@@ -1169,7 +1223,14 @@ module riscv_core_ooo
     generate
         for (fpl = 0; fpl < OOO_WIDTH; fpl += 1) begin : fetch_pmp_gen
             pmp_checker FetchPMP (
+`ifdef RVC
+                // RV64C: check the ABSOLUTE 4-byte word fpl of the 16-byte block
+                // (block-aligned base), so fault_lane[w] is word w regardless of
+                // the entry offset -- the realigner maps parcel s -> word s>>1.
+                .paddr({fetch_pa[XLEN-1:4], 4'b0} + (fpl * 32'd4)),
+`else
                 .paddr(fetch_pa + (fpl * 32'd4)),
+`endif
                 .access(2'd0),
                 .priv(cur_priv),
                 .pmpcfg(csr_pmpcfg_arr),
@@ -1188,12 +1249,25 @@ module riscv_core_ooo
     // PMP faults are per word. fetch_fault retains its group-level meaning (any
     // lane faults) for the existing frontend-stall/redirect logic.
     always_comb begin
+`ifdef RVC
+        // Absolute per-4B-word fault for the whole 16-byte block. A page/exec
+        // fault covers the entire (single-page) block -> all words fault, so
+        // whichever parcel the entry instruction sits at is caught; PMP faults
+        // are already per absolute word (no entry-offset mask under RVC).
+        if (paging_fetch && fetch_perm_fault)
+            fetch_fault_lane = {OOO_WIDTH{1'b1}};
+        else if (fetch_pa_resolved)
+            fetch_fault_lane = pmp_fetch_fault_lane;
+        else
+            fetch_fault_lane = '0;
+`else
         if (paging_fetch && fetch_perm_fault)
             fetch_fault_lane = {{(OOO_WIDTH-1){1'b0}}, 1'b1};
         else if (fetch_pa_resolved)
             fetch_fault_lane = pmp_fetch_fault_lane & fetch_lane_in_block;
         else
             fetch_fault_lane = '0;
+`endif
     end
     assign fetch_fault = |fetch_fault_lane;
     assign fetch_fault_cause =
@@ -1238,7 +1312,8 @@ module riscv_core_ooo
         .update_valid(branch_writeback.valid && branch_writeback.branch_valid &&
             (branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH)),
         .update_pc(branch_writeback.pc),
-        .update_taken(branch_writeback.redirect_pc != (branch_writeback.pc + 32'd4)),
+        .update_taken(branch_writeback.redirect_pc !=
+            (branch_writeback.pc + `ILEN_INC(branch_writeback.is_compressed))),
         .update_info(branch_writeback.predictor_info)
     );
 
@@ -1755,7 +1830,8 @@ module riscv_core_ooo
         lane_control_predicted = '0;
         dispatched_unpredicted_control = 1'b0;
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
-            lane_predicted_pc[i] = decode_lanes[i].pc + 32'd4;
+            lane_predicted_pc[i] = decode_lanes[i].pc +
+                `ILEN_INC(decode_lanes[i].ctrl.is_compressed);
             lane_predictor_info[i] = '0;
         end
         ras_redirect_valid = 1'b0;
@@ -1774,7 +1850,8 @@ module riscv_core_ooo
         if (branch_restore_valid && branch_resolve_valid &&
                 (branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH)) begin
             ghr_next = {ghr_next[DIRECT_HISTORY_BITS-2:0],
-                (branch_writeback.redirect_pc != branch_writeback.pc + 32'd4)};
+                (branch_writeback.redirect_pc !=
+                    branch_writeback.pc + `ILEN_INC(branch_writeback.is_compressed))};
         end
         ghr_branch_snapshot = ghr_next;
         branch_active_tail_snapshot = active_tail;
@@ -1791,7 +1868,8 @@ module riscv_core_ooo
                 if (lane_is_call[i] &&
                         (ras_count_next < RAS_COUNT_BITS'(RAS_DEPTH))) begin
                     ras_stack_next[RAS_INDEX_BITS'(ras_count_next)] =
-                        decode_lanes[i].pc + 32'd4;
+                        decode_lanes[i].pc +
+                        `ILEN_INC(decode_lanes[i].ctrl.is_compressed);
                     ras_count_next = ras_count_next + 1'b1;
                 end else if (lane_is_return[i] && (ras_count_next != '0)) begin
                     lane_control_predicted[i] = 1'b1;
@@ -2061,10 +2139,21 @@ module riscv_core_ooo
                             // Illegal-instruction faults report the instruction in
                             // mtval; memory faults report the faulting address,
                             // which the LSQ/fetch placed in the commit data field.
+                            // RV64C: an illegal COMPRESSED op reports the 16-bit
+                            // parcel (zero-extended), not the expanded 32-bit word
+                            // (.instr must stay canonical -- it is a live CSR/
+                            // fence/predictor decode input).
                             commit_exc_tval  =
                                 (active_commit_packet[i].exc_cause ==
                                     RISCV_Priv::EXC_ILLEGAL_INSTR) ?
+`ifdef RVC
+                                    (active_commit_packet[i].is_compressed ?
+                                        {{(XLEN-16){1'b0}},
+                                         active_commit_packet[i].rvc_parcel} :
+                                        active_commit_packet[i].instr) :
+`else
                                         active_commit_packet[i].instr :
+`endif
                                         active_commit_packet[i].data;
                             commit_trap_epc  = active_commit_packet[i].pc;
                         end
@@ -2149,8 +2238,15 @@ module riscv_core_ooo
             // group, then any still-outstanding fetch (oldest-first), then
             // pc_q if the frontend is completely empty.
             commit_int_epc  =
+`ifdef RVC
+                // RV64C: the realigner's oldest un-dispatched PC covers a pending
+                // straddle completion and a partially-drained head block (a
+                // block-aligned fgrp_pc would skip a mid-block instruction).
+                rvc_oldest_valid ? rvc_oldest_pc :
+`else
                 lane_valid[0] ? decode_lanes[0].pc :
                 fgrp_valid    ? fgrp_pc :
+`endif
                 (fbuf_cnt_q == 2'd2) ? fbuf_q[1].pc :
                 (fmeta_q[fmeta_rd_q].valid && !fmeta_q[fmeta_rd_q].kill) ?
                     fmeta_q[fmeta_rd_q].pc :
@@ -2278,6 +2374,16 @@ module riscv_core_ooo
                     // Unpredicted JAL/JALR dispatched: younger fetches are
                     // dead; pc holds until the control transfer resolves.
                     fetch_flush = 1'b1;
+`ifdef RVC
+                end else begin
+                    // RV64C: rvc_realign drains the 16-byte group over multiple
+                    // cycles and pops the group (fetch_consume) only once every
+                    // in-block parcel is drained or the block tail-straddles.
+                    // Partial dispatch HOLDS the group (align_ptr advances inside
+                    // the realigner) -- no pc rewind, no flush, no double-decode.
+                    fetch_consume = rvc_consume_block;
+                end
+`else
                 end else if (fgrp_valid && (dispatch_count < valid_count)) begin
                     // Partial dispatch: discard the group and refetch from the
                     // first undispatched instruction.
@@ -2288,6 +2394,7 @@ module riscv_core_ooo
                     // Fully dispatched (or no decodable lanes): pop it.
                     fetch_consume = 1'b1;
                 end
+`endif
             end
             // Fetch issue: one 16-byte block per cycle while the frontend is
             // unstalled, translation for pc_q is resolved (fetch_xlate_stall
@@ -2707,7 +2814,9 @@ module riscv_core_ooo
                         logic [3:0] branch_idx;
                         branch_idx = {
                             branch_writeback.redirect_pc < branch_writeback.pc,
-                            branch_writeback.redirect_pc != (branch_writeback.pc + 32'd4),
+                            branch_writeback.redirect_pc !=
+                                (branch_writeback.pc +
+                                 `ILEN_INC(branch_writeback.is_compressed)),
                             branch_writeback.control_predicted,
                             branch_writeback.branch_mispredict
                         };
