@@ -1865,12 +1865,26 @@ module riscv_core_ooo
         branch_active_tail_snapshot = active_tail + active_id_t'(dispatch_count);
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
             if (dispatch_valid[i]) begin
-                if (lane_is_call[i] &&
-                        (ras_count_next < RAS_COUNT_BITS'(RAS_DEPTH))) begin
-                    ras_stack_next[RAS_INDEX_BITS'(ras_count_next)] =
-                        decode_lanes[i].pc +
-                        `ILEN_INC(decode_lanes[i].ctrl.is_compressed);
-                    ras_count_next = ras_count_next + 1'b1;
+                if (decode_lanes[i].ctrl.pc_source == PC_uncond) begin
+                    // P1: a JAL / c.j / c.jal is a static direct jump — target is
+                    // pc+imm (IMM_UJ) and it is unconditionally taken. Predict it
+                    // at dispatch (control_predicted) so it steers fetch here and
+                    // never falls into the unpredicted-control freeze (control_pending
+                    // + pc-hold). At resolve the ALU compares actual_target (pc+imm)
+                    // against predicted_pc (pc+imm) -> never mispredicts, checkpoint
+                    // frees cleanly. A call (rd!=x0) additionally pushes the RAS; a
+                    // call with a full RAS is still predicted here (just no push).
+                    lane_control_predicted[i] = 1'b1;
+                    lane_predicted_pc[i] = decode_lanes[i].pc + decode_lanes[i].imm;
+                    predictor_redirect_valid = 1'b1;
+                    predictor_redirect_pc = decode_lanes[i].pc + decode_lanes[i].imm;
+                    if (lane_is_call[i] &&
+                            (ras_count_next < RAS_COUNT_BITS'(RAS_DEPTH))) begin
+                        ras_stack_next[RAS_INDEX_BITS'(ras_count_next)] =
+                            decode_lanes[i].pc +
+                            `ILEN_INC(decode_lanes[i].ctrl.is_compressed);
+                        ras_count_next = ras_count_next + 1'b1;
+                    end
                 end else if (lane_is_return[i] && (ras_count_next != '0)) begin
                     lane_control_predicted[i] = 1'b1;
                     lane_predicted_pc[i] =
