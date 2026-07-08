@@ -45,6 +45,10 @@ module rvc_realign
     input  wire logic                        frontend_hold,  // stall/halt: freeze, no consume
     input  wire logic                        fetch_flush,    // any redirect: reset drain + straddle
 
+    // ---- P2b offset-precise BTB steer (tied 0 when BTB disabled) ----
+    input  wire logic                        btb_hit_in,   // this block was BTB-steered to a target
+    input  wire logic [2:0]                  btb_off_in,   // last in-block parcel of the predicted branch
+
     // ---- two aligned + expanded lanes ----
     output logic [1:0]                       out_valid,
     output logic [1:0][XLEN-1:0]             out_pc,
@@ -57,6 +61,9 @@ module rvc_realign
 
     // ---- frontend control ----
     output logic                             rvc_consume_block,   // pop the presented group
+    output logic                             rvc_block_drained,   // P2a BTB: block-ending (flush-independent)
+    output logic                             rvc_btb_terminate,   // P2b: block terminated AT btb_off this cycle
+    output logic                             rvc_tail_straddle,   // P2b: drain ended in a tail straddle (case-E recover)
     output logic                             frontend_oldest_valid,
     output logic [XLEN-1:0]                  frontend_oldest_pc
 );
@@ -109,6 +116,8 @@ module rvc_realign
     logic [1:0]  l0_parcels;   // IN-BLOCK parcels consumed
     logic        l0_tail;      // 32-bit low half at parcel 7 (straddles)
     logic [2:0]  l0_lo_w, l0_hi_w;
+    logic [2:0]  l0_last;      // P2b: last in-block parcel of lane0's instruction
+    logic        btb_term0;    // P2b: lane0 IS the BTB-predicted terminating branch
 
     assign lane0_par = completing ? pblock[0] : pblock[s0];
     always_comb begin
@@ -157,6 +166,14 @@ module rvc_realign
             l0_next               = {1'b0, s0} + 4'd1;
             out_fetch_fault[0]    = fgrp_fault_word[l0_lo_w];
         end
+        // P2b: lane0 is the terminating branch iff its last in-block parcel matches
+        // the BTB offset (a straddle completion is never a BTB entry -> !completing;
+        // a parcel-7 32-bit low half has out_valid[0]=0 so it cannot match). Computed
+        // IN-BLOCK, after out_valid[0]: a continuous assign reading out_valid[0] here
+        // would form an UNOPTFLAT cycle with the lane1 block that consumes btb_term0.
+        l0_last   = l0_is32 ? (s0 + 3'd1) : s0;
+        btb_term0 = btb_hit_in && out_valid[0] && !completing &&
+                    (l0_last == btb_off_in);
     end
 
     // ---------------- lane 1 ----------------
@@ -166,6 +183,8 @@ module rvc_realign
     logic [3:0]  s1;            // 0..8; lane1 only valid when s1 <= 7
     logic [2:0]  s1b;           // s1[2:0], safe pblock index when s1 <= 7
     logic [2:0]  l1_lo_w, l1_hi_w;
+    logic [2:0]  l1_last;       // P2b: last in-block parcel of lane1's instruction
+    logic        btb_term1;     // P2b: lane1 IS the BTB-predicted terminating branch
 
     assign s1  = l0_next;
     assign s1b = s1[2:0];
@@ -187,7 +206,9 @@ module rvc_realign
 
         // lane1 only exists if lane0 emitted a real instruction and there is
         // room left in the block (s1 <= 7; s1 == 8 means the block is exhausted).
-        if (out_valid[0] && (s1 <= 4'd7) && fgrp_valid && !fgrp_excpt) begin
+        // P2b: suppress lane1 when lane0 is the terminating branch -- everything
+        // past the taken branch in this block is wrong-path.
+        if (out_valid[0] && !btb_term0 && (s1 <= 4'd7) && fgrp_valid && !fgrp_excpt) begin
             if (l1_is32 && (s1b == 3'd7)) begin
                 out_valid[1] = 1'b0;
                 l1_tail      = 1'b1;
@@ -207,12 +228,24 @@ module rvc_realign
                 out_fetch_fault[1]    = fgrp_fault_word[l1_lo_w];
             end
         end
+        // P2b: lane1 as the terminating branch (out_valid[1] is already 0 when
+        // btb_term0, so at most one of term0/term1 is set). Computed IN-BLOCK for the
+        // same UNOPTFLAT reason as btb_term0.
+        l1_last   = l1_is32 ? (s1b + 3'd1) : s1b;
+        btb_term1 = btb_hit_in && out_valid[1] && (l1_last == btb_off_in);
     end
+
+    // The block TERMINATES -- rvc_block_drained asserts and the block consumes -- the
+    // cycle the predicted branch actually dispatches (its lane is in the dispatched
+    // set). Continuous: reads only the block-local term vars + dispatch_count.
+    assign rvc_btb_terminate = (btb_term0 && (dispatch_count >= 3'd1)) ||
+                               (btb_term1 && (dispatch_count >= 3'd2));
 
     // ---------------- consume / hold / straddle-latch ----------------
     logic [2:0] parcels_dispatched;   // in-block parcels of the dispatched lanes
     logic [3:0] ptr_after;
     logic       tail_straddle;
+    logic       tail_straddle_eff;    // P2b: straddle only if the block was NOT terminated
     logic       completion_dispatched;
 
     always_comb begin
@@ -224,12 +257,28 @@ module rvc_realign
         // is a 32-bit low half.
         tail_straddle = (ptr_after == 4'd7) && (pblock[7][1:0] == 2'b11);
         completion_dispatched = completing && (dispatch_count >= 3'd1);
-
-        // Consume the block once every in-block parcel is drained, or the tail
-        // straddles (latch its low half). fgrp_excpt also discards the block.
-        rvc_consume_block = fgrp_valid && !frontend_hold && !fetch_flush &&
-            ((ptr_after >= 4'd8) || tail_straddle || fgrp_excpt);
     end
+
+    // These two are CONTINUOUS assigns, deliberately outside the always_comb
+    // above: rvc_block_drained (the block's useful parcels are fully drained this
+    // cycle -- the P2a BTB "block-ending branch" signal) must depend only on the
+    // drain pointer, NEVER on fetch_flush. If it shared an always_comb that reads
+    // fetch_flush (as rvc_consume_block does), Verilator would tie block_drained to
+    // fetch_flush at block granularity, forming a fetch_flush -> block_drained ->
+    // btb_suppress -> fetch_flush UNOPTFLAT loop. The flush gate lives only on
+    // rvc_consume_block. Consume once every in-block parcel is drained, or the
+    // tail straddles (latch its low half); fgrp_excpt also discards the block.
+    // P2b: a BTB-terminated block also drains (block ends AT the predicted branch),
+    // and its would-be tail straddle is discarded -- fetch steered to the target,
+    // so the parcel-7 low half is wrong-path (never orphaned to base+16). This is
+    // the fix for the P2a straddle-vs-steer bug. rvc_btb_terminate depends only on
+    // dispatch + the BTB inputs (never fetch_flush), so the UNOPTFLAT invariant holds.
+    assign tail_straddle_eff = tail_straddle && !rvc_btb_terminate;
+    assign rvc_block_drained = (ptr_after >= 4'd8) || tail_straddle_eff ||
+        fgrp_excpt || rvc_btb_terminate;
+    assign rvc_consume_block = fgrp_valid && !frontend_hold && !fetch_flush &&
+        rvc_block_drained;
+    assign rvc_tail_straddle = tail_straddle_eff;   // case-E recover: re-fetch base+14
 
     // ---------------- oldest un-dispatched frontend PC (interrupt EPC) ----------------
     assign frontend_oldest_valid = straddle_valid_q || (fgrp_valid && !fgrp_excpt);
@@ -255,8 +304,8 @@ module rvc_realign
         end else if (fgrp_valid) begin
             if (rvc_consume_block) begin
                 align_ptr_valid_n = 1'b0;                 // next block is fresh
-                straddle_valid_n  = tail_straddle;        // latch iff tail straddle
-                if (tail_straddle) begin
+                straddle_valid_n  = tail_straddle_eff;    // latch iff tail straddle (not if BTB-terminated)
+                if (tail_straddle_eff) begin
                     straddle_half_n  = pblock[7];
                     straddle_pc_n    = base + {3'd7, 1'b0};   // base + 14
                     straddle_fault_n = fgrp_fault_word[3];    // word 3 = parcels 6/7

@@ -65,6 +65,7 @@ VERILATOR_DESIGN_SRC := $(CVFPU_SRC) $(sort $(VERILATOR_SRC))
 VERILATOR_INC_FLAGS := $(addprefix -I,$(SRC_SUBDIRS))
 VERILATOR_CFLAGS ?= --sv --timing --binary -Wno-fatal \
 		--top-module $(VERILATOR_TOP_MODULE) --Mdir $(VERILATOR_OBJ_DIR) \
+		--output-split 5000 --output-split-cfuncs 5000 \
 		-DSIMULATION_18447 \
 		-DLAB_18447='"4b"'
 
@@ -140,6 +141,15 @@ endif
 # needs the ASAP7 cell models) and is left to the OpenROAD flow, not this build.
 ifeq ($(ASIC),1)
 	VERILATOR_CFLAGS += -DNIIGO_ASIC
+endif
+
+# BTB=1 enables the fetch-directed branch target buffer (plans/ooo-perf.md P2a):
+# src/btb.sv, looked up on pc_next so a hit steers the next fetch to the target
+# (N->T, no wrong-path block), verified + trained at decode, flush suppressed for
+# block-ending agrees. Prediction-only; default OFF is bit-identical (all gated by
+# -DBTB). OOO only.
+ifeq ($(BTB),1)
+	VERILATOR_CFLAGS += -DBTB
 endif
 
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \

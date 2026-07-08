@@ -174,6 +174,17 @@ module riscv_core_ooo
         logic [XLEN-1:0]      pc;
         logic [OOO_WIDTH-1:0] fault_lane;
         logic [4:0]           fault_cause;
+`ifdef BTB
+        // P2a: when this block was fetched, the BTB steered the NEXT fetch to
+        // btb_tgt (btb_hit=1). Carried to decode so it can verify the steer
+        // against B2's real prediction and suppress the flush on a block-ending
+        // agree. btb_hit=0 => fetch continued sequentially after this block.
+        // btb_off (P2b) = the predicted branch's last in-block parcel (the offset
+        // at which the realigner terminates the block on a steered hit).
+        logic                 btb_hit;
+        logic [XLEN-1:0]      btb_tgt;
+        logic [2:0]           btb_off;
+`endif
     } fetch_meta_t;
     typedef struct packed {
         logic                 valid;
@@ -182,6 +193,11 @@ module riscv_core_ooo
         logic                 excpt;
         logic [OOO_WIDTH-1:0] fault_lane;
         logic [4:0]           fault_cause;
+`ifdef BTB
+        logic                 btb_hit;
+        logic [XLEN-1:0]      btb_tgt;
+        logic [2:0]           btb_off;
+`endif
     } fetch_group_t;
     fetch_meta_t  fmeta_q [FETCH_DEPTH];
     fetch_meta_t  fmeta_next [FETCH_DEPTH];
@@ -217,6 +233,139 @@ module riscv_core_ooo
                                                    : fmeta_head.fault_lane;
     assign fgrp_fault_cause = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].fault_cause
                                                    : fmeta_head.fault_cause;
+    // P2a: suppress a decode-stage redirect flush when the BTB already steered
+    // fetch to the correct block-ending target. Declared unconditionally (it
+    // gates the always-present redirect arms); tied 0 when the BTB is disabled.
+    logic            btb_suppress;
+`ifdef BTB
+    logic            fgrp_btb_hit;
+    logic [XLEN-1:0] fgrp_btb_tgt;
+    logic [2:0]      fgrp_btb_off;
+    assign fgrp_btb_hit = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].btb_hit : fmeta_head.btb_hit;
+    assign fgrp_btb_tgt = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].btb_tgt : fmeta_head.btb_tgt;
+    assign fgrp_btb_off = (fbuf_cnt_q != 2'd0) ? fbuf_q[0].btb_off : fmeta_head.btb_off;
+
+    // P2a fetch-directed BTB. Looked up on pc_next (the block about to be fetched)
+    // so its sync-read result is ready the cycle that block becomes pc_q: a hit
+    // then steers this cycle's pc_next to the target (stream N->T, no wrong-path
+    // N+16) and tags the block's fmeta entry. Every steer is verified at decode
+    // (and, on a mispredict, at execute), so this is a pure performance hint.
+    logic            btb_pred_valid;
+    logic [XLEN-1:0] btb_pred_target;
+    logic [2:0]      btb_pred_offset;
+    logic [1:0]      btb_pred_type;
+    logic [XLEN-1:0] btb_lk_blk_q;     // block(pc_next) looked up last cycle
+    logic            btb_hit_now;      // BTB hit for the block being fetched (pc_q)
+    logic            btb_train_valid, btb_train_taken;
+    logic [XLEN-1:0] btb_train_pc, btb_train_target;
+    logic [2:0]      btb_train_offset;
+    logic [1:0]      btb_train_type;
+
+    btb #(.SETS(512)) Btb (
+        .clk(clk), .rst_l(rst_l),
+        .lookup_valid(1'b1),
+        .lookup_pc(pc_next),
+        .pred_valid(btb_pred_valid),
+        .pred_target(btb_pred_target),
+        .pred_offset(btb_pred_offset),
+        .pred_type(btb_pred_type),
+        .train_valid(btb_train_valid),
+        .train_taken(btb_train_taken),
+        .train_pc(btb_train_pc),
+        .train_target(btb_train_target),
+        .train_offset(btb_train_offset),
+        .train_type(btb_train_type)
+    );
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) btb_lk_blk_q <= '0;
+        else        btb_lk_blk_q <= {pc_next[XLEN-1:4], 4'b0};
+    end
+    // Steer only if the registered prediction is for the block we are actually
+    // fetching now (a redirect may have moved pc_q off the looked-up pc_next).
+    assign btb_hit_now = btb_pred_valid &&
+        (btb_lk_blk_q == {pc_q[XLEN-1:4], 4'b0});
+
+    // ---- decode-time verify + train (drives B7's redirect arms + the BTB) ----
+    // Scoped to predictor_redirect ONLY (TAGE-taken conditionals, P1 JALs,
+    // ITTAGE-hit indirects). RETURNS (ras_redirect) are RAS-predicted with a
+    // dynamic target -- caching them in the BTB pollutes it, so the ras arm below
+    // stays un-suppressed and returns are never trained/steered.
+    logic [XLEN-1:0] btb_seq_for_fgrp;    // sequential next block (base + 16)
+    logic            btb_mis_steer;       // any steer that must flush + redirect
+    logic [XLEN-1:0] btb_mis_recover_pc;  // where a mis-steer redirects to
+    assign btb_seq_for_fgrp = {fgrp_pc[XLEN-1:4], 4'b0} + XLEN'(16);
+`ifdef RVC
+    // ---- P2b OFFSET-PRECISE verify: rvc_realign terminates the block AT btb_off
+    // (the predicted branch's last parcel), so the branch and its target are the
+    // whole in-stream picture -- no wrong-path tail parcels, no orphaned straddle.
+    logic [2:0]      btb_branch_off;
+    logic            btb_branch_straddle;  // 32-bit branch low half at parcel 7
+    logic [XLEN-1:0] btb_fallthrough_pc;   // continue after a not-taken terminator
+    logic            btb_mis_term;         // terminated, but resolves not-taken/non-branch
+    logic            btb_mis_drain;        // steered + drained without matching btb_off
+    assign btb_branch_off      = btb_branch_pc[3:1] + (btb_branch_is_c ? 3'd0 : 3'd1);
+    assign btb_branch_straddle = !btb_branch_is_c && (btb_branch_pc[3:1] == 3'd7);
+    // fall-through of the terminating branch = base + 2*(off + 1) (off is straddle-free
+    // so off <= 7 and off+1 <= 8 => base .. base+16).
+    assign btb_fallthrough_pc  = {fgrp_pc[XLEN-1:4], 4'b0} +
+        XLEN'({1'b0, fgrp_btb_off, 1'b0} + 12'd2);
+    // WIN: the realigner terminated AT the predicted branch and it resolves taken to
+    // the BTB target -- the target is already streaming, so suppress the flush.
+    // NOTE: every verify arm is gated on fgrp_valid. After a mis-steer flush the group
+    // buffer empties (fgrp_valid=0) but fmeta_head/pblock keep STALE btb_hit + tail_straddle,
+    // which would keep btb_mis_drain asserted -> perpetual flush -> fetch never re-issues ->
+    // hang (observed at xv6 pc 8000041e). btb_suppress/btb_mis_term are implicitly gated
+    // (rvc_btb_terminate <= out_valid[0] <= fgrp_valid) but carry it for clarity.
+    assign btb_suppress = fgrp_valid && rvc_btb_terminate && predictor_redirect_valid &&
+        (predictor_redirect_pc == fgrp_btb_tgt);
+    // MIS-STEER (terminated wrong): the block terminated at btb_off but no redirect
+    // fired (branch not-taken, or the offset instr is not a branch) -- recover to the
+    // fall-through. A redirect to a DIFFERENT target needs no special case: btb_suppress
+    // is 0, so the normal predictor_redirect arm flushes + redirects to the real target.
+    assign btb_mis_term = fgrp_valid && rvc_btb_terminate && !predictor_redirect_valid &&
+        !ras_redirect_valid && !dispatched_unpredicted_control;
+    // MIS-STEER (aliased/stale): steered, but the block drained WITHOUT terminating at
+    // btb_off (offset landed mid-instruction / the block never branches there) and no
+    // redirect fired -- recover to base+16, or re-fetch base+14 to re-establish a
+    // pending tail straddle the flush would otherwise orphan.
+    assign btb_mis_drain = fgrp_valid && fgrp_btb_hit && rvc_block_drained && !rvc_btb_terminate &&
+        !predictor_redirect_valid && !ras_redirect_valid && !dispatched_unpredicted_control;
+    assign btb_mis_steer = btb_mis_term || btb_mis_drain;
+    assign btb_mis_recover_pc = btb_mis_term ? btb_fallthrough_pc :
+        (rvc_tail_straddle ? ({fgrp_pc[XLEN-1:4], 4'b0} + XLEN'(14)) : btb_seq_for_fgrp);
+    // TRAIN: cache the taken branch's block + terminating offset; REFUSE a straddling
+    // 32-bit branch (its high half lives in the next block -> cannot be a clean in-block
+    // terminate; refusing it is the P2a straddle-bug fix). Invalidate on any mis-steer.
+    assign btb_train_valid = (!dispatch_stall && !halted_q) &&
+        ((predictor_redirect_valid && !btb_branch_straddle) || btb_mis_steer);
+    assign btb_train_taken  = predictor_redirect_valid && !btb_branch_straddle;
+    assign btb_train_pc     = fgrp_pc;
+    assign btb_train_target = predictor_redirect_pc;
+    assign btb_train_offset = btb_branch_off;
+    assign btb_train_type   = 2'd0;
+`else
+    // ---- non-RVC: block-granular P2a. Fixed 4-byte insns => no realigner, no
+    // straddle, so block-ending steering is correct as-is. (Mid-block non-RVC via a
+    // tail mask is a future extension; block-ending covers loop back-edges.)
+    logic btb_block_ending;
+    assign btb_block_ending = fgrp_valid && (dispatch_count == valid_count);
+    assign btb_suppress = predictor_redirect_valid && fgrp_btb_hit &&
+        (fgrp_btb_tgt == predictor_redirect_pc) && btb_block_ending;
+    assign btb_mis_steer = fgrp_btb_hit && btb_block_ending &&
+        !predictor_redirect_valid && !ras_redirect_valid &&
+        !dispatched_unpredicted_control && (fgrp_btb_tgt != btb_seq_for_fgrp);
+    assign btb_mis_recover_pc = btb_seq_for_fgrp;
+    assign btb_train_valid = (!dispatch_stall && !halted_q) &&
+        ((predictor_redirect_valid && btb_block_ending) || btb_mis_steer);
+    assign btb_train_taken  = predictor_redirect_valid && btb_block_ending;
+    assign btb_train_pc     = fgrp_pc;
+    assign btb_train_target = predictor_redirect_pc;
+    assign btb_train_offset = 3'd0;
+    assign btb_train_type   = 2'd0;
+`endif
+`else
+    assign btb_suppress = 1'b0;
+`endif
     logic halted_q, halted_next;
     logic terminal_pending_q, terminal_pending_next;
     logic control_pending_q, control_pending_next;
@@ -253,6 +402,10 @@ module riscv_core_ooo
     logic [XLEN-1:0] ras_redirect_pc;
     logic predictor_redirect_valid;
     logic [XLEN-1:0] predictor_redirect_pc;
+    // P2b: PC + is_compressed of the predictor-redirecting branch, captured in the
+    // B2 predictor loop, so the BTB can train its terminating parcel offset.
+    logic [XLEN-1:0] btb_branch_pc;
+    logic            btb_branch_is_c;
 
     logic [XLEN-1:0] ras_stack_q [RAS_DEPTH];
     logic [XLEN-1:0] ras_stack_next [RAS_DEPTH];
@@ -581,8 +734,21 @@ module riscv_core_ooo
     logic [1:0][4:0]       rvc_lane_cause;
     logic [1:0][15:0]      rvc_lane_parcel;
     logic                  rvc_consume_block;
+    logic                  rvc_block_drained;
+    logic                  rvc_btb_terminate;
+    logic                  rvc_tail_straddle;
     logic                  rvc_oldest_valid;
     logic [XLEN-1:0]       rvc_oldest_pc;
+    // P2b BTB steer inputs to the realigner (tied 0 when BTB is disabled).
+    logic                  realign_btb_hit;
+    logic [2:0]            realign_btb_off;
+`ifdef BTB
+    assign realign_btb_hit = fgrp_btb_hit;
+    assign realign_btb_off = fgrp_btb_off;
+`else
+    assign realign_btb_hit = 1'b0;
+    assign realign_btb_off = 3'd0;
+`endif
 
     rvc_realign RvcRealign (
         .clk,
@@ -596,6 +762,8 @@ module riscv_core_ooo
         .dispatch_count,
         .frontend_hold(dispatch_stall || halted_q),
         .fetch_flush,
+        .btb_hit_in(realign_btb_hit),
+        .btb_off_in(realign_btb_off),
         .out_valid(rvc_lane_valid),
         .out_pc(rvc_lane_pc),
         .out_instr(rvc_lane_instr),
@@ -605,6 +773,9 @@ module riscv_core_ooo
         .out_fault_cause(rvc_lane_cause),
         .out_rvc_parcel(rvc_lane_parcel),
         .rvc_consume_block,
+        .rvc_block_drained,
+        .rvc_btb_terminate,
+        .rvc_tail_straddle,
         .frontend_oldest_valid(rvc_oldest_valid),
         .frontend_oldest_pc(rvc_oldest_pc)
     );
@@ -1844,6 +2015,8 @@ module riscv_core_ooo
         ras_redirect_pc = '0;
         predictor_redirect_valid = 1'b0;
         predictor_redirect_pc = '0;
+        btb_branch_pc = '0;
+        btb_branch_is_c = 1'b0;
         ras_stack_next = ras_stack_q;
         ras_count_next = branch_restore_valid ?
             ras_checkpoint_count_q[branch_resolve_id] : ras_count_q;
@@ -1884,6 +2057,8 @@ module riscv_core_ooo
                     lane_predicted_pc[i] = decode_lanes[i].pc + decode_lanes[i].imm;
                     predictor_redirect_valid = 1'b1;
                     predictor_redirect_pc = decode_lanes[i].pc + decode_lanes[i].imm;
+                    btb_branch_pc   = decode_lanes[i].pc;
+                    btb_branch_is_c = decode_lanes[i].ctrl.is_compressed;
                     if (lane_is_call[i] &&
                             (ras_count_next < RAS_COUNT_BITS'(RAS_DEPTH))) begin
                         ras_stack_next[RAS_INDEX_BITS'(ras_count_next)] =
@@ -1908,6 +2083,8 @@ module riscv_core_ooo
                         predictor_redirect_valid = 1'b1;
                         predictor_redirect_pc = decode_lanes[i].pc +
                             decode_lanes[i].imm;
+                        btb_branch_pc   = decode_lanes[i].pc;
+                        btb_branch_is_c = decode_lanes[i].ctrl.is_compressed;
                     end
                 end else if ((decode_lanes[i].ctrl.pc_source == PC_indirect) &&
                         !lane_is_return[i]) begin
@@ -1917,6 +2094,8 @@ module riscv_core_ooo
                         lane_predicted_pc[i] = indirect_prediction_target;
                         predictor_redirect_valid = 1'b1;
                         predictor_redirect_pc = indirect_prediction_target;
+                        btb_branch_pc   = decode_lanes[i].pc;
+                        btb_branch_is_c = decode_lanes[i].ctrl.is_compressed;
                     end
                 end
                 if (lane_has_dest[i] && free_alloc_valid[i]) begin
@@ -2384,16 +2563,28 @@ module riscv_core_ooo
             // is still walking leaves the buffer and cannot dispatch twice
             // (the old frozen-pipe scheme would re-present it).
             if (!dispatch_stall && !halted_q) begin
+                // Returns (ras) always redirect -- the BTB does not handle them.
+                // !btb_suppress: when the BTB already steered fetch to a
+                // block-ending predictor-taken target, skip the redirect+flush
+                // (the target is the next block in the stream), fall to consume.
                 if (ras_redirect_valid) begin
                     pc_next = ras_redirect_pc;
                     fetch_flush = 1'b1;
-                end else if (predictor_redirect_valid) begin
+                end else if (predictor_redirect_valid && !btb_suppress) begin
                     pc_next = predictor_redirect_pc;
                     fetch_flush = 1'b1;
                 end else if (dispatched_unpredicted_control) begin
                     // Unpredicted JAL/JALR dispatched: younger fetches are
                     // dead; pc holds until the control transfer resolves.
                     fetch_flush = 1'b1;
+`ifdef BTB
+                end else if (btb_mis_steer) begin
+                    // BTB steered wrong: flush the wrongly steered target stream and
+                    // redirect to the recovered PC (fall-through of a not-taken
+                    // terminator, or base+16 / base+14 for an aliased/stale steer).
+                    pc_next = btb_mis_recover_pc;
+                    fetch_flush = 1'b1;
+`endif
 `ifdef RVC
                 end else begin
                     // RV64C: rvc_realign drains the 16-byte group over multiple
@@ -2401,7 +2592,13 @@ module riscv_core_ooo
                     // in-block parcel is drained or the block tail-straddles.
                     // Partial dispatch HOLDS the group (align_ptr advances inside
                     // the realigner) -- no pc rewind, no flush, no double-decode.
-                    fetch_consume = rvc_consume_block;
+                    // Use the flush-INDEPENDENT rvc_block_drained (not rvc_consume_block,
+                    // which gates on !fetch_flush): here !fetch_flush and !frontend_hold
+                    // are already implied (no redirect arm fired; inside !dispatch_stall
+                    // && !halted_q), so this equals rvc_consume_block exactly, but reading
+                    // the flush-independent signal breaks the fetch_flush -> rvc_consume_block
+                    // -> this-always -> fetch_flush UNOPTFLAT combinational loop.
+                    fetch_consume = fgrp_valid && rvc_block_drained;
                 end
 `else
                 end else if (fgrp_valid && (dispatch_count < valid_count)) begin
@@ -2429,7 +2626,13 @@ module riscv_core_ooo
                     (({1'b0, fmeta_cnt_q} + {1'b0, fbuf_cnt_q}
                       - {2'b0, fetch_consume}) < 3'(FETCH_DEPTH))) begin
                 fetch_issue = 1'b1;
+`ifdef BTB
+                // A BTB hit for pc_q's block steers the next fetch to the target
+                // (verified at decode); otherwise fetch continues sequentially.
+                pc_next = btb_hit_now ? btb_pred_target : sequential_next_pc;
+`else
                 pc_next = sequential_next_pc;
+`endif
             end
         end
 
@@ -2585,6 +2788,11 @@ module riscv_core_ooo
             fbuf_next[bcnt[0]].excpt = ifetch_resp_excpt;
             fbuf_next[bcnt[0]].fault_lane = fmeta_head.fault_lane;
             fbuf_next[bcnt[0]].fault_cause = fmeta_head.fault_cause;
+`ifdef BTB
+            fbuf_next[bcnt[0]].btb_hit = fmeta_head.btb_hit;
+            fbuf_next[bcnt[0]].btb_tgt = fmeta_head.btb_tgt;
+            fbuf_next[bcnt[0]].btb_off = fmeta_head.btb_off;
+`endif
             bcnt = bcnt + 2'd1;
         end
 
@@ -2596,6 +2804,14 @@ module riscv_core_ooo
             fmeta_next[fmeta_wr_q].pc = pc_q;
             fmeta_next[fmeta_wr_q].fault_lane = fetch_fault_lane;
             fmeta_next[fmeta_wr_q].fault_cause = fetch_fault_cause;
+`ifdef BTB
+            // Tag the block with the steer decided this cycle (btb_hit_now =>
+            // the next fetch was steered to btb_pred_target). btb_pred_offset is
+            // the terminating parcel the realigner will stop this block at.
+            fmeta_next[fmeta_wr_q].btb_hit = btb_hit_now;
+            fmeta_next[fmeta_wr_q].btb_tgt = btb_pred_target;
+            fmeta_next[fmeta_wr_q].btb_off = btb_pred_offset;
+`endif
             fmeta_wr_next = ~fmeta_wr_q;
             fmeta_cnt_next = fmeta_cnt_next + 2'd1;
         end
