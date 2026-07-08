@@ -95,6 +95,15 @@ ccd-gg-test:
 		-DLAB_18447='"4b"' -Isrc -Isrc/mem tests/tb_niigo_ccd_gg.sv
 	$(OUTPUT_BASE_DIR)/ccd-gg/Vtb_niigo_ccd_gg
 
+# ---- BTB unit test (P2, plans/ooo-perf.md): standalone src/btb.sv exerciser ----
+# Drives the sync-read lookup + write-only train ports; checks allocate/hit/miss/
+# tag/invalidate + the 1-cycle sync-read timing. Expect "TB-BTB: ALL PASSED".
+btb-test:
+	verilator --binary -j 0 --Mdir $(OUTPUT_BASE_DIR)/btb-ut --top-module tb_btb \
+		-Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-WIDTHCONCAT -Wno-ASCRANGE -Wno-UNOPTFLAT \
+		-DLAB_18447='"4b"' -DRV64 -Isrc tests/tb_btb.sv src/btb.sv
+	$(OUTPUT_BASE_DIR)/btb-ut/Vtb_btb
+
 # ---- L2 Inc 1: standalone niigo_l2 unit test (transparent write-back NINE L2) ----
 # Drives the L2's NMI slave with RD/WR line sequences against a random-latency
 # behavioural backing memory; checks fill/hit/dirty-writeback/write-allocate/
