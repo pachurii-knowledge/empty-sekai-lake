@@ -131,6 +131,17 @@ endif
 	VERILATOR_CFLAGS += -DRVC
 endif
 
+# ASIC=1 selects the ASAP7 7nm ASIC target (-DNIIGO_ASIC), mirroring RV64=1 for
+# datapath width. It flips the target-divergent, RESULTS-IDENTICAL knobs the ASIC
+# flow needs -- CVFPU FMA 2->3 pipe stages (niigo_fp_unit) and RAS depth 128->32
+# (riscv_core_ooo) -- so a functional Verilator run can exercise the ASIC config.
+# The default (ASIC unset) is the FPGA / functional-sim target (FMA=2, RAS=128).
+# The physical SRAM-macro mapping is a SEPARATE opt-in (-DNIIGO_SRAM_MACRO, which
+# needs the ASAP7 cell models) and is left to the OpenROAD flow, not this build.
+ifeq ($(ASIC),1)
+	VERILATOR_CFLAGS += -DNIIGO_ASIC
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

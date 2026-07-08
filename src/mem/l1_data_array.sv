@@ -32,54 +32,52 @@ module l1_data_array #(
 
     localparam int BYTES = LINE_BITS/8;
 
+    // Single-port SRAM macro mapping (ASAP7). Each (way, byte-lane) is a
+    // niigo_sram_64x8 (64 words x 8 bits, 1RW; FakeRAM-generated, LIB/LEF under
+    // fpga/openroad/sram/). Both L1 controllers drive READ and WRITE in DISJOINT
+    // cycles, so the single shared address port is muxed (write index when being
+    // written, else read index). Logically identical to the inferred array below,
+    // which the Verilator/functional build uses. Geometry-guarded exactly like
+    // l1_tag_array: only the fixed 64x512 L1 geometry maps to the macro; other
+    // geometries (RV32 L1, the L2) stay inferred even under the macro build.
 `ifdef NIIGO_SRAM_MACRO
-    // ------------------------------------------------------------------ ASAP7
-    // Single-port SRAM macro mapping. Each (way, byte-lane) is a niigo_sram_64x8
-    // (64 words x 8 bits, 1RW; FakeRAM-generated, LIB/LEF under fpga/openroad/
-    // sram/). Both L1 controllers drive READ and WRITE in DISJOINT cycles
-    // (l1_icache: S_SERVE/S_REPLAY read vs S_INSTALL write; l1_dcache: S_IDLE/
-    // S_FLUSH_READ read vs store-hit/S_INSTALL write), so the single shared
-    // address port is muxed (this lane's write index when it is being written,
-    // else the read index). Byte writes map to per-lane we_in (wmask[b]); a read
-    // presents all WAYS*BYTES lanes at ridx. Real SRAM holds rd_out between
-    // accesses, matching the inferred array's registered read. Logically
-    // identical to the inferred array below, which the Verilator/functional
-    // build (no NIIGO_SRAM_MACRO) uses. Requires SETS==64, LINE_BITS==512
-    // (the L1 geometry; the niigo_sram_64x8 depth/width are fixed to match).
+    localparam bit USE_SRAM_DATA = (SETS == 64) && (LINE_BITS == 512);
+`else
+    localparam bit USE_SRAM_DATA = 1'b0;
+`endif
+
     genvar w, b;
     generate
-        for (w = 0; w < WAYS; w += 1) begin : ways
-            for (b = 0; b < BYTES; b += 1) begin : lanes
-                wire lane_wr = wen && (wway == w[$clog2(WAYS)-1:0]) && wmask[b];
-                niigo_sram_64x8 u_lane (
-                    .clk    (clk),
-                    .ce_in  (ren || lane_wr),
-                    .we_in  (lane_wr),
-                    .addr_in(lane_wr ? widx : ridx),
-                    .wd_in  (wdata[b*8 +: 8]),
-                    .rd_out (rdata[w][b*8 +: 8])
-                );
+        if (USE_SRAM_DATA) begin : g_sram
+            for (w = 0; w < WAYS; w += 1) begin : ways
+                for (b = 0; b < BYTES; b += 1) begin : lanes
+                    wire lane_wr = wen && (wway == w[$clog2(WAYS)-1:0]) && wmask[b];
+                    niigo_sram_64x8 u_lane (
+                        .clk    (clk),
+                        .ce_in  (ren || lane_wr),
+                        .we_in  (lane_wr),
+                        .addr_in(lane_wr ? widx : ridx),
+                        .wd_in  (wdata[b*8 +: 8]),
+                        .rd_out (rdata[w][b*8 +: 8])
+                    );
+                end
             end
-        end
-    endgenerate
-`else
-    genvar w;
-    generate
-        for (w = 0; w < WAYS; w += 1) begin : ways
-            logic [LINE_BITS-1:0] mem [SETS];
-            always_ff @(posedge clk) begin
-                if (ren) rdata[w] <= mem[ridx];
-            end
-            always_ff @(posedge clk) begin
-                if (wen && (wway == w[$clog2(WAYS)-1:0])) begin
-                    for (int b = 0; b < BYTES; b += 1) begin
-                        if (wmask[b]) mem[widx][b*8 +: 8] <= wdata[b*8 +: 8];
+        end else begin : g_infer
+            for (w = 0; w < WAYS; w += 1) begin : ways
+                logic [LINE_BITS-1:0] mem [SETS];
+                always_ff @(posedge clk) begin
+                    if (ren) rdata[w] <= mem[ridx];
+                end
+                always_ff @(posedge clk) begin
+                    if (wen && (wway == w[$clog2(WAYS)-1:0])) begin
+                        for (int bb = 0; bb < BYTES; bb += 1) begin
+                            if (wmask[bb]) mem[widx][bb*8 +: 8] <= wdata[bb*8 +: 8];
+                        end
                     end
                 end
             end
         end
     endgenerate
-`endif
 
 endmodule : l1_data_array
 

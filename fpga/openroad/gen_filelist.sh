@@ -37,7 +37,11 @@ done
            src/cvfpu/vendor/opene906/E906_RTL_FACTORY/gen_rtl/fpu/rtl; do
     echo "+incdir+$ROOT/$d"
   done
-  for D in RV64 OOO_4WIDE L1_CACHES L1D_CACHE AXI_MEMSYS FPGA_BUILD SYNTHESIS; do echo "+define+$D"; done
+  # NIIGO_ASIC selects the ASAP7 7nm target knobs (CVFPU FMA 3 pipe stages, RAS
+  # depth 32) -- results-identical to the FPGA/sim defaults, tuned for the generic
+  # ABC flow. NIIGO_SRAM_MACRO (the physical L1 SRAM-cell mapping) is added on top
+  # by the separate design_sram.f variant, since it needs the ASAP7 cell models.
+  for D in RV64 OOO_4WIDE L1_CACHES L1D_CACHE AXI_MEMSYS FPGA_BUILD SYNTHESIS NIIGO_ASIC; do echo "+define+$D"; done
 } > "$F"
 
 # LAB_18447 is a STRING-valued macro (`LAB_18447 == "4a" ...). slang drops the value

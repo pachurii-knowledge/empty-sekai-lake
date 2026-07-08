@@ -49,8 +49,20 @@ module niigo_fp_unit
     // 3 aligns best with the mantissa-mul / align-add / normalize-round segments;
     // 4+ split balanced logic unevenly and add register area/congestion. The extra
     // FMA latency vs PR2 is a negligible IPC cost (serialized + infrequent FP).
+    // Target-selected FMA (ADDMUL) pipeline depth. This is the whole-core binding
+    // Fmax floor on the ASAP7 generic-ABC ASIC flow (no DSP/retiming), so it needs
+    // 3 distributed stages there (41.7 -> 69.9 MHz); the FPGA/FB2b path closed at 2
+    // (Vivado has DSP + retiming). Latency-only: the computed IEEE result and fflags
+    // are identical at any depth (PipeConfig=DISTRIBUTED just retimes registers
+    // through the fixed FMA datapath), and the wrapper is depth-agnostic -- so this
+    // is a safe -DNIIGO_ASIC target knob, not a functional change.
+`ifdef NIIGO_ASIC
+    localparam int NIIGO_FMA_STAGES = 3;   // ASAP7 7nm ASIC
+`else
+    localparam int NIIGO_FMA_STAGES = 2;   // FPGA (FB2b 62.5 MHz) + functional sim
+`endif
     localparam fpnew_pkg::fpu_implementation_t NIIGO_CVFPU_IMPL = '{
-        PipeRegs:   '{'{default: 3},   // ADDMUL (FMA): 3 distributed stages (ASAP7)
+        PipeRegs:   '{'{default: NIIGO_FMA_STAGES},  // ADDMUL (FMA): target-selected
                       '{default: 1},   // DIVSQRT
                       '{default: 1},   // NONCOMP
                       '{default: 1}},  // CONV
