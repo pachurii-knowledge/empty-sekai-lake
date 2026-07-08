@@ -2723,6 +2723,29 @@ module riscv_core_ooo
     logic [63:0] perf_stall_cycles_prev;
     logic perf_first_dispatch;
 
+    // --- Extended microarchitectural counters (asap7-synth perf study) ---
+    // All read-only taps off existing datapath signals; no functional effect
+    // (single-core / COHERENT=0 path stays bit-identical). Gated by the
+    // always-on SIMULATION_18447 define; absent from the synthesis tops.
+    logic [63:0] perf_rob_full_cycles;        // active list (ROB) full
+    logic [63:0] perf_rob_empty_cycles;       // ROB empty (drained -> frontend-bound)
+    logic [63:0] perf_iq_full_cycles;         // integer issue queue full
+    logic [63:0] perf_memq_full_cycles;       // load/store queue full
+    logic [63:0] perf_bstack_full_cycles;     // branch checkpoint stack full
+    logic [63:0] perf_freelist_stall_cycles;  // no free physreg available
+    logic [63:0] perf_dispatch_stall_cycles;  // any-reason dispatch stall
+    logic [63:0] perf_bstack_branch_block;    // cycles a branch was blocked by full stack
+    logic [63:0] perf_branch_presented;       // cycles a branch was presented at dispatch
+    logic [63:0] perf_commit_starved_be;      // 0-retire w/ non-empty ROB (backend/latency)
+    logic [63:0] perf_commit_starved_fe;      // 0-retire w/ empty ROB (frontend)
+    logic [63:0] perf_retire_hist [OOO_WIDTH+1];
+    logic [63:0] perf_dispatch_hist [OOO_WIDTH+1];
+    logic [63:0] perf_compressed_retired;     // RVC (16-bit) instructions retired
+    logic [63:0] perf_l1i_miss_cnt, perf_l1d_miss_cnt, perf_l1d_wb_cnt;
+    logic [63:0] perf_load_lat_sum, perf_load_lat_count;  // avg load accept->resp latency
+    logic        perf_load_pending_q;
+    logic [63:0] perf_load_start_cycle;
+
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             perf_cycle_counter = 64'b0;
@@ -2745,6 +2768,29 @@ module riscv_core_ooo
             perf_last_dispatch_cycle = 64'b0;
             perf_stall_cycles_prev = 64'b0;
             perf_first_dispatch = 1'b1;
+            perf_rob_full_cycles = 64'b0;
+            perf_rob_empty_cycles = 64'b0;
+            perf_iq_full_cycles = 64'b0;
+            perf_memq_full_cycles = 64'b0;
+            perf_bstack_full_cycles = 64'b0;
+            perf_freelist_stall_cycles = 64'b0;
+            perf_dispatch_stall_cycles = 64'b0;
+            perf_bstack_branch_block = 64'b0;
+            perf_branch_presented = 64'b0;
+            perf_commit_starved_be = 64'b0;
+            perf_commit_starved_fe = 64'b0;
+            perf_compressed_retired = 64'b0;
+            perf_l1i_miss_cnt = 64'b0;
+            perf_l1d_miss_cnt = 64'b0;
+            perf_l1d_wb_cnt = 64'b0;
+            perf_load_lat_sum = 64'b0;
+            perf_load_lat_count = 64'b0;
+            perf_load_pending_q = 1'b0;
+            perf_load_start_cycle = 64'b0;
+            for (int i = 0; i <= OOO_WIDTH; i += 1) begin
+                perf_retire_hist[i] = 64'b0;
+                perf_dispatch_hist[i] = 64'b0;
+            end
             for (int i = 0; i < PERF_STALL_BUCKETS; i += 1) begin
                 perf_stall_instr[i] = 64'b0;
             end
@@ -2767,6 +2813,62 @@ module riscv_core_ooo
                 perf_total_data_writes = perf_total_data_writes + 64'd1;
             end
 
+            // --- Structural-hazard occupancy (per-cycle) ---
+            if (active_full)        perf_rob_full_cycles       = perf_rob_full_cycles + 64'd1;
+            if (active_empty)       perf_rob_empty_cycles      = perf_rob_empty_cycles + 64'd1;
+            if (int_iq_full)        perf_iq_full_cycles        = perf_iq_full_cycles + 64'd1;
+            if (mem_queue_full)     perf_memq_full_cycles      = perf_memq_full_cycles + 64'd1;
+            if (branch_stack_full)  perf_bstack_full_cycles    = perf_bstack_full_cycles + 64'd1;
+            if (!free_can_allocate) perf_freelist_stall_cycles = perf_freelist_stall_cycles + 64'd1;
+            if (dispatch_stall)     perf_dispatch_stall_cycles = perf_dispatch_stall_cycles + 64'd1;
+            if (hpm_l1i_miss)       perf_l1i_miss_cnt          = perf_l1i_miss_cnt + 64'd1;
+            if (hpm_l1d_miss)       perf_l1d_miss_cnt          = perf_l1d_miss_cnt + 64'd1;
+            if (hpm_l1d_wb)         perf_l1d_wb_cnt            = perf_l1d_wb_cnt + 64'd1;
+
+            // Branch presented at dispatch, and whether the full branch stack
+            // blocked it (dispatch_control forces a stall on branch+stack-full).
+            begin
+                logic branch_presented_c;
+                branch_presented_c = 1'b0;
+                for (int i = 0; i < OOO_WIDTH; i += 1) begin
+                    if (lane_valid[i] && lane_is_branch[i]) branch_presented_c = 1'b1;
+                end
+                if (branch_presented_c) begin
+                    perf_branch_presented = perf_branch_presented + 64'd1;
+                    if (branch_stack_full)
+                        perf_bstack_branch_block = perf_bstack_branch_block + 64'd1;
+                end
+            end
+
+            // Commit-bandwidth histogram + starvation decomposition.
+            perf_retire_hist[retire_count] = perf_retire_hist[retire_count] + 64'd1;
+            if (retire_count == 3'd0) begin
+                if (active_empty) perf_commit_starved_fe = perf_commit_starved_fe + 64'd1;
+                else              perf_commit_starved_be = perf_commit_starved_be + 64'd1;
+            end
+            begin
+                logic [2:0] dcnt;
+                dcnt = 3'd0;
+                for (int i = 0; i < OOO_WIDTH; i += 1) begin
+                    if (dispatch_valid[i]) dcnt = dcnt + 3'd1;
+                end
+                perf_dispatch_hist[dcnt] = perf_dispatch_hist[dcnt] + 64'd1;
+            end
+
+            // Average cacheable-load latency (accept -> response); one load is
+            // outstanding at a time, so req/resp pair cleanly. Devices excluded.
+            if (perf_load_pending_q && dmem_resp_valid) begin
+                perf_load_lat_sum = perf_load_lat_sum +
+                    (perf_cycle_counter - perf_load_start_cycle);
+                perf_load_lat_count = perf_load_lat_count + 64'd1;
+                perf_load_pending_q = 1'b0;
+            end
+            if (!perf_load_pending_q && dmem_req_valid && !dmem_req_write &&
+                    dmem_req_ready && !dmem_req_device) begin
+                perf_load_pending_q = 1'b1;
+                perf_load_start_cycle = perf_cycle_counter;
+            end
+
             for (int i = 0; i < OOO_WIDTH; i += 1) begin
                 if (dispatch_valid[i]) begin
                     perf_dispatch_counter = perf_dispatch_counter + 64'd1;
@@ -2787,6 +2889,10 @@ module riscv_core_ooo
 
                 if (retire_valid[i]) begin
                     perf_retire_counter = perf_retire_counter + 64'd1;
+`ifdef RVC
+                    if (active_commit_packet[i].is_compressed)
+                        perf_compressed_retired = perf_compressed_retired + 64'd1;
+`endif
                     unique case (RISCV_ISA::opcode_t'(active_commit_packet[i].instr[6:0]))
                         RISCV_ISA::OP_OP, RISCV_ISA::OP_IMM: begin
                             perf_alu_instructions = perf_alu_instructions + 64'd1;
@@ -2875,8 +2981,13 @@ module riscv_core_ooo
         end
     end
 
-    initial begin
-        wait (halted);
+    // Dump at end-of-sim ($finish): fires on the ECALL-halt path (benchmarks)
+    // AND on a +maxcyc cap (xv6, which never halts). The legacy stdout lines are
+    // preserved verbatim so scripts/run_447_benchmarks.py keeps parsing them; the
+    // extended metrics follow, and +perf_out=<path> writes a key=value file.
+    final begin
+        string perf_out_path;
+        int    pfd;
         $display("FINAL OOO PERFORMANCE COUNTERS:");
         $display("Total cycles: %0d", perf_cycle_counter);
         $display("Instructions dispatched: %0d", perf_dispatch_counter);
@@ -2910,6 +3021,74 @@ module riscv_core_ooo
         $display("Total control flow instructions: %0d", perf_branch_instructions);
         $display("Mispredicted control flow instructions: %0d",
             perf_mispredicted_branches);
+        // --- extended microarchitectural metrics ---
+        $display("EXT ROB full cycles: %0d", perf_rob_full_cycles);
+        $display("EXT ROB empty cycles: %0d", perf_rob_empty_cycles);
+        $display("EXT IQ full cycles: %0d", perf_iq_full_cycles);
+        $display("EXT MemQ full cycles: %0d", perf_memq_full_cycles);
+        $display("EXT BranchStack full cycles: %0d", perf_bstack_full_cycles);
+        $display("EXT Freelist stall cycles: %0d", perf_freelist_stall_cycles);
+        $display("EXT Dispatch stall cycles: %0d", perf_dispatch_stall_cycles);
+        $display("EXT Branch presented cycles: %0d", perf_branch_presented);
+        $display("EXT Branch blocked by full stack cycles: %0d", perf_bstack_branch_block);
+        $display("EXT Commit-starved backend cycles: %0d", perf_commit_starved_be);
+        $display("EXT Commit-starved frontend cycles: %0d", perf_commit_starved_fe);
+        $display("EXT Compressed retired: %0d", perf_compressed_retired);
+        $display("EXT L1I misses: %0d", perf_l1i_miss_cnt);
+        $display("EXT L1D misses: %0d", perf_l1d_miss_cnt);
+        $display("EXT L1D writebacks: %0d", perf_l1d_wb_cnt);
+        $display("EXT Load latency sum: %0d", perf_load_lat_sum);
+        $display("EXT Load latency count: %0d", perf_load_lat_count);
+        for (int i = 0; i <= OOO_WIDTH; i += 1)
+            $display("EXT Retire hist[%0d]: %0d", i, perf_retire_hist[i]);
+        for (int i = 0; i <= OOO_WIDTH; i += 1)
+            $display("EXT Dispatch hist[%0d]: %0d", i, perf_dispatch_hist[i]);
+
+        if ($value$plusargs("perf_out=%s", perf_out_path)) begin
+            pfd = $fopen(perf_out_path, "w");
+            if (pfd != 0) begin
+                $fdisplay(pfd, "cycles=%0d", perf_cycle_counter);
+                $fdisplay(pfd, "dispatched=%0d", perf_dispatch_counter);
+                $fdisplay(pfd, "retired=%0d", perf_retire_counter);
+                $fdisplay(pfd, "alu=%0d", perf_alu_instructions);
+                $fdisplay(pfd, "load=%0d", perf_load_instructions);
+                $fdisplay(pfd, "store=%0d", perf_store_instructions);
+                $fdisplay(pfd, "frontend_stall_cycles=%0d", perf_frontend_stall_cycles);
+                $fdisplay(pfd, "data_reads=%0d", perf_total_data_reads);
+                $fdisplay(pfd, "data_writes=%0d", perf_total_data_writes);
+                $fdisplay(pfd, "control_flow=%0d", perf_branch_instructions);
+                $fdisplay(pfd, "mispredicts=%0d", perf_mispredicted_branches);
+                $fdisplay(pfd, "jalr_pred_correct=%0d", perf_jalr_predicted_correct);
+                $fdisplay(pfd, "jalr_pred_incorrect=%0d", perf_jalr_predicted_incorrect);
+                $fdisplay(pfd, "jalr_unpredicted=%0d", perf_jalr_unpredicted);
+                $fdisplay(pfd, "return_pred_correct=%0d", perf_return_predicted_correct);
+                $fdisplay(pfd, "return_pred_incorrect=%0d", perf_return_predicted_incorrect);
+                $fdisplay(pfd, "return_unpredicted=%0d", perf_return_unpredicted);
+                $fdisplay(pfd, "rob_full_cycles=%0d", perf_rob_full_cycles);
+                $fdisplay(pfd, "rob_empty_cycles=%0d", perf_rob_empty_cycles);
+                $fdisplay(pfd, "iq_full_cycles=%0d", perf_iq_full_cycles);
+                $fdisplay(pfd, "memq_full_cycles=%0d", perf_memq_full_cycles);
+                $fdisplay(pfd, "bstack_full_cycles=%0d", perf_bstack_full_cycles);
+                $fdisplay(pfd, "freelist_stall_cycles=%0d", perf_freelist_stall_cycles);
+                $fdisplay(pfd, "dispatch_stall_cycles=%0d", perf_dispatch_stall_cycles);
+                $fdisplay(pfd, "branch_presented_cycles=%0d", perf_branch_presented);
+                $fdisplay(pfd, "bstack_branch_block_cycles=%0d", perf_bstack_branch_block);
+                $fdisplay(pfd, "commit_starved_backend=%0d", perf_commit_starved_be);
+                $fdisplay(pfd, "commit_starved_frontend=%0d", perf_commit_starved_fe);
+                $fdisplay(pfd, "compressed_retired=%0d", perf_compressed_retired);
+                $fdisplay(pfd, "l1i_miss=%0d", perf_l1i_miss_cnt);
+                $fdisplay(pfd, "l1d_miss=%0d", perf_l1d_miss_cnt);
+                $fdisplay(pfd, "l1d_wb=%0d", perf_l1d_wb_cnt);
+                $fdisplay(pfd, "load_lat_sum=%0d", perf_load_lat_sum);
+                $fdisplay(pfd, "load_lat_count=%0d", perf_load_lat_count);
+                for (int i = 0; i <= OOO_WIDTH; i += 1)
+                    $fdisplay(pfd, "retire_hist_%0d=%0d", i, perf_retire_hist[i]);
+                for (int i = 0; i <= OOO_WIDTH; i += 1)
+                    $fdisplay(pfd, "dispatch_hist_%0d=%0d", i, perf_dispatch_hist[i]);
+                $fclose(pfd);
+                $display("PERF: wrote %s", perf_out_path);
+            end
+        end
     end
 `endif /* SIMULATION_18447 */
 

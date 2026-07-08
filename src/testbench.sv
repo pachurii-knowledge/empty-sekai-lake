@@ -366,6 +366,27 @@ module top;
         end
     end
 
+    /* Simulation-only cycle cap. Pass +maxcyc=<N> to end simulation cleanly via
+     * $finish after N cycles (so the OoO core's `final` performance dump fires).
+     * Needed for workloads that never assert `halted` (e.g. an xv6 boot). Inert
+     * when the plusarg is absent, preserving the existing halt-driven flow. */
+    longint unsigned maxcyc_limit;
+    logic            maxcyc_enabled;
+    initial begin
+        if ($value$plusargs("maxcyc=%d", maxcyc_limit)) begin
+            maxcyc_enabled = 1'b1;
+        end else begin
+            maxcyc_limit = 0;
+            maxcyc_enabled = 1'b0;
+        end
+    end
+    always @(posedge clk) begin
+        if (rst_l && maxcyc_enabled && (longint'(cycle_count) >= maxcyc_limit)) begin
+            $display("MAXCYC: reached %0d cycles, ending simulation", cycle_count);
+            $finish;
+        end
+    end
+
     /* HTIF tohost monitor used by the RISC-V privileged / Sv32 test suites.
      * Enable by passing +tohost=<hex byte address>; a non-zero store to that
      * address ends simulation. By convention a payload of 1 means PASS, and any
