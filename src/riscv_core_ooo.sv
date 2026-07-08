@@ -646,6 +646,7 @@ module riscv_core_ooo
     logic lsq_store_second_beat;
     logic lsq_store_port_busy;
     logic lsq_sc_commit_done;           // M4-S5b: LSQ resolved the coherent SC -> release ROB retire
+    logic [2:0] lsq_head_reason;        // P3-M0: LSQ head-blocking-reason (display-only perf)
     logic commit_store;
     active_id_t commit_store_id;
 
@@ -1753,7 +1754,8 @@ module riscv_core_ooo
         .store_port_busy(lsq_store_port_busy),
         .head_load_off(dev_load_off),
         .sc_commit_done(lsq_sc_commit_done),
-        .load_writeback
+        .load_writeback,
+        .lsq_head_reason(lsq_head_reason)
     );
 
     ooo_writeback_bus WritebackBus (
@@ -2981,6 +2983,7 @@ module riscv_core_ooo
     logic [63:0] perf_load_lat_sum, perf_load_lat_count;  // avg load accept->resp latency
     logic        perf_load_pending_q;
     logic [63:0] perf_load_start_cycle;
+    logic [63:0] perf_lsq_hr [7];             // P3-M0: LSQ head-blocking reason histogram
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
@@ -3023,6 +3026,7 @@ module riscv_core_ooo
             perf_load_lat_count = 64'b0;
             perf_load_pending_q = 1'b0;
             perf_load_start_cycle = 64'b0;
+            for (int i = 0; i < 7; i += 1) perf_lsq_hr[i] = 64'b0;
             for (int i = 0; i <= OOO_WIDTH; i += 1) begin
                 perf_retire_hist[i] = 64'b0;
                 perf_dispatch_hist[i] = 64'b0;
@@ -3039,6 +3043,7 @@ module riscv_core_ooo
             end
         end else if (!halted_q) begin
             perf_cycle_counter = perf_cycle_counter + 64'd1;
+            perf_lsq_hr[lsq_head_reason] = perf_lsq_hr[lsq_head_reason] + 64'd1;
             if (frontend_stall || dispatched_unpredicted_control) begin
                 perf_frontend_stall_cycles = perf_frontend_stall_cycles + 64'd1;
             end
@@ -3321,6 +3326,10 @@ module riscv_core_ooo
                     $fdisplay(pfd, "retire_hist_%0d=%0d", i, perf_retire_hist[i]);
                 for (int i = 0; i <= OOO_WIDTH; i += 1)
                     $fdisplay(pfd, "dispatch_hist_%0d=%0d", i, perf_dispatch_hist[i]);
+                // P3-M0: LSQ head-blocking reason histogram (0 empty, 1 ready,
+                // 2 loadwait, 3 storepark, 4 xlate, 5 memport, 6 other).
+                for (int i = 0; i < 7; i += 1)
+                    $fdisplay(pfd, "lsq_hr_%0d=%0d", i, perf_lsq_hr[i]);
                 $fclose(pfd);
                 $display("PERF: wrote %s", perf_out_path);
             end

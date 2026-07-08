@@ -92,8 +92,21 @@ module load_store_queue
     // sc_ok arrived + rd written). The commit unit holds the SC at the ROB head
     // until this fires, then retires it. Constant 0 when COHERENT=0.
     output logic                 sc_commit_done,
-    output writeback_packet_t    load_writeback
+    output writeback_packet_t    load_writeback,
+    // P3-M0 (display-only, MLP diagnosis): categorizes why the in-order head is
+    // blocked this cycle (see the LSQ_HR_* codes). Pure combinational hint off the
+    // head state -- feeds only the SIMULATION perf counters, never functional logic;
+    // optimized away in synthesis. See plans/ooo-perf.md P3-M0.
+    output logic [2:0]           lsq_head_reason
 );
+    // P3-M0 head-blocking-reason codes.
+    localparam logic [2:0] LSQ_HR_EMPTY     = 3'd0; // no valid entry at head (idle)
+    localparam logic [2:0] LSQ_HR_READY     = 3'd1; // head drains/progresses this cycle
+    localparam logic [2:0] LSQ_HR_LOADWAIT  = 3'd2; // load outstanding (mem_inflight): MLP=1 tax
+    localparam logic [2:0] LSQ_HR_STOREPARK = 3'd3; // completed store parked awaiting commit
+    localparam logic [2:0] LSQ_HR_XLATE     = 3'd4; // head mem-op, translation not ready
+    localparam logic [2:0] LSQ_HR_MEMPORT   = 3'd5; // load ready but dmem port not ready
+    localparam logic [2:0] LSQ_HR_OTHER     = 3'd6; // operand-wait / other
 
     typedef struct packed {
         issue_entry_t entry;
@@ -1416,6 +1429,31 @@ module load_store_queue
             xlate_reqv_q <= mem_req_valid;
             entries_q <= entries_next;
         end
+    end
+
+    // P3-M0: categorize why the in-order head is blocked this cycle (display-only;
+    // reads only the head state already computed above -> no functional effect).
+    // Priority: idle > progressing > load-response-wait > store-park > translate >
+    // dmem-port > other (operand-wait). LOADWAIT (mem_inflight) is the MLP=1 tax
+    // that P3b/P3c target; STOREPARK is the store->load-forwarding tax (ext. opt A).
+    always_comb begin
+        if (count_q == '0)
+            lsq_head_reason = LSQ_HR_EMPTY;
+        else if (head_retire)
+            lsq_head_reason = LSQ_HR_READY;
+        else if (mem_inflight_q)
+            lsq_head_reason = LSQ_HR_LOADWAIT;
+        else if (headq.entry.valid && headq.entry.ctrl.memWrite && headq.issued_load)
+            lsq_head_reason = LSQ_HR_STOREPARK;
+        else if (headq.entry.valid && !headq.issued_load &&
+                 (headq.entry.ctrl.memRead || headq.entry.ctrl.memWrite) &&
+                 !head_xlate_ok)
+            lsq_head_reason = LSQ_HR_XLATE;
+        else if (headq.entry.valid && !headq.issued_load &&
+                 headq.entry.ctrl.memRead && head_xlate_ok && !dmem_req_ready)
+            lsq_head_reason = LSQ_HR_MEMPORT;
+        else
+            lsq_head_reason = LSQ_HR_OTHER;
     end
 
 endmodule: load_store_queue
