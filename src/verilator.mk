@@ -89,6 +89,7 @@ ifeq ($(PERF),1)
 	BIG_LSQ := 1
 	BTB := 1
 	XLATE_BYPASS := 1
+	FP_OOO := 1
 endif
 
 ifeq ($(SUPERSCALAR),4)
