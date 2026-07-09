@@ -153,6 +153,26 @@ ifeq ($(DEEP_WINDOW),1)
 	VERILATOR_CFLAGS += -DDEEP_WINDOW
 endif
 
+# P6b window-depth structure resizes (plans/ooo-perf.md P6). Each grows one OoO
+# window structure; defaults are bit-identical. INT_IQ (BIG_IQ) is a collapsing slot
+# queue (16->24, any size legal). ACTIVE_LIST/ROB (BIG_ROB) and MEM_Q/LSQ (BIG_LSQ)
+# are power-of-2 ring buffers so they take only pow2 sizes (ROB 32->64, LSQ 16->32).
+# BIG_ROB=64 needs PHYS_REGS >= 32+64 = 96 (free-list floor) => it REQUIRES DEEP_WINDOW
+# (PHYS_REGS=128). OOO only. The three grow the same entries_q arrays whose whole-array
+# NBAs are now element-wise loops (Verilator V3Delayed workaround), default unchanged.
+ifeq ($(BIG_IQ),1)
+	VERILATOR_CFLAGS += -DBIG_IQ
+endif
+ifeq ($(BIG_LSQ),1)
+	VERILATOR_CFLAGS += -DBIG_LSQ
+endif
+ifeq ($(BIG_ROB),1)
+ifneq ($(DEEP_WINDOW),1)
+$(error BIG_ROB=1 requires DEEP_WINDOW=1: a 64-entry ROB needs PHYS_REGS>=96 (free-list deadlock floor); DEEP_WINDOW sets PHYS_REGS=128)
+endif
+	VERILATOR_CFLAGS += -DBIG_ROB
+endif
+
 # ASIC=1 selects the ASAP7 7nm ASIC target (-DNIIGO_ASIC), mirroring RV64=1 for
 # datapath width. It flips the target-divergent, RESULTS-IDENTICAL knobs the ASIC
 # flow needs -- CVFPU FMA 2->3 pipe stages (niigo_fp_unit) and RAS depth 128->32

@@ -44,9 +44,28 @@ package OOO_Types;
     localparam int PHYS_REGS = 64;
 `endif
     localparam int FP_REGS = 32;
+    // Window-depth structures (P6b). Defaults are bit-identical; each grows under
+    // its own macro. ACTIVE_LIST (ROB) and MEM_Q (LSQ) are POWER-OF-2 RING BUFFERS
+    // (bare +1 pointer wrap + ring distance), so they may ONLY take power-of-2 sizes
+    // (48/24 would index out-of-array slots). INT_IQ is a collapsing slot queue, so
+    // any size is legal. BIG_ROB=64 needs PHYS_REGS >= 32+64 = 96 (the free-list
+    // deadlock floor), so it REQUIRES -DDEEP_WINDOW (PHYS_REGS=128), enforced by the
+    // build flags. active_id_t / iq_idx_t / all counts auto-derive via $clog2.
+`ifdef BIG_ROB
+    localparam int ACTIVE_LIST_SIZE = 64;   // pow2 ring; requires DEEP_WINDOW
+`else
     localparam int ACTIVE_LIST_SIZE = 32;
+`endif
+`ifdef BIG_IQ
+    localparam int INT_IQ_SIZE = 24;        // collapsing queue; non-pow2 OK
+`else
     localparam int INT_IQ_SIZE = 16;
+`endif
+`ifdef BIG_LSQ
+    localparam int MEM_Q_SIZE = 32;         // pow2 ring
+`else
     localparam int MEM_Q_SIZE = 16;
+`endif
     localparam int BRANCH_STACK_SIZE = 4;
     localparam int ALU_ISSUE_PORTS = 2;
     localparam int FU_ISSUE_PORTS = 5;

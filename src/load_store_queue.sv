@@ -1475,7 +1475,12 @@ module load_store_queue
             xlate_head_q <= head_q;
             xlate_probe_q <= store_probe_hi_q;
             xlate_reqv_q <= mem_req_valid;
-            entries_q <= entries_next;
+            // Element-wise (not whole-array `entries_q <= entries_next`): a whole
+            // unpacked-array NBA trips a Verilator V3Delayed internal error at the
+            // larger MEM_Q_SIZE=32 (BIG_LSQ). Behaviourally identical, so the default
+            // 16-entry build is unchanged.
+            for (int i = 0; i < MEM_Q_SIZE; i += 1)
+                entries_q[i] <= entries_next[i];
         end
     end
 

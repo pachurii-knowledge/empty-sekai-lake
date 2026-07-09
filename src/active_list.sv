@@ -505,7 +505,13 @@ module active_list
                 entries_q[i] <= '0;
             end
         end else begin
-            entries_q <= entries_next;
+            // Element-wise (not whole-array `entries_q <= entries_next`): a whole
+            // unpacked-array NBA trips a Verilator V3Delayed internal error at the
+            // larger ACTIVE_LIST_SIZE=64 (BIG_ROB). Behaviourally identical, so the
+            // default 32-entry build is unchanged. (commit_packet_q/allocate_packet_q
+            // below stay whole-array: they are OOO_WIDTH-sized and never grow.)
+            for (int i = 0; i < ACTIVE_LIST_SIZE; i += 1)
+                entries_q[i] <= entries_next[i];
             head_q <= head_next;
             tail_q <= tail_next;
             count_q <= count_next;

@@ -328,7 +328,12 @@ module int_issue_queue
                 entries_q[i] <= '0;
             end
         end else begin
-            entries_q <= entries_next;
+            // Element-wise (not whole-array `entries_q <= entries_next`): a whole
+            // unpacked-array NBA trips a Verilator V3Delayed internal error at the
+            // larger INT_IQ_SIZE=24 (BIG_IQ). Behaviourally identical, so the default
+            // 16-entry build is unchanged.
+            for (int i = 0; i < INT_IQ_SIZE; i += 1)
+                entries_q[i] <= entries_next[i];
             count_q <= count_next;
         end
     end
