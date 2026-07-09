@@ -647,6 +647,7 @@ module riscv_core_ooo
     logic lsq_store_port_busy;
     logic lsq_sc_commit_done;           // M4-S5b: LSQ resolved the coherent SC -> release ROB retire
     logic [2:0] lsq_head_reason;        // P3-M0: LSQ head-blocking-reason (display-only perf)
+    logic [2:0] lsq_fwd_class;          // P3 L2a: store->load forwarding opportunity (display-only)
     logic commit_store;
     active_id_t commit_store_id;
 
@@ -1755,7 +1756,8 @@ module riscv_core_ooo
         .head_load_off(dev_load_off),
         .sc_commit_done(lsq_sc_commit_done),
         .load_writeback,
-        .lsq_head_reason(lsq_head_reason)
+        .lsq_head_reason(lsq_head_reason),
+        .lsq_fwd_class(lsq_fwd_class)
     );
 
     ooo_writeback_bus WritebackBus (
@@ -2984,6 +2986,7 @@ module riscv_core_ooo
     logic        perf_load_pending_q;
     logic [63:0] perf_load_start_cycle;
     logic [63:0] perf_lsq_hr [7];             // P3-M0: LSQ head-blocking reason histogram
+    logic [63:0] perf_lsq_fwd [5];            // P3 L2a: store->load forwarding-opportunity histogram
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
@@ -3027,6 +3030,7 @@ module riscv_core_ooo
             perf_load_pending_q = 1'b0;
             perf_load_start_cycle = 64'b0;
             for (int i = 0; i < 7; i += 1) perf_lsq_hr[i] = 64'b0;
+            for (int i = 0; i < 5; i += 1) perf_lsq_fwd[i] = 64'b0;
             for (int i = 0; i <= OOO_WIDTH; i += 1) begin
                 perf_retire_hist[i] = 64'b0;
                 perf_dispatch_hist[i] = 64'b0;
@@ -3044,6 +3048,7 @@ module riscv_core_ooo
         end else if (!halted_q) begin
             perf_cycle_counter = perf_cycle_counter + 64'd1;
             perf_lsq_hr[lsq_head_reason] = perf_lsq_hr[lsq_head_reason] + 64'd1;
+            perf_lsq_fwd[lsq_fwd_class] = perf_lsq_fwd[lsq_fwd_class] + 64'd1;
             if (frontend_stall || dispatched_unpredicted_control) begin
                 perf_frontend_stall_cycles = perf_frontend_stall_cycles + 64'd1;
             end
@@ -3330,6 +3335,9 @@ module riscv_core_ooo
                 // 2 loadwait, 3 storepark, 4 xlate, 5 memport, 6 other).
                 for (int i = 0; i < 7; i += 1)
                     $fdisplay(pfd, "lsq_hr_%0d=%0d", i, perf_lsq_hr[i]);
+                // P3 L2a: 0 na, 1 noload, 2 nomatch, 3 partial, 4 full (forwardable)
+                for (int i = 0; i < 5; i += 1)
+                    $fdisplay(pfd, "lsq_fwd_%0d=%0d", i, perf_lsq_fwd[i]);
                 $fclose(pfd);
                 $display("PERF: wrote %s", perf_out_path);
             end

@@ -97,7 +97,13 @@ module load_store_queue
     // blocked this cycle (see the LSQ_HR_* codes). Pure combinational hint off the
     // head state -- feeds only the SIMULATION perf counters, never functional logic;
     // optimized away in synthesis. See plans/ooo-perf.md P3-M0.
-    output logic [2:0]           lsq_head_reason
+    output logic [2:0]           lsq_head_reason,
+    // P3 L2a (display-only, store->load forwarding MEASURE-FIRST): on a store-park
+    // cycle, classifies whether a younger load could forward from the parked HEAD
+    // store (see the LSQ_FWD_* codes), modeling the L2b stalls (device PA, single-word,
+    // no-intervening-store, byte full-cover) so FWD_FULL is not over-counted. Pure
+    // combinational; feeds only the SIM perf counters. See plans/ooo-perf.md P3 lever 2.
+    output logic [2:0]           lsq_fwd_class
 );
     // P3-M0 head-blocking-reason codes.
     localparam logic [2:0] LSQ_HR_EMPTY     = 3'd0; // no valid entry at head (idle)
@@ -107,6 +113,12 @@ module load_store_queue
     localparam logic [2:0] LSQ_HR_XLATE     = 3'd4; // head mem-op, translation not ready
     localparam logic [2:0] LSQ_HR_MEMPORT   = 3'd5; // load ready but dmem port not ready
     localparam logic [2:0] LSQ_HR_OTHER     = 3'd6; // operand-wait / other
+    // P3 L2a store->load forwarding-opportunity codes.
+    localparam logic [2:0] LSQ_FWD_NA      = 3'd0; // not a store-park cycle
+    localparam logic [2:0] LSQ_FWD_NOLOAD  = 3'd1; // store-park, no younger eligible int load
+    localparam logic [2:0] LSQ_FWD_NOMATCH = 3'd2; // younger load, no byte overlap w/ head store
+    localparam logic [2:0] LSQ_FWD_PARTIAL = 3'd3; // overlap but partial/two-beat/intervening/device
+    localparam logic [2:0] LSQ_FWD_FULL    = 3'd4; // younger int load, full-cover from single-word RAM head store
 
     typedef struct packed {
         issue_entry_t entry;
@@ -1490,6 +1502,71 @@ module load_store_queue
             lsq_head_reason = LSQ_HR_MEMPORT;
         else
             lsq_head_reason = LSQ_HR_OTHER;
+    end
+
+    // P3 L2a (MEASURE-FIRST, display-only): on a store-park cycle, would a younger
+    // load forward from the parked HEAD store? Reads registered entries_q only (the
+    // FB2b torn-read rule) and models the L2b stalls so FWD_FULL is not over-counted:
+    // device-PA (the store's captured store_lo_pa in the device hole < 0x8000_0000),
+    // single-word store/load, no intervening store between head and the load, and
+    // byte full-cover. Purely combinational -> optimized away in synthesis.
+    logic                          fwd_found_load, fwd_intervening_store;
+    logic [$clog2(MEM_Q_SIZE)-1:0] fwd_load_idx;
+    logic [XLEN_BYTES-1:0]         fwd_load_full, fwd_load_mask;
+    always_comb begin
+        lsq_fwd_class         = LSQ_FWD_NA;
+        fwd_found_load        = 1'b0;
+        fwd_intervening_store = 1'b0;
+        fwd_load_idx          = head_next_skip;
+        fwd_load_full         = '0;
+        fwd_load_mask         = '0;
+        if (lsq_head_reason == LSQ_HR_STOREPARK) begin
+            // oldest younger eligible plain-integer load; flag any store before it.
+            for (int j = 1; j < MEM_Q_SIZE; j += 1) begin
+                automatic logic [$clog2(MEM_Q_SIZE)-1:0] fi =
+                    head_next_skip + ($clog2(MEM_Q_SIZE))'(j);
+                if (!fwd_found_load &&
+                        (($clog2(MEM_Q_SIZE+1))'(j) < count_after_skip) &&
+                        entries_q[fi].entry.valid) begin
+                    if (entries_q[fi].entry.ctrl.memRead &&
+                            !entries_q[fi].entry.ctrl.memWrite &&
+                            (entries_q[fi].entry.ctrl.exec_class == EXEC_INT) &&
+                            entries_q[fi].addr_ready && !entries_q[fi].issued_load) begin
+                        fwd_found_load = 1'b1;
+                        fwd_load_idx   = fi;
+                    end else if (entries_q[fi].entry.ctrl.memWrite) begin
+                        fwd_intervening_store = 1'b1;
+                    end
+                end
+            end
+            if (!fwd_found_load) begin
+                lsq_fwd_class = LSQ_FWD_NOLOAD;
+            end else begin
+                unique case (entries_q[fwd_load_idx].entry.ctrl.ldst_mode)
+                    LDST_D:          fwd_load_full = '1;
+                    LDST_W, LDST_WU: fwd_load_full = XLEN_BYTES'('hF);
+                    LDST_H, LDST_HU: fwd_load_full = XLEN_BYTES'('h3);
+                    LDST_B, LDST_BU: fwd_load_full = XLEN_BYTES'('h1);
+                    default:         fwd_load_full = '0;
+                endcase
+                fwd_load_mask = fwd_load_full <<
+                    entries_q[fwd_load_idx].addr[ADDR_SHIFT-1:0];
+                if ((headq.addr[XLEN-1:ADDR_SHIFT] !=
+                         entries_q[fwd_load_idx].addr[XLEN-1:ADDR_SHIFT]) ||
+                        ((fwd_load_mask & headq.store_mask) == '0)) begin
+                    lsq_fwd_class = LSQ_FWD_NOMATCH;   // no byte overlap w/ head store
+                end else if (((fwd_load_mask & ~headq.store_mask) == '0) &&  // full-cover
+                        (headq.store_lo_pa >= XLEN'(64'h8000_0000)) &&        // RAM, not device
+                        (headq.store_mask_hi == '0) &&                        // store single-word
+                        !needs_two_beats(entries_q[fwd_load_idx].entry.ctrl,
+                                         entries_q[fwd_load_idx].addr) &&      // load single-word
+                        !fwd_intervening_store) begin
+                    lsq_fwd_class = LSQ_FWD_FULL;
+                end else begin
+                    lsq_fwd_class = LSQ_FWD_PARTIAL;
+                end
+            end
+        end
     end
 
 endmodule: load_store_queue
