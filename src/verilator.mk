@@ -69,6 +69,28 @@ VERILATOR_CFLAGS ?= --sv --timing --binary -Wno-fatal \
 		-DSIMULATION_18447 \
 		-DLAB_18447='"4b"'
 
+# PERF=1 = the canonical OoO performance build (plans/ooo-perf.md). One umbrella flag for the
+# full landed-lever stack on the REALISTIC memory config (L1D). Passthrough is NOT used for perf:
+# its fixed 8-cycle-every-load fakes a memory-bound signature (LOADWAIT collapses to the identity
+# loads x (latency-1)), which flips window/memory/translate conclusions vs L1D -- e.g. XLATE_BYPASS
+# reads modest on passthrough but +13% mean on L1D. See the P3 mem-lever recon. Expands to RV64GC +
+# L1D + the gated perf levers; each flag still composes individually for A/B isolation. NB: this is a
+# FUNCTIONAL sim perf build -- XLATE_BYPASS carries an Fmax cost, so an FPGA/ASIC build should drop it.
+# Must precede the sub-flag ifeq blocks so they see these vars.
+ifeq ($(PERF),1)
+	RV64 := 1
+	OOO := 1
+	RVC := 1
+	L1D := 1
+	REALIGN4 := 1
+	DEEP_WINDOW := 1
+	BIG_IQ := 1
+	BIG_ROB := 1
+	BIG_LSQ := 1
+	BTB := 1
+	XLATE_BYPASS := 1
+endif
+
 ifeq ($(SUPERSCALAR),4)
 	VERILATOR_CFLAGS += -DSUPERSCALAR_4WIDE
 endif
