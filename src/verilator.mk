@@ -223,6 +223,16 @@ ifeq ($(XLATE_BYPASS),1)
 	VERILATOR_CFLAGS += -DXLATE_BYPASS
 endif
 
+# FP_OOO=1 de-serializes floating-point ops (plans/ooo-perf.md P5b): drops the
+# machine-wide dispatch quiesce every FP op raises today and replaces it with a
+# single-producer arch-FPR scoreboard (one in-flight writer per FPR via a WAW
+# dispatch-stall; producer branch_mask aged by ~reset_mask for abort recovery) +
+# an fflags-read drain interlock. Default OFF is bit-identical (all gated by
+# -DFP_OOO). OOO only.
+ifeq ($(FP_OOO),1)
+	VERILATOR_CFLAGS += -DFP_OOO
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

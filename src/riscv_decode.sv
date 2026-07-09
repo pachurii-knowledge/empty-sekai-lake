@@ -585,7 +585,9 @@ module riscv_decode
                 end
                 OP_LOAD_FP: begin
                     ctrl_signals.exec_class = EXEC_FP;
+`ifndef FP_OOO
                     ctrl_signals.serializing = 1'b1;
+`endif
                     ctrl_signals.useImm = 1'b1;
                     ctrl_signals.rfWrite = 1'b0;
                     ctrl_signals.fp_writes_fpr = 1'b1;
@@ -615,7 +617,9 @@ module riscv_decode
                 end
                 OP_STORE_FP: begin
                     ctrl_signals.exec_class = EXEC_FP;
+`ifndef FP_OOO
                     ctrl_signals.serializing = 1'b1;
+`endif
                     ctrl_signals.useImm = 1'b1;
                     ctrl_signals.rfWrite = 1'b0;
                     ctrl_signals.fp_uses_rs2 = 1'b1;
@@ -678,7 +682,9 @@ module riscv_decode
                 end
                 OP_MADD, OP_MSUB, OP_NMSUB, OP_NMADD: begin
                     ctrl_signals.exec_class = EXEC_FP;
+`ifndef FP_OOO
                     ctrl_signals.serializing = 1'b1;
+`endif
                     ctrl_signals.fp_uses_rs1 = 1'b1;
                     ctrl_signals.fp_uses_rs2 = 1'b1;
                     ctrl_signals.fp_uses_rs3 = 1'b1;
@@ -703,7 +709,9 @@ module riscv_decode
                 end
                 OP_FP: begin
                     ctrl_signals.exec_class = EXEC_FP;
+`ifndef FP_OOO
                     ctrl_signals.serializing = 1'b1;
+`endif
                     ctrl_signals.fp_double = (instr[26:25] == 2'b01);
                     ctrl_signals.rfWrite = 1'b0;
                     ctrl_signals.pc_source = PC_plus4;

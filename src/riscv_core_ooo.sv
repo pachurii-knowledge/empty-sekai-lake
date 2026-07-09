@@ -387,6 +387,11 @@ module riscv_core_ooo
     logic [OOO_WIDTH-1:0] lane_is_memory;
     logic [OOO_WIDTH-1:0] lane_is_terminal;
     logic [OOO_WIDTH-1:0] lane_is_serializing;
+    // P5b FP de-serialization scoreboard taps (driven 0 unless -DFP_OOO).
+    logic [OOO_WIDTH-1:0] lane_is_fp;
+    logic [OOO_WIDTH-1:0] lane_fp_src_busy;
+    logic [OOO_WIDTH-1:0] lane_reads_fflags;
+    logic                 fflags_drain_stall;
     logic [OOO_WIDTH-1:0] dispatch_valid;
     logic [OOO_WIDTH-1:0] alloc_req;
     logic [OOO_WIDTH-1:0] map_has_dest;
@@ -602,6 +607,17 @@ module riscv_core_ooo
     fp_reg_data_t fp_regs_q [FP_REGS];
     fp_reg_data_t fp_regs_next [FP_REGS];
     logic serial_pending_q, serial_pending_next;
+
+`ifdef FP_OOO
+    // P5b: single-producer arch-FPR scoreboard. fpr_busy_q[x]=1 while an FP writer
+    // to FPR x is in flight (dispatch->retire); a WAW dispatch-stall keeps at most
+    // one writer per FPR live, so the producer's aged branch_mask alone suffices
+    // for abort recovery (fpr_prod_mask_q, aged by ~reset_mask -- the same trick
+    // niigo_fp_unit uses for its single in-flight op). No branch_stack snapshot.
+    logic [FP_REGS-1:0] fpr_busy_q, fpr_busy_next;
+    branch_mask_t       fpr_prod_mask_q   [FP_REGS];
+    branch_mask_t       fpr_prod_mask_next [FP_REGS];
+`endif
 
     logic branch_stack_full;
     logic branch_allocate;
@@ -1519,6 +1535,8 @@ module riscv_core_ooo
         .lane_is_memory,
         .lane_is_terminal,
         .lane_is_serializing,
+        .lane_is_fp,
+        .lane_fp_src_busy,
         .active_list_full(active_full),
         .int_iq_full(int_iq_full),
         .mem_queue_full(mem_queue_full),
@@ -1527,7 +1545,8 @@ module riscv_core_ooo
         .free_list_available(free_count_snapshot),
         .suppress_dispatch(redirect_valid || terminal_pending_q ||
             control_pending_q || serial_pending_q || halted_q || irq_drain_q ||
-            wfi_wait_q || commit_take_trap || fencei_block || predict_stall),
+            wfi_wait_q || commit_take_trap || fencei_block || predict_stall ||
+            fflags_drain_stall),
         .dispatch_valid,
         .dispatch_stall
     );
@@ -1946,6 +1965,9 @@ module riscv_core_ooo
         lane_is_memory = '0;
         lane_is_terminal = '0;
         lane_is_serializing = '0;
+        lane_is_fp = '0;
+        lane_fp_src_busy = '0;
+        lane_reads_fflags = '0;
         valid_count = '0;
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
@@ -1975,11 +1997,49 @@ module riscv_core_ooo
                 (decode_lanes[i].ctrl.syscall || decode_lanes[i].ctrl.illegal_instr);
             lane_is_serializing[i] = lane_valid[i] &&
                 decode_lanes[i].ctrl.serializing;
+`ifdef FP_OOO
+            // P5b: an FP lane touches an FPR (source or dest). lane_fp_src_busy
+            // folds the source-read stall AND the WAW dest stall (one in-flight
+            // writer per FPR) -- both read the REGISTERED busy_q so a producer's
+            // fp_regs_q write and its busy-clear land on the same edge (a reader
+            // that sees the bit cleared reads the freshly-committed value).
+            lane_is_fp[i] = lane_valid[i] &&
+                (decode_lanes[i].ctrl.fp_writes_fpr ||
+                 decode_lanes[i].ctrl.fp_uses_rs1 ||
+                 decode_lanes[i].ctrl.fp_uses_rs2 ||
+                 decode_lanes[i].ctrl.fp_uses_rs3);
+            lane_fp_src_busy[i] = lane_valid[i] &&
+                ((decode_lanes[i].ctrl.fp_uses_rs1 &&
+                    fpr_busy_q[decode_lanes[i].rs1]) ||
+                 (decode_lanes[i].ctrl.fp_uses_rs2 &&
+                    fpr_busy_q[decode_lanes[i].rs2]) ||
+                 (decode_lanes[i].ctrl.fp_uses_rs3 &&
+                    fpr_busy_q[decode_lanes[i].instr[31:27]]) ||
+                 (decode_lanes[i].ctrl.fp_writes_fpr &&
+                    fpr_busy_q[decode_lanes[i].rd]));
+            // A CSR op reading fflags(0x001)/frm(0x002)/fcsr(0x003) must see all
+            // older FP fflags-producers' accumulated flags, which land only at
+            // their commit -> hold it until the ROB drains (rare; see below).
+            lane_reads_fflags[i] = lane_valid[i] &&
+                (decode_lanes[i].ctrl.exec_class == EXEC_CSR) &&
+                (decode_lanes[i].instr[31:20] inside {12'h001, 12'h002, 12'h003});
+`endif
             if (lane_valid[i]) begin
                 valid_count += 1'b1;
             end
         end
     end
+
+`ifdef FP_OOO
+    // fflags-read drain interlock: while any presented lane reads fflags/fcsr and
+    // the ROB is non-empty of older ops, suppress the whole group's dispatch. The
+    // ROB drains by commit (its ops are all older than the not-yet-dispatched
+    // reader), so this is deadlock-free; fflags reads are rare (FP exception
+    // checks / context save), so the conservatism is free.
+    assign fflags_drain_stall = (|(lane_valid & lane_reads_fflags)) && !active_empty;
+`else
+    assign fflags_drain_stall = 1'b0;
+`endif
 
     // ---- B1b: dispatch-count + active-list offset + partial-resume. Reads
     // dispatch_valid (and the B1a lane attrs), kept separate from the decode above
@@ -2932,6 +2992,50 @@ module riscv_core_ooo
             end
         end
     end
+
+`ifdef FP_OOO
+    // P5b FPR scoreboard next-state. Priority (last write wins): age every
+    // producer mask by ~reset_mask; clear a busy bit whose (aged) producer mask
+    // intersects abort_mask (wrong-path squash) or whose producer retires (commit
+    // fp_write -> fp_rd); clear-all on a precise-trap flush; then a fresh
+    // dispatch-set re-arms. The WAW dispatch-stall guarantees one producer per
+    // FPR, so retire-by-fp_rd and mask-abort are unambiguous.
+    always_comb begin
+        fpr_busy_next = fpr_busy_q;
+        for (int x = 0; x < FP_REGS; x += 1) begin
+            fpr_prod_mask_next[x] = fpr_prod_mask_q[x] & ~reset_mask;
+            if (fpr_busy_q[x] && ((fpr_prod_mask_q[x] & abort_mask) != '0)) begin
+                fpr_busy_next[x] = 1'b0;
+            end
+        end
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (retire_valid[i] && active_commit_packet[i].fp_write) begin
+                fpr_busy_next[active_commit_packet[i].fp_rd] = 1'b0;
+            end
+        end
+        if (trap_take) begin
+            fpr_busy_next = '0;
+        end
+        for (int i = 0; i < OOO_WIDTH; i += 1) begin
+            if (dispatch_valid[i] && decode_lanes[i].ctrl.fp_writes_fpr) begin
+                fpr_busy_next[decode_lanes[i].rd] = 1'b1;
+                // dispatch_branch_mask is already & ~reset_mask & ~abort_mask.
+                fpr_prod_mask_next[decode_lanes[i].rd] = dispatch_branch_mask;
+            end
+        end
+    end
+
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin
+            fpr_busy_q <= '0;
+            for (int x = 0; x < FP_REGS; x += 1) fpr_prod_mask_q[x] <= '0;
+        end else begin
+            fpr_busy_q <= fpr_busy_next;
+            for (int x = 0; x < FP_REGS; x += 1)
+                fpr_prod_mask_q[x] <= fpr_prod_mask_next[x];
+        end
+    end
+`endif
 
 
 `ifdef SIMULATION_18447
