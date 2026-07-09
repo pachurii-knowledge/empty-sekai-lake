@@ -29,7 +29,20 @@ package OOO_Types;
     localparam int XLEN = RISCV_ISA::XLEN;
 
     localparam int OOO_WIDTH = 4;
+    // Physical register count (P6 window depth). Default 64 = 32 arch + 32 rename
+    // (exactly 32 + ACTIVE_LIST_SIZE, the deadlock floor, so ZERO free-list headroom
+    // over the ROB). -DDEEP_WINDOW grows it to 128 to give the free list burst slack:
+    // under 4-wide dispatch (-DREALIGN4) the 2-stage commit frees regs late, so at 64
+    // the free list starves before the ROB fills (P4 measured qsort freelist_stall 37%).
+    // 128 (not 96) because free_list.sv is a power-of-2 ring buffer (bare +1 pointer wrap
+    // + free_distance = PHYS_REGS - from + to); a non-pow2 size hands out out-of-range
+    // regs. phys_reg_t auto-widens 6->7. ROB (ACTIVE_LIST_SIZE) intentionally unchanged
+    // (growing it would raise phys-reg demand, not lower it). Default OFF = bit-identical.
+`ifdef DEEP_WINDOW
+    localparam int PHYS_REGS = 128;
+`else
     localparam int PHYS_REGS = 64;
+`endif
     localparam int FP_REGS = 32;
     localparam int ACTIVE_LIST_SIZE = 32;
     localparam int INT_IQ_SIZE = 16;

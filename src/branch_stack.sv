@@ -174,8 +174,16 @@ module branch_stack
             end
         end else begin
             valid_mask_q <= valid_mask_next;
-            meta_q <= meta_next;
-            map_q <= map_next;
+            // Element-wise (not whole-array `meta_q<=meta_next` / `map_q<=map_next`):
+            // whole unpacked-array NBAs trip a Verilator V3Delayed internal error at the
+            // wider phys_reg_t under PHYS_REGS=128 (same as free_list.sv). Behaviourally
+            // identical, so the default (64) build is unchanged.
+            for (int slot = 0; slot < BRANCH_STACK_SIZE; slot += 1) begin
+                meta_q[slot] <= meta_next[slot];
+                for (int i = 0; i < 32; i += 1) begin
+                    map_q[slot][i] <= map_next[slot][i];
+                end
+            end
         end
     end
 

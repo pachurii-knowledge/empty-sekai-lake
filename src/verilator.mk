@@ -144,6 +144,15 @@ endif
 	VERILATOR_CFLAGS += -DREALIGN4
 endif
 
+# DEEP_WINDOW=1 grows PHYS_REGS 64->128 (plans/ooo-perf.md P6), giving the physical-register
+# free list burst headroom over the 32-entry ROB. It removes the P4 4-wide qsort freelist
+# starvation (freelist_stall 37% -> ~0) where the 2-stage commit frees regs slower than
+# 4-wide dispatch allocates. 128 (not 96) because free_list.sv is a power-of-2 ring buffer.
+# phys_reg_t auto-widens 6->7; the ROB is left at 32. Default OFF is bit-identical. OOO only.
+ifeq ($(DEEP_WINDOW),1)
+	VERILATOR_CFLAGS += -DDEEP_WINDOW
+endif
+
 # ASIC=1 selects the ASAP7 7nm ASIC target (-DNIIGO_ASIC), mirroring RV64=1 for
 # datapath width. It flips the target-divergent, RESULTS-IDENTICAL knobs the ASIC
 # flow needs -- CVFPU FMA 2->3 pipe stages (niigo_fp_unit) and RAS depth 128->32

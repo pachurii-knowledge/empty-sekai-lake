@@ -97,7 +97,12 @@ module free_list
                 entries_q[i] <= phys_reg_t'(i + 32);
             end
         end else begin
-            entries_q <= entries_next;
+            // Element-wise (not whole-array `entries_q <= entries_next`): a whole
+            // unpacked-array non-blocking assign trips a Verilator V3Delayed internal
+            // error ("Unexpected LHS form") at the larger PHYS_REGS=128 array. The
+            // loop is behaviourally identical, so the default (64) build is unchanged.
+            for (int i = 0; i < PHYS_REGS; i += 1)
+                entries_q[i] <= entries_next[i];
             head_q <= head_next;
             tail_q <= tail_next;
             count_q <= count_next;
