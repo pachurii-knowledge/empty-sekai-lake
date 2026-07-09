@@ -18,10 +18,14 @@ make verilator-build OOO=1 L1D=1    # OoO + L1I + write-back L1D (fpga-memsys C2
 make verilator-build RV64=1 OOO=1 L1D=1 AXI=1  # full FPGA-equivalent path (caches + AXI4-512); boots xv6
 make verilator-build OOO=1 CCD=1    # OoO + L1I + grant-and-go MOESI L1D agent (single-core CCD arm)
 make verilator-build OOO=1 AGENT_DEBUG=1  # add +AGENT_DEBUG debug tracing
+make verilator-build RV64=1 OOO=1 RVC=1   # RV64GC (adds the RV64C compressed extension)
+make verilator-build PERF=1               # canonical OoO perf build (RV64GC + L1D + all landed perf levers)
 make verilator-clean
 ```
 
 `OOO=1` → `-DOOO_4WIDE`, `SUPERSCALAR=4` → `-DSUPERSCALAR_4WIDE`, `RV64=1` → `-DRV64` (composes with `OOO`/`SUPERSCALAR`; default unset = RV32G), `AGENT_DEBUG=1` → `-DAGENT_DEBUG`. The memory-subsystem flags (OoO only): `L1=1` → `-DL1_CACHES` (L1I), `L1D=1` → `-DL1_CACHES -DL1D_CACHE` (adds the write-back L1D + PTW-through-L1D), `AXI=1` → `-DAXI_MEMSYS` (routes the cache miss/writeback traffic through the AXI4-512 bridge + a sim AXI slave; requires the caches); `CCD=1` → `-DCCD_AGENT -DL1_CACHES` (replaces the C2 L1D with the M3d grant-and-go MOESI L1D agent — `niigo_l1d_gg` via `niigo_ccd_gg_direct #(.NACTIVE(1))` + `niigo_dir_gg`; single-core, coherence inert; **mutually exclusive with `L1D=1`** via `NIIGO_AGENT_DSIDE`). The default OoO build is still the zero-cache passthrough (the suites run against all of {none, L1, L1D, L1D+AXI}). The Verilator executable lands at `output/simulation/verilator_obj/Vtop`. Requires Verilator 5.x and a `riscv64-unknown-elf-*` toolchain on PATH.
+
+**OoO performance flags (`plans/ooo-perf.md`; all gated, default OFF = bit-identical, so the correctness baselines are unaffected):** `RVC=1` → `-DRVC` (RV64C compressed frontend; needs `RV64`); `REALIGN4=1` → `-DREALIGN4` (widen the RVC realigner 2→4 lanes so the compressed frontend feeds all 4 dispatch slots; needs `RVC`); `DEEP_WINDOW=1` → `-DDEEP_WINDOW` (`PHYS_REGS` 64→128, gives the free list burst headroom under 4-wide dispatch); `BIG_IQ=1`/`BIG_ROB=1`/`BIG_LSQ=1` → `-DBIG_*` (window depth: IQ 16→24, ROB 32→64, LSQ 16→32 — ROB/LSQ are power-of-2 rings so only pow2 sizes, and `BIG_ROB` **requires `DEEP_WINDOW`** for the `PHYS_REGS≥32+ROB` floor); `BTB=1` → `-DBTB` (fetch-directed branch target buffer); `XLATE_BYPASS=1` → `-DXLATE_BYPASS` (DTLB-hit load skips the registered head-translate stage — the biggest L1D lever, but carries an Fmax cost). **`PERF=1` is the umbrella** = `RV64GC + L1D + REALIGN4 + DEEP_WINDOW + BIG_IQ/ROB/LSQ + BTB + XLATE_BYPASS` (the canonical perf build); each flag still composes individually for A/B isolation. **Always measure OoO perf on `L1D=1` (or `PERF=1`), never the passthrough default** — passthrough's fixed 8-cycle-every-load fabricates a memory-bound signature (LOADWAIT collapses to the identity `loads×(latency−1)`) that flips window/memory/translate conclusions vs a real cache. `PERF=1` is a *functional* sim build; an FPGA/ASIC build should drop `XLATE_BYPASS` (Fmax).
 
 The **multi-core / SMP** path is not a `verilator-build` flag combo — it is built by the dedicated `ccd-*` make targets (see Test), which add `-DCCD_AGENT -DL1_CACHES -DNIIGO_EXT_DEVICES` (the last lifts CLINT/PLIC/UART to ONE shared SMP-top instance) plus `-DNCORE4`/`-DNCORE1` to pick the harness core count and `-DRV64` for the 64-bit litmi/boot. Two RTL params gate SMP behaviour and **default to single-core-verbatim**: `COHERENT` (default 0 ⇒ bit-identical single-core; 1 ⇒ agent-authoritative LR/SC + AMO resolved at the commit/directory serialization point — `riscv_core`→`riscv_core_ooo`→{LSQ, commit_unit}) and `HART_ID` (per-core `mhartid`, default 0).
 
@@ -101,3 +105,21 @@ Floating point: `niigo_fp_unit.sv` wraps the vendored CVFPU/FPnew under `src/cvf
 ## Layout
 
 `src/` RTL (cores, priv/MMU, SoC devices, the `src/mem/` memory + MOESI coherence subsystem) + testbench support + vendored CVFPU · `scripts/` ACT build/run + memory-image tooling + riscv-dv glue (`run_riscvdv.sh`) · `tests/` local `.S` tests + the `tb_ccd_*.sv` coherence/SMP harnesses · `formal/` CMurphi MOESI coherence models (`moesi_ccd*.m`, `run.sh`; git-tracked) · `act-config/` version-controlled niigo ACT DUT config (synced into the checkout via `scripts/sync_act_config.sh`) · `references/` reference RTL/PDFs + generated ACT artifacts (gitignored; its `riscv-tests` is a nested git repo) · `output/` build & sim artifacts (gitignored) · `447ref/`, `plans/`, `.cursor/` gitignored.
+
+## Working agreement (how to run long jobs)
+
+- **Background + notify, never idle-poll.** Launch builds/sims/synth with
+  run_in_background. State expected duration up front and how you'll detect
+  completion; then go quiet until it exits — do not re-check on a timer.
+- **Resource caps (this box OOMs easily).** Never `make -j` unbounded: use `-j2`
+  for the big Verilator/NCORE=2 builds. Detach heavy builds (`setsid`). Do NOT
+  run multiple compiler-spawning subagents concurrently — serialize gcc/verilator
+  or gate them behind a single build.
+- **Bash hygiene.** Use absolute paths; never `cd X && …` in a compound command.
+- **Long runs write a heartbeat** to RUN_STATUS.md (phase, elapsed, next check)
+  so I can `tail -f` it without asking you.
+- **Session boundaries.** At each completed phase, update the plan file + memory,
+  then expect a fresh session — carry all state in files, not in the transcript.
+  
+## Other instructions
+Do not include plans and iteration logs in any commit. Do not include Claude attribution in any commit.
