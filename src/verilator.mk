@@ -152,6 +152,14 @@ ifeq ($(BTB),1)
 	VERILATOR_CFLAGS += -DBTB
 endif
 
+# XLATE_BYPASS=1 lets a DTLB-hit head memory op issue the SAME cycle it presents,
+# bypassing the FB2b registered-translate stage (plans/ooo-perf.md P3 lever 1). Cuts
+# the per-mem-op xlate-wait bubble; re-opens the LSQ-head->DTLB->DataPMP->issue placed
+# path (Fmax cost). Default OFF is bit-identical (all gated by -DXLATE_BYPASS). OOO only.
+ifeq ($(XLATE_BYPASS),1)
+	VERILATOR_CFLAGS += -DXLATE_BYPASS
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

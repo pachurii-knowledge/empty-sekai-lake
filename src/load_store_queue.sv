@@ -319,6 +319,14 @@ module load_store_queue
     logic            xlate_probe_q;               // store_probe_hi_q ditto
     logic            xlate_reqv_q;                // mem_req_valid ditto
     logic            xlate_ready;                 // registered translate is current
+    // P3 lever 1 (XLATE_BYPASS): the "effective" translate the head op consumes --
+    // the registered result when it is current, else (bypass) the LIVE combinational
+    // DTLB/DataPMP result when it resolves THIS cycle (a DTLB hit / bare / a fault),
+    // so a hit issues WITHOUT the FB2b +1-cycle register bubble. Off => == xlate_*_q.
+    logic [XLEN-1:0] xlate_pa_eff;
+    logic            xlate_fault_eff;
+    logic            xlate_stall_eff;
+    logic            xlate_ready_eff;
 
     assign full = (count_q > MEM_Q_SIZE - OOO_WIDTH);
     assign store_port_busy = double_store_pending_q;
@@ -448,9 +456,37 @@ module load_store_queue
         // translate from a different head (or a walk transition) is never consumed.
         xlate_ready = xlate_reqv_q && mem_req_valid &&
             (xlate_head_q == head_q) && (xlate_probe_q == store_probe_hi_q);
-        head_xlate_ok  = !xlate_fault_q && xlate_ready &&
-            (!paging_data || (head_match && !xlate_stall_q));
-        head_xlate_flt = head_match && xlate_ready && xlate_fault_q;
+        // Effective translate = registered when current, else (XLATE_BYPASS) the live
+        // combinational DTLB/DataPMP result when it resolves this cycle (a hit or a
+        // fault -- i.e. NOT a walk-stall), letting the head op issue/fault the SAME
+        // cycle it presents. A DTLB miss (xlate_stall) or a not-yet-live translate
+        // falls back to the registered/PTW path. Off (no -DXLATE_BYPASS) the _eff
+        // signals are exactly xlate_*_q => bit-identical. The bypass re-opens the
+        // LSQ-head -> DTLB -> DataPMP -> issue placed path (FB2b Fmax cost; Quick-place
+        // before FPGA use). mem_req_vaddr already carries the probe offset, so the
+        // two-beat store's high-word probe bypasses correctly too (atomicity preserved
+        // by store_probe_hi sequencing, not by the translate stage).
+        xlate_pa_eff    = xlate_pa_q;
+        xlate_fault_eff = xlate_fault_q;
+        xlate_stall_eff = xlate_stall_q;
+        xlate_ready_eff = xlate_ready;
+`ifdef XLATE_BYPASS
+        // Restrict the bypass to PLAIN LOADS (not stores / AMO / LR / SC): those carry
+        // the ordering-sensitive commit-write + reservation state the FB2b register
+        // stage was implicitly sequencing. A plain load at the head has all older ops
+        // drained, so issuing it a cycle early cannot reorder against an older store.
+        if (!xlate_ready && mem_req_valid && head_match && !xlate_stall &&
+                headq.entry.ctrl.memRead && !headq.entry.ctrl.memWrite &&
+                (headq.entry.ctrl.exec_class != EXEC_AMO)) begin
+            xlate_pa_eff    = xlate_pa;
+            xlate_fault_eff = xlate_fault;
+            xlate_stall_eff = 1'b0;
+            xlate_ready_eff = 1'b1;
+        end
+`endif
+        head_xlate_ok  = !xlate_fault_eff && xlate_ready_eff &&
+            (!paging_data || (head_match && !xlate_stall_eff));
+        head_xlate_flt = head_match && xlate_ready_eff && xlate_fault_eff;
 
         // The per-op head blocks below write the single head entry via head_delta
         // (sparse per-field write-enables) instead of indexing entries_premerge,
@@ -525,7 +561,7 @@ module load_store_queue
                 if (load_writeback.data == '0) begin
                     // SC succeeds: capture its PA for the commit write-back.
                     head_delta.we_store_lo_pa = 1'b1;
-                    head_delta.store_lo_pa = xlate_pa_q;
+                    head_delta.store_lo_pa = xlate_pa_eff;
                     head_delta.we_issued_load = 1'b1;
                     head_delta.issued_load = 1'b1;
                     reservation_valid_mid = 1'b0;
@@ -547,7 +583,7 @@ module load_store_queue
                 load_writeback.branch_mask = headq.entry.branch_mask;
                 load_writeback.has_dest = 1'b0;
                 head_delta.we_store_lo_pa = 1'b1;
-                head_delta.store_lo_pa = xlate_pa_q;
+                head_delta.store_lo_pa = xlate_pa_eff;
                 head_delta.we_issued_load = 1'b1;
                 head_delta.issued_load = 1'b1;
             end
@@ -648,7 +684,7 @@ module load_store_queue
             load_writeback.branch_mask = headq.entry.branch_mask;
             load_writeback.has_dest = 1'b0;
             head_delta.we_store_lo_pa = 1'b1;
-            head_delta.store_lo_pa = xlate_pa_q;
+            head_delta.store_lo_pa = xlate_pa_eff;
             head_delta.we_issued_load = 1'b1;
             head_delta.issued_load = 1'b1;
         end
@@ -673,7 +709,7 @@ module load_store_queue
             // Capture the PA for an AMO's write-back beat (same address it read);
             // harmless for a pure load.
             head_delta.we_store_lo_pa = 1'b1;
-            head_delta.store_lo_pa = xlate_pa_q;
+            head_delta.store_lo_pa = xlate_pa_eff;
             head_delta.we_issued_load = 1'b1;
             head_delta.issued_load = 1'b1;
             mem_inflight_next = 1'b1;
@@ -697,7 +733,7 @@ module load_store_queue
                 // Single-beat store proven translatable: latch its PA and mark
                 // it complete. The commit write below uses this latched PA.
                 head_delta.we_store_lo_pa = 1'b1;
-                head_delta.store_lo_pa = xlate_pa_q;
+                head_delta.store_lo_pa = xlate_pa_eff;
                 load_writeback.valid = 1'b1;
                 load_writeback.active_id = headq.entry.active_id;
                 load_writeback.branch_mask = headq.entry.branch_mask;
@@ -708,12 +744,12 @@ module load_store_queue
                 // Low word translated OK: capture its PA, then probe the high
                 // word next cycle.
                 head_delta.we_store_lo_pa = 1'b1;
-                head_delta.store_lo_pa = xlate_pa_q;
+                head_delta.store_lo_pa = xlate_pa_eff;
                 store_probe_hi_next = 1'b1;
             end else begin
                 // High word translated OK; capture its PA and complete.
                 head_delta.we_store_hi_pa = 1'b1;
-                head_delta.store_hi_pa = xlate_pa_q;
+                head_delta.store_hi_pa = xlate_pa_eff;
                 load_writeback.valid = 1'b1;
                 load_writeback.active_id = headq.entry.active_id;
                 load_writeback.branch_mask = headq.entry.branch_mask;
