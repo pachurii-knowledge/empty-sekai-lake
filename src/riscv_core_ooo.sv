@@ -727,14 +727,14 @@ module riscv_core_ooo
     // 32-bit instructions/cycle with true 2-byte-granular PCs. Under -DRVC the
     // fgrp_fault_lane carried through the buffer is ABSOLUTE per-4B-word (see the
     // FetchPMP fork below), which the realigner maps to each instruction.
-    logic [1:0]            rvc_lane_valid;
-    logic [1:0][XLEN-1:0]  rvc_lane_pc;
-    logic [1:0][31:0]      rvc_lane_instr;
-    logic [1:0]            rvc_lane_is_comp;
-    logic [1:0]            rvc_lane_fault;
-    logic [1:0]            rvc_lane_fault_hi;
-    logic [1:0][4:0]       rvc_lane_cause;
-    logic [1:0][15:0]      rvc_lane_parcel;
+    logic [`RVC_NLANES-1:0]            rvc_lane_valid;
+    logic [`RVC_NLANES-1:0][XLEN-1:0]  rvc_lane_pc;
+    logic [`RVC_NLANES-1:0][31:0]      rvc_lane_instr;
+    logic [`RVC_NLANES-1:0]            rvc_lane_is_comp;
+    logic [`RVC_NLANES-1:0]            rvc_lane_fault;
+    logic [`RVC_NLANES-1:0]            rvc_lane_fault_hi;
+    logic [`RVC_NLANES-1:0][4:0]       rvc_lane_cause;
+    logic [`RVC_NLANES-1:0][15:0]      rvc_lane_parcel;
     logic                  rvc_consume_block;
     logic                  rvc_block_drained;
     logic                  rvc_btb_terminate;

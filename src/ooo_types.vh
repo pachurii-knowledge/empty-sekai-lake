@@ -4,6 +4,18 @@
 `include "internal_defines.vh"
 `include "riscv_isa.vh"
 
+// RV64C realign lane count (P4). Default 2-wide expand-before-decode realigner;
+// -DREALIGN4 widens the realigner and its decode/wire consumers to 4 lanes so the
+// RVC frontend can feed all 4 backend dispatch slots. Preprocessor macro (not a
+// package localparam) because it sizes module ports. Consumed by rvc_realign.sv,
+// ooo_fetch_decode.sv, and riscv_core_ooo.sv. Default keeps the 2-wide path
+// behaviourally bit-identical.
+`ifdef REALIGN4
+  `define RVC_NLANES 4
+`else
+  `define RVC_NLANES 2
+`endif
+
 package OOO_Types;
 
     // Pull in the shared control/ALU types from their package (not $unit) so the

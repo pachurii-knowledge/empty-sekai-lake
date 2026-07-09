@@ -23,12 +23,18 @@
  */
 `ifdef RVC
 
+`include "ooo_types.vh"   // brings in the `RVC_NLANES lane-count macro (P4)
+
 `default_nettype none
 
 module rvc_realign
     import OOO_Types::*;
     import RISCV_UArch::MEMORY_READ_WIDTH;
-(
+#(
+    // Emitted lanes: 2 (default) or 4 under -DREALIGN4. Sized from the shared
+    // macro so ports/body agree with ooo_fetch_decode + riscv_core_ooo.
+    parameter int NL = `RVC_NLANES
+)(
     input  wire logic                        clk,
     input  wire logic                        rst_l,
 
@@ -41,7 +47,7 @@ module rvc_realign
     input  wire logic [4:0]                  fgrp_fault_cause,
 
     // ---- backend feedback ----
-    input  wire logic [2:0]                  dispatch_count, // emitted lanes actually dispatched (0..2)
+    input  wire logic [2:0]                  dispatch_count, // emitted lanes actually dispatched (0..NL)
     input  wire logic                        frontend_hold,  // stall/halt: freeze, no consume
     input  wire logic                        fetch_flush,    // any redirect: reset drain + straddle
 
@@ -49,15 +55,15 @@ module rvc_realign
     input  wire logic                        btb_hit_in,   // this block was BTB-steered to a target
     input  wire logic [2:0]                  btb_off_in,   // last in-block parcel of the predicted branch
 
-    // ---- two aligned + expanded lanes ----
-    output logic [1:0]                       out_valid,
-    output logic [1:0][XLEN-1:0]             out_pc,
-    output logic [1:0][31:0]                 out_instr,      // canonical 32-bit
-    output logic [1:0]                       out_is_compressed,
-    output logic [1:0]                       out_fetch_fault,
-    output logic [1:0]                       out_fetch_fault_hi,
-    output logic [1:0][4:0]                  out_fault_cause,
-    output logic [1:0][15:0]                 out_rvc_parcel, // raw parcel (illegal-compressed mtval)
+    // ---- NL aligned + expanded lanes (NL = 2 default, 4 under -DREALIGN4) ----
+    output logic [NL-1:0]                    out_valid,
+    output logic [NL-1:0][XLEN-1:0]          out_pc,
+    output logic [NL-1:0][31:0]              out_instr,      // canonical 32-bit
+    output logic [NL-1:0]                    out_is_compressed,
+    output logic [NL-1:0]                    out_fetch_fault,
+    output logic [NL-1:0]                    out_fetch_fault_hi,
+    output logic [NL-1:0][4:0]               out_fault_cause,
+    output logic [NL-1:0][15:0]              out_rvc_parcel, // raw parcel (illegal-compressed mtval)
 
     // ---- frontend control ----
     output logic                             rvc_consume_block,   // pop the presented group
@@ -102,6 +108,13 @@ module rvc_realign
     logic        exp0_ill, exp1_ill;   // (illegal already carried as {0,c} in exp*_x)
     rvc_expand exp0 (.c(lane0_par), .x(exp0_x), .illegal(exp0_ill));
     rvc_expand exp1 (.c(lane1_par), .x(exp1_x), .illegal(exp1_ill));
+`ifdef REALIGN4
+    logic [15:0] lane2_par, lane3_par;
+    logic [31:0] exp2_x, exp3_x;
+    logic        exp2_ill, exp3_ill;
+    rvc_expand exp2 (.c(lane2_par), .x(exp2_x), .illegal(exp2_ill));
+    rvc_expand exp3 (.c(lane3_par), .x(exp3_x), .illegal(exp3_ill));
+`endif
 
     // bounded high-half fetch of a 32-bit instruction starting at parcel p
     function automatic logic [15:0] hi_parcel(input logic [2:0] p);
@@ -185,6 +198,7 @@ module rvc_realign
     logic [2:0]  l1_lo_w, l1_hi_w;
     logic [2:0]  l1_last;       // P2b: last in-block parcel of lane1's instruction
     logic        btb_term1;     // P2b: lane1 IS the BTB-predicted terminating branch
+    logic [3:0]  l1_next;       // P4: start parcel of the instr after lane1 (feeds lane2)
 
     assign s1  = l0_next;
     assign s1b = s1[2:0];
@@ -203,6 +217,7 @@ module rvc_realign
         out_fetch_fault_hi[1] = 1'b0;
         out_fault_cause[1]    = fgrp_fault_cause;
         l1_parcels            = 2'd0;
+        l1_next               = s1;   // no-emit / tail: next lane sees no advance
 
         // lane1 only exists if lane0 emitted a real instruction and there is
         // room left in the block (s1 <= 7; s1 == 8 means the block is exhausted).
@@ -217,6 +232,7 @@ module rvc_realign
                 out_instr[1]          = {hi_parcel(s1b), pblock[s1b]};
                 out_is_compressed[1]  = 1'b0;
                 l1_parcels            = 2'd2;
+                l1_next               = s1 + 4'd2;
                 out_fetch_fault[1]    = fgrp_fault_word[l1_lo_w] | fgrp_fault_word[l1_hi_w];
                 out_fetch_fault_hi[1] = fgrp_fault_word[l1_hi_w] & ~fgrp_fault_word[l1_lo_w];
             end else begin
@@ -225,6 +241,7 @@ module rvc_realign
                 out_is_compressed[1]  = 1'b1;
                 out_rvc_parcel[1]     = lane1_par;
                 l1_parcels            = 2'd1;
+                l1_next               = s1 + 4'd1;
                 out_fetch_fault[1]    = fgrp_fault_word[l1_lo_w];
             end
         end
@@ -235,24 +252,149 @@ module rvc_realign
         btb_term1 = btb_hit_in && out_valid[1] && (l1_last == btb_off_in);
     end
 
+`ifdef REALIGN4
+    // ---------------- lane 2 (P4: mirrors lane1, start = l1_next) ----------------
+    logic        l2_is32;
+    logic [1:0]  l2_parcels;
+    logic        l2_tail;
+    logic [3:0]  s2;            // 0..8; lane2 only valid when s2 <= 7
+    logic [2:0]  s2b;
+    logic [2:0]  l2_lo_w, l2_hi_w;
+    logic [2:0]  l2_last;
+    logic        btb_term2;
+    logic [3:0]  l2_next;       // start parcel of the instr after lane2 (feeds lane3)
+    logic        term_before2;  // an older lane in this block already terminated
+
+    assign s2  = l1_next;
+    assign s2b = s2[2:0];
+    assign lane2_par    = pblock[s2b];
+    assign term_before2 = btb_term0 || btb_term1;
+    always_comb begin
+        l2_is32   = (lane2_par[1:0] == 2'b11);
+        l2_lo_w   = s2[3:1];
+        l2_hi_w   = ({1'b0, s2b} + 4'd1) >> 1;
+        l2_tail   = 1'b0;
+        out_valid[2]          = 1'b0;
+        out_pc[2]             = base + {s2b, 1'b0};
+        out_instr[2]          = 32'h0000_0013;
+        out_is_compressed[2]  = 1'b0;
+        out_rvc_parcel[2]     = 16'h0000;
+        out_fetch_fault[2]    = 1'b0;
+        out_fetch_fault_hi[2] = 1'b0;
+        out_fault_cause[2]    = fgrp_fault_cause;
+        l2_parcels            = 2'd0;
+        l2_next               = s2;
+
+        // lane2 exists only if lane1 emitted, no older lane terminated, and there
+        // is room left in the block.
+        if (out_valid[1] && !term_before2 && (s2 <= 4'd7) && fgrp_valid && !fgrp_excpt) begin
+            if (l2_is32 && (s2b == 3'd7)) begin
+                out_valid[2] = 1'b0;
+                l2_tail      = 1'b1;
+            end else if (l2_is32) begin
+                out_valid[2]          = 1'b1;
+                out_instr[2]          = {hi_parcel(s2b), pblock[s2b]};
+                out_is_compressed[2]  = 1'b0;
+                l2_parcels            = 2'd2;
+                l2_next               = s2 + 4'd2;
+                out_fetch_fault[2]    = fgrp_fault_word[l2_lo_w] | fgrp_fault_word[l2_hi_w];
+                out_fetch_fault_hi[2] = fgrp_fault_word[l2_hi_w] & ~fgrp_fault_word[l2_lo_w];
+            end else begin
+                out_valid[2]          = 1'b1;
+                out_instr[2]          = exp2_x;
+                out_is_compressed[2]  = 1'b1;
+                out_rvc_parcel[2]     = lane2_par;
+                l2_parcels            = 2'd1;
+                l2_next               = s2 + 4'd1;
+                out_fetch_fault[2]    = fgrp_fault_word[l2_lo_w];
+            end
+        end
+        l2_last   = l2_is32 ? (s2b + 3'd1) : s2b;
+        btb_term2 = btb_hit_in && out_valid[2] && (l2_last == btb_off_in);
+    end
+
+    // ---------------- lane 3 (P4: mirrors lane1, start = l2_next; last lane) ----------------
+    logic        l3_is32;
+    logic [1:0]  l3_parcels;
+    logic        l3_tail;
+    logic [3:0]  s3;
+    logic [2:0]  s3b;
+    logic [2:0]  l3_lo_w, l3_hi_w;
+    logic [2:0]  l3_last;
+    logic        btb_term3;
+    logic        term_before3;
+
+    assign s3  = l2_next;
+    assign s3b = s3[2:0];
+    assign lane3_par    = pblock[s3b];
+    assign term_before3 = btb_term0 || btb_term1 || btb_term2;
+    always_comb begin
+        l3_is32   = (lane3_par[1:0] == 2'b11);
+        l3_lo_w   = s3[3:1];
+        l3_hi_w   = ({1'b0, s3b} + 4'd1) >> 1;
+        l3_tail   = 1'b0;
+        out_valid[3]          = 1'b0;
+        out_pc[3]             = base + {s3b, 1'b0};
+        out_instr[3]          = 32'h0000_0013;
+        out_is_compressed[3]  = 1'b0;
+        out_rvc_parcel[3]     = 16'h0000;
+        out_fetch_fault[3]    = 1'b0;
+        out_fetch_fault_hi[3] = 1'b0;
+        out_fault_cause[3]    = fgrp_fault_cause;
+        l3_parcels            = 2'd0;
+
+        if (out_valid[2] && !term_before3 && (s3 <= 4'd7) && fgrp_valid && !fgrp_excpt) begin
+            if (l3_is32 && (s3b == 3'd7)) begin
+                out_valid[3] = 1'b0;
+                l3_tail      = 1'b1;
+            end else if (l3_is32) begin
+                out_valid[3]          = 1'b1;
+                out_instr[3]          = {hi_parcel(s3b), pblock[s3b]};
+                out_is_compressed[3]  = 1'b0;
+                l3_parcels            = 2'd2;
+                out_fetch_fault[3]    = fgrp_fault_word[l3_lo_w] | fgrp_fault_word[l3_hi_w];
+                out_fetch_fault_hi[3] = fgrp_fault_word[l3_hi_w] & ~fgrp_fault_word[l3_lo_w];
+            end else begin
+                out_valid[3]          = 1'b1;
+                out_instr[3]          = exp3_x;
+                out_is_compressed[3]  = 1'b1;
+                out_rvc_parcel[3]     = lane3_par;
+                l3_parcels            = 2'd1;
+                out_fetch_fault[3]    = fgrp_fault_word[l3_lo_w];
+            end
+        end
+        l3_last   = l3_is32 ? (s3b + 3'd1) : s3b;
+        btb_term3 = btb_hit_in && out_valid[3] && (l3_last == btb_off_in);
+    end
+`endif
+
     // The block TERMINATES -- rvc_block_drained asserts and the block consumes -- the
     // cycle the predicted branch actually dispatches (its lane is in the dispatched
     // set). Continuous: reads only the block-local term vars + dispatch_count.
     assign rvc_btb_terminate = (btb_term0 && (dispatch_count >= 3'd1)) ||
-                               (btb_term1 && (dispatch_count >= 3'd2));
+                               (btb_term1 && (dispatch_count >= 3'd2))
+`ifdef REALIGN4
+                            || (btb_term2 && (dispatch_count >= 3'd3))
+                            || (btb_term3 && (dispatch_count >= 3'd4))
+`endif
+                               ;
 
     // ---------------- consume / hold / straddle-latch ----------------
-    logic [2:0] parcels_dispatched;   // in-block parcels of the dispatched lanes
+    logic [3:0] parcels_dispatched;   // in-block parcels of the dispatched lanes (<= 8)
     logic [3:0] ptr_after;
     logic       tail_straddle;
     logic       tail_straddle_eff;    // P2b: straddle only if the block was NOT terminated
     logic       completion_dispatched;
 
     always_comb begin
-        parcels_dispatched = 3'd0;
-        if (dispatch_count >= 3'd1) parcels_dispatched += {1'b0, l0_parcels};
-        if (dispatch_count >= 3'd2) parcels_dispatched += {1'b0, l1_parcels};
-        ptr_after = {1'b0, s0} + {1'b0, parcels_dispatched};
+        parcels_dispatched = 4'd0;
+        if (dispatch_count >= 3'd1) parcels_dispatched += {2'b0, l0_parcels};
+        if (dispatch_count >= 3'd2) parcels_dispatched += {2'b0, l1_parcels};
+`ifdef REALIGN4
+        if (dispatch_count >= 3'd3) parcels_dispatched += {2'b0, l2_parcels};
+        if (dispatch_count >= 3'd4) parcels_dispatched += {2'b0, l3_parcels};
+`endif
+        ptr_after = {1'b0, s0} + parcels_dispatched;
         // A block-boundary straddle: the next instruction begins at parcel 7 and
         // is a 32-bit low half.
         tail_straddle = (ptr_after == 4'd7) && (pblock[7][1:0] == 2'b11);
@@ -347,9 +489,15 @@ module rvc_realign
     end
 
     // Silence unused-signal lints for the expander illegal outputs (illegal is
-    // already carried inside exp*_x as {16'h0000, parcel}).
+    // already carried inside exp*_x as {16'h0000, parcel}) and the tail flags.
     logic _unused;
-    assign _unused = &{1'b0, exp0_ill, exp1_ill, l0_tail, l1_tail};
+`ifdef REALIGN4
+    assign _unused = &{1'b0, exp0_ill, exp1_ill, exp2_ill, exp3_ill,
+                       l0_tail, l1_tail, l2_tail, l3_tail};
+`else
+    // 2-wide: l1_next is computed but has no lane2 consumer.
+    assign _unused = &{1'b0, exp0_ill, exp1_ill, l0_tail, l1_tail, l1_next};
+`endif
 
 endmodule : rvc_realign
 

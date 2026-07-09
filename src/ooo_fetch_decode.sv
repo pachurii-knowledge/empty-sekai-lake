@@ -18,18 +18,19 @@ module ooo_fetch_decode
     input wire logic [XLEN-1:0]  fetch_pc,
     input wire logic [3:0][31:0] instr,
 `ifdef RVC
-    // RV64C: pre-aligned + expanded lanes from rvc_realign (2-wide). Under -DRVC
-    // these fully replace the fixed 4-byte window: instr/fetch_pc/fetch_fault_lane
-    // are ignored and the realigner supplies each lane's PC, canonical 32-bit
-    // encoding, length flag, per-instruction fetch fault, and raw parcel.
-    input wire logic [1:0]            rvc_valid,
-    input wire logic [1:0][XLEN-1:0]  rvc_pc,
-    input wire logic [1:0][31:0]      rvc_instr,
-    input wire logic [1:0]            rvc_is_compressed,
-    input wire logic [1:0]            rvc_fetch_fault,
-    input wire logic [1:0]            rvc_fetch_fault_hi,
-    input wire logic [1:0][4:0]       rvc_fault_cause,
-    input wire logic [1:0][15:0]      rvc_parcel,
+    // RV64C: pre-aligned + expanded lanes from rvc_realign (`RVC_NLANES-wide: 2 by
+    // default, 4 under -DREALIGN4). Under -DRVC these fully replace the fixed 4-byte
+    // window: instr/fetch_pc/fetch_fault_lane are ignored and the realigner supplies
+    // each lane's PC, canonical 32-bit encoding, length flag, per-instruction fetch
+    // fault, and raw parcel.
+    input wire logic [`RVC_NLANES-1:0]            rvc_valid,
+    input wire logic [`RVC_NLANES-1:0][XLEN-1:0]  rvc_pc,
+    input wire logic [`RVC_NLANES-1:0][31:0]      rvc_instr,
+    input wire logic [`RVC_NLANES-1:0]            rvc_is_compressed,
+    input wire logic [`RVC_NLANES-1:0]            rvc_fetch_fault,
+    input wire logic [`RVC_NLANES-1:0]            rvc_fetch_fault_hi,
+    input wire logic [`RVC_NLANES-1:0][4:0]       rvc_fault_cause,
+    input wire logic [`RVC_NLANES-1:0][15:0]      rvc_parcel,
 `endif
     output decode_lane_t     decode_lanes [OOO_WIDTH]
 );
@@ -61,10 +62,11 @@ module ooo_fetch_decode
     always_comb begin
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
 `ifdef RVC
-            // Only lanes 0/1 exist (the realigner is two-wide); 2/3 are forced
-            // invalid NOPs so the control/fault chains and dispatch accounting
-            // stay well-defined against the 4-wide backend.
-            if (i < 2) begin
+            // The realigner supplies `RVC_NLANES lanes (2 by default, 4 under
+            // -DREALIGN4); any lanes beyond that are forced invalid NOPs so the
+            // control/fault chains and dispatch accounting stay well-defined against
+            // the 4-wide backend.
+            if (i < `RVC_NLANES) begin
                 lane_present[i]       = rvc_valid[i];
                 raw_decode_instr[i]   = rvc_valid[i] ? rvc_instr[i] : 32'h0000_0013;
                 lane_pc[i]            = rvc_pc[i];

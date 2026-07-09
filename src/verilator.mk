@@ -132,6 +132,18 @@ endif
 	VERILATOR_CFLAGS += -DRVC
 endif
 
+# REALIGN4=1 widens the RV64C expand-before-decode realigner from 2 to 4 lanes
+# (plans/ooo-perf.md P4), so the compressed frontend can feed all 4 backend
+# dispatch slots. It reconciles with the P2b offset-precise BTB termination (the
+# terminate/parcel accounting gain lane-2/3 terms). Requires RVC; default OFF is
+# behaviourally identical to the 2-wide realigner (all gated by -DREALIGN4). OOO only.
+ifeq ($(REALIGN4),1)
+ifneq ($(RVC),1)
+$(error REALIGN4=1 requires RVC=1 (it widens the RV64C realigner))
+endif
+	VERILATOR_CFLAGS += -DREALIGN4
+endif
+
 # ASIC=1 selects the ASAP7 7nm ASIC target (-DNIIGO_ASIC), mirroring RV64=1 for
 # datapath width. It flips the target-divergent, RESULTS-IDENTICAL knobs the ASIC
 # flow needs -- CVFPU FMA 2->3 pipe stages (niigo_fp_unit) and RAS depth 128->32
