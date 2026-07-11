@@ -246,6 +246,18 @@ ifeq ($(ALU4),1)
 	VERILATOR_CFLAGS += -DALU4
 endif
 
+# LSQ_MLP2=1 (Track A, plans/track-a-mlp.md): non-blocking L1D / memory-level
+# parallelism -- lifts the LSQ single-outstanding-load limit to 2 (LSQ_MLP=2).
+# OoO + L1D only (a real cache is required for miss overlap to matter; passthrough's
+# fixed-latency FIFO is not the target). A coherent build FORCES LSQ_MLP=1 in RTL
+# (the LSQ CCD/COHERENT pin) -- 2 in-flight loads open an RVWMO load-load reorder
+# window with no 9.11 squash -- so this composes with CCD only as an inert no-op.
+# Default OFF is bit-identical (all gated by -DLSQ_MLP2). Functional sim lever like
+# XLATE_BYPASS (an FPGA/ASIC build likely drops it).
+ifeq ($(LSQ_MLP2),1)
+	VERILATOR_CFLAGS += -DLSQ_MLP2
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

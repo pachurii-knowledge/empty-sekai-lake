@@ -155,6 +155,31 @@ module load_store_queue
     // Byte-address -> word-address shift for the word-granular memory bus.
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
 
+    // Track A (plans/track-a-mlp.md): LSQ_MLP = the number of loads allowed
+    // outstanding at the memory port. -DLSQ_MLP2 raises it to 2 (non-blocking L1D).
+    // CCD/COHERENT PIN (correctness-critical, compile-time): a coherent build is
+    // FORCED back to 1 -- two in-flight loads open an RVWMO load-load reorder window
+    // with no 9.11-style inflight-load squash. CCD_AGENT is a macro, COHERENT a
+    // param, so both are folded here (COHERENT can only be checked at elaboration).
+    // LSQ_MLP==1 => the whole Track-A path is bit-identical to the single-outstanding
+    // design (id fields const-0, issue_ptr==head).
+`ifdef LSQ_MLP2
+  `ifdef CCD_AGENT
+    localparam int LSQ_MLP_REQ = 1;
+  `else
+    localparam int LSQ_MLP_REQ = 2;
+  `endif
+`else
+    localparam int LSQ_MLP_REQ = 1;
+`endif
+    localparam int LSQ_MLP  = COHERENT ? 1 : LSQ_MLP_REQ;
+    localparam int LSQ_ID_W = (LSQ_MLP > 1) ? $clog2(LSQ_MLP) : 1;
+    // Compile-time guard: the coherent path must never elaborate MLP>1.
+    initial begin
+        if (COHERENT && (LSQ_MLP != 1))
+            $fatal(1, "load_store_queue: COHERENT build must pin LSQ_MLP=1 (got %0d)", LSQ_MLP);
+    end
+
     // M3d Stage 2: dmem_req_op codes (see the port comment). The CCD adapter maps
     // these to l1_core_op_e; keep the two in lockstep.
     localparam logic [2:0] DMEM_OP_LOAD   = 3'd0;
