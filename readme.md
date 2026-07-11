@@ -1,9 +1,7 @@
 # empty-sekai-lake
 
 `empty-sekai-lake` or `niigo-lake` is a SystemVerilog RISC-V processor project with
-both simple in-order cores and a 4-wide out-of-order core. The datapath width is a
-build-time switch: the default build is **RV32G**, and `-DRV64` (`RV64=1`) selects a
-**RV64G** datapath with Sv39 virtual memory. Both widths carry the M/S/U privilege
+both simple in-order cores and a 4-wide out-of-order core. The datapath width is a build-time switch threaded through every module from `RISCV_ISA::XLEN`: the base build is **RV32G** (Sv32), and `-DRV64` (`RV64=1`) selects a **RV64G** datapath with Sv39 virtual memory. The reference configuration of the out-of-order core — the one the microarchitecture description below assumes unless noted — is the `PERF=1` build: **RV64GC + Sv39** (RV64G plus the `C` compressed extension), with split L1 instruction/data caches and the full landed performance-lever stack. The base RV32G/RV64G builds and every individual lever remain build-gated (see *Build and Test*). Both widths carry the M/S/U privilege
 levels and a small system-on-chip device bus (CLINT, PLIC, NS16550A UART). The current
 verification focus is the out-of-order core, built with Verilator and run against the
 RISC-V architectural tests at both widths.
@@ -24,12 +22,13 @@ infrastructures of the same course.
 `empty-sekai-lake` is named after the lake in `Nightcord at 25:00`'s Sekai.
 ## Bring-up status
 
-- **RV32G** (default build): the OoO core passes `247/247` of the RV32G architectural
+- **RV32G** (base build): the OoO core passes `247/247` of the RV32G architectural
   suite plus the Sv32 privileged/translation tests, with no regression. This remains the
   live regression anchor through the RV64 migration.
 - **RV64G** (`RV64=1`): the scalar and OoO cores pass the rv64 architectural suite
   (`289/289` unprivileged: `ui/um/ua/uf/ud`) plus the Sv39 privileged tests
-  (signature-verified; see *Build and Test*).
+  (signature-verified; see *Build and Test*). The reference `PERF=1` build (RV64GC OoO
+  + L1D) additionally passes the wider **RV64GC** architectural suite `333/333`.
 - **Operating system**: the `RV64=1 OOO=1` core boots **xv6-riscv** (RV64G + Sv39, no
   `C`) from M-mode reset, through `mret` into the S-mode kernel, Sv39 paging with
   hardware A/D updates (Svadu), the scheduler, `init`, and the shell, to the interactive
@@ -69,7 +68,7 @@ XLEN is selected at build time (`-DRV64`) and threaded through every module from
 `RISCV_ISA::XLEN`; the privileged and MMU RTL is shared between the two widths and
 selects its geometry off `MXLEN == XLEN`.
 
-### RV32G (default)
+### RV32G (base build)
 
 - `I`: base RV32I integer instructions
 - `M`: integer multiply/divide
@@ -78,7 +77,7 @@ selects its geometry off `MXLEN == XLEN`.
 - `Zicsr`: CSR instructions
 - `Zifencei`: instruction fence
 
-### RV64G (`RV64=1`)
+### RV64G / RV64GC (`RV64=1`, `+RVC=1`)
 
 The RV32G coverage above, widened to 64-bit, plus the RV64-only instructions:
 
@@ -91,6 +90,10 @@ The RV32G coverage above, widened to 64-bit, plus the RV64-only instructions:
 - `F`/`D`: CVFPU built in the `RV64D` configuration, adding the 64-bit integer
   conversions `FCVT.L/LU.{S,D}` and `FCVT.{S,D}.L/LU` and the 64-bit moves
   `FMV.X.D`/`FMV.D.X`.
+- `C`: the RVC compressed (16-bit) instruction extension — RV64-only, gated by `RVC=1`
+  (`-DRVC`). It is **enabled in the reference `PERF` build**, making that configuration
+  **RV64GC**. Compressed parcels are expanded to their 32-bit encodings in a pre-decode
+  realigner (2 lanes by default, 4 under `REALIGN4`, which `PERF` also enables).
 
 ### Privileged architecture (both widths)
 
@@ -103,7 +106,7 @@ The RV32G coverage above, widened to 64-bit, plus the RV64-only instructions:
 ### Validation snapshot
 
 ```sh
-# RV32G (default OoO build): expected 247/247
+# RV32G (base OoO build): expected 247/247
 make verilator-build OOO=1
 python3 scripts/run_riscv_suite.py \
   --extensions I,M,F,D,Zaamo,Zalrsc,Zicsr,Zifencei \
@@ -111,27 +114,45 @@ python3 scripts/run_riscv_suite.py \
 
 # RV64G (RV64=1 OoO build): expected 289/289 unprivileged
 make verilator-build RV64=1 OOO=1
+
+# PERF (reference config): RV64GC OoO + L1D + full lever stack — expected RV64GC ACT 333/333
+make verilator-build PERF=1
+python3 scripts/run_riscv_suite.py \
+  --elf-dir references/riscv-tests/work/niigo-rv64gc/elfs \
+  --extensions I,M,F,D,Zaamo,Zalrsc,Zicsr,Zifencei,Zca,Zcd,MisalignZca \
+  --jobs 8 --timeout 120 --output output/riscv-tests-rv64gc
 ```
 
 ## Microarchitectural Overview
 
 The out-of-order implementation is centered on `src/riscv_core_ooo.sv`. It fetches and
 decodes up to four instructions per cycle, renames architectural integer registers onto
-a 64-entry physical register file, tracks in-flight work in a 32-entry active list, and
+a 128-entry physical register file, tracks in-flight work in a 64-entry active list, and
 issues operations to independent functional units. The datapath, register file, and
 pipeline structures are all `XLEN`-wide, so the same RTL builds as either a 32- or
 64-bit core.
 
-The main OoO sizing parameters live in `src/ooo_types.vh`:
+Unless a value is explicitly marked otherwise, this section describes the out-of-order
+core in its **reference `PERF=1` configuration** — **RV64GC + Sv39** with split L1
+instruction/data caches and the full landed performance-lever stack. Where a perf lever
+changes a size or feature, the `PERF` value is given first with the base default (and the
+flag that sets it) in parentheses; the base RV32G/RV64G defaults and every individual flag
+are documented under *Build and Test*.
+
+The main OoO sizing parameters (base defaults in `src/ooo_types.vh`, shown here at their
+`PERF` values with the base default and enabling flag in parentheses):
 
 - Dispatch width: `4`
-- Physical integer registers: `64`
-- Active list entries: `32`
-- Integer issue queue entries: `16`
-- Memory queue entries: `16`
-- Branch checkpoints: `4`
-- Issue ports: ALU0, ALU1, MUL, DIV, FP
-- Writeback sources: ALU0, ALU1, load/store, multiply, divide, FP
+- Physical integer registers: `128` (base default `64`; `DEEP_WINDOW`)
+- Active list entries: `64` (base default `32`; `BIG_ROB`, which requires `DEEP_WINDOW`)
+- Integer issue queue entries: `24` (base default `16`; `BIG_IQ`)
+- Memory queue entries: `32` (base default `16`; `BIG_LSQ`)
+- Branch checkpoints: `4` (unchanged under `PERF`; `BIG_BSTACK` doubles this to `8` but is
+  measured-neutral and is not part of the umbrella)
+- Issue ports: ALU0, ALU1, ALU2, MUL, DIV, FP (the third ALU port, ALU2, comes from
+  `ALU4`, folded into `PERF`; the base build has two ALU ports)
+- Writeback sources: ALU0, ALU1, ALU2, load/store, multiply, divide, FP (ALU2 present under
+  `PERF`; the base build has no ALU2)
 
 The build also provides a small in-order scalar core (`src/riscv_core_scalar.sv`, the
 default-flag core and the first target for each RV64 datapath feature) and a
@@ -140,10 +161,15 @@ conservative 4-wide in-order core (`src/riscv_core_4wide.sv`, `SUPERSCALAR=4`). 
 
 ### Frontend
 
-The frontend tracks a 16-byte aligned fetch stream and presents four 32-bit instructions
-to `ooo_fetch_decode`. Control-flow prediction is split across direct and indirect
-predictors:
+The frontend tracks a 16-byte aligned fetch stream and presents four instructions
+to `ooo_fetch_decode`. Under the canonical RV64GC (`PERF=1`) build the RVC compressed
+frontend expands 16-bit parcels before decode, with the realigner widened to four lanes
+(`REALIGN4`, up from the base two) so the compressed stream can fill all four dispatch
+slots. Control-flow prediction is split across a fetch-directed target buffer plus
+direction and indirect-target predictors:
 
+- A fetch-directed branch target buffer (`BTB`, part of the `PERF=1` umbrella) steers
+  fetch toward predicted-taken targets ahead of decode.
 - `tage_sc_l_predictor.sv` handles conditional direct branches.
 - `ittage_predictor.sv` handles indirect targets.
 - A return-address stack in `riscv_core_ooo.sv` predicts returns.
@@ -171,8 +197,11 @@ work.
 ### Issue and Execution
 
 Integer and FP operations are inserted into `int_issue_queue.sv` with a functional-unit
-class. The core has two ALU issue slots, plus dedicated multiply, divide, and
-floating-point paths:
+class. The core has three ALU issue slots (ALU0/ALU1/ALU2) in the canonical `PERF=1`
+configuration — the base build has two, and the third is enabled by `-DALU4` (folded into
+the `PERF=1` umbrella) via a parameterized N-way ALU pick, which relieves the two-port
+throughput ceiling on integer-ILP-heavy code (CSR ops stay confined to ALU0/ALU1) — plus
+dedicated multiply, divide, and floating-point paths:
 
 - `ooo_alu_pipe.sv` handles simple integer ALU, branch, CSR, the `W`-form ALU ops, and
   simple FP move/classify style results.
@@ -185,8 +214,10 @@ floating-point paths:
   reservation is snoop-killed by remote stores and the `SC` is resolved at commit by the
   L1D agent — see *Multicore cache coherence (CCD)*).
 
-Results arbitrate through `ooo_writeback_bus.sv`, which can accept up to four writeback
-packets per cycle and forwards wakeups to dependent instructions.
+Results arbitrate through `ooo_writeback_bus.sv`, which selects up to four writeback
+packets per cycle (`OOO_WIDTH`) from the functional-unit sources — the three ALU pipes,
+load/store, multiply, divide, and FP under `PERF=1` — and forwards wakeups to dependent
+instructions.
 
 ### Floating Point and CVFPU
 
@@ -204,8 +235,13 @@ issue/writeback handshakes from CVFPU's valid-ready interface.
 For timing closure on FPGA the CVFPU FMA (ADDMUL) datapath is configured with two
 distributed pipeline registers, splitting the multiply-add across two stages (one extra
 cycle of FMA latency); FP is infrequent in the integer-heavy OS workloads, so the cost is
-negligible. FP issue is serialized to a single in-flight operation so that an in-flight FP
-op's speculative branch mask is aged correctly on branch recovery.
+negligible. In the canonical `PERF=1` configuration FP dispatch is de-serialized
+(`-DFP_OOO`): a single-producer architectural-FPR scoreboard — one in-flight writer per FP
+register, enforced by a WAW dispatch-stall with the producer's speculative branch mask
+aged on branch recovery, plus an fflags-read drain interlock — replaces the machine-wide
+dispatch quiesce the base build raises on every FP op. (In the base build FP issue is
+serialized to a single in-flight operation so that an in-flight FP op's speculative branch
+mask is aged correctly on branch recovery.)
 
 The project also vendors small compatibility cells under `src/common_cells/`:
 
@@ -224,7 +260,11 @@ architecturally visible only after the commit unit authorizes the active-list en
 preserving precise state. The queue works in virtual addresses; the head access is
 translated by the MMU (see below) and the resolved physical word address is applied at
 the memory port; the head access's translation (DTLB + data-PMP) result is registered
-and consumed on the following cycle to shorten the FPGA critical path.
+and consumed on the following cycle to shorten the FPGA critical path. In the canonical
+`PERF=1` configuration this registered head-translate stage is bypassed (`-DXLATE_BYPASS`)
+for a DTLB-hit plain load, which then issues the same cycle it presents; this is the
+single biggest L1D performance lever but re-opens the LSQ-head→DTLB→DataPMP→issue path (an
+Fmax cost), so an FPGA/ASIC build drops it while keeping the registered stage.
 
 Misaligned loads and stores are supported without trapping (`MISALIGNED_LDST`). The queue
 classifies each access from its size and byte offset and, when an access crosses a
@@ -252,14 +292,17 @@ frontend, keeping architectural state precise.
 
 The OoO core speaks three handshaked, latency-agnostic ports into the memory subsystem
 (`src/mem/niigo_memsys.sv`): an instruction-fetch port (one 16-byte block at a time), a
-word-granular data load/store port, and a page-table-walk request/ack port. The default
-OoO build wires these straight through to the word-addressed `main_memory` model (legacy
-fixed-latency timing). The FPGA-oriented build flags insert real caches behind the same
-ports: `L1=1` adds the L1 instruction cache; `L1D=1` adds the write-back L1 data cache
-(and routes the PTW through it so page tables stay coherent); `L2=1` interposes a shared
-write-back L2 on the memory-side backend, behind the L1s (see below); `AXI=1` routes the
-cache miss/writeback traffic through an NMI→AXI4-512 bridge onto a simulated AXI slave.
-Devices (CLINT/PLIC/UART) always bypass the caches.
+word-granular data load/store port, and a page-table-walk request/ack port. In the
+reference `PERF` configuration these ports sit behind a real split L1I + write-back L1 data
+cache — the canonical memory boundary detailed below — with the PTW routed through the L1D
+so page tables stay coherent. The build flags select what backs the ports: `L1D=1` is
+`PERF`'s setting (write-back L1D + PTW-through-L1D); `L1=1` adds only the L1 instruction
+cache; `L2=1` interposes a shared write-back L2 on the memory-side backend, behind the L1s
+(see below); `AXI=1` routes the cache miss/writeback traffic through an NMI→AXI4-512 bridge
+onto a simulated AXI slave. With no cache flags — the base-default OoO build used by the
+correctness baselines — the ports instead wire straight through to the word-addressed
+`main_memory` model (legacy fixed-latency timing), a passthrough variant. Devices
+(CLINT/PLIC/UART) always bypass the caches.
 
 The L1I and L1D share one geometry (`src/mem/niigo_mem.vh`, `l1_icache.sv`/`l1_dcache.sv`,
 `l1_data_array.sv`/`l1_tag_array.sv`):
@@ -483,7 +526,8 @@ Build the OoO Verilator simulator. The default is RV32G; add `RV64=1` for the RV
 datapath:
 
 ```sh
-make verilator-build OOO=1            # RV32G OoO (default focus / regression anchor)
+make verilator-build PERF=1           # canonical OoO perf build = RV64GC + L1D + landed perf levers (the reference microarchitecture config)
+make verilator-build OOO=1            # RV32G OoO (base build / regression anchor)
 make verilator-build RV64=1 OOO=1     # RV64G + Sv39 OoO
 make verilator-build SUPERSCALAR=4    # conservative 4-wide in-order
 make verilator-build                  # scalar in-order (default-flag core)
@@ -494,7 +538,13 @@ make verilator-build                  # scalar in-order (default-flag core)
 `-DL1_CACHES` (L1I), `L1D=1` → `-DL1_CACHES -DL1D_CACHE` (write-back L1D + PTW-through-L1D),
 `AXI=1` → `-DAXI_MEMSYS` (NMI→AXI4-512 bridge; requires the caches), `CCD=1` →
 `-DCCD_AGENT -DL1_CACHES` (single-core grant-and-go MOESI L1D agent; mutually exclusive
-with `L1D=1`). The executable lands at `output/simulation/verilator_obj/Vtop`.
+with `L1D=1`). The executable lands at `output/simulation/verilator_obj/Vtop`. `PERF=1` is
+the umbrella reference build — it expands to `-DRV64 -DOOO_4WIDE -DRVC -DL1_CACHES
+-DL1D_CACHE -DREALIGN4 -DDEEP_WINDOW -DBIG_IQ -DBIG_ROB -DBIG_LSQ -DBTB -DXLATE_BYPASS
+-DFP_OOO -DALU4` (the landed perf levers of `plans/ooo-perf.md`), the configuration the
+microarchitecture sections above describe; each lever also composes individually for A/B
+isolation. It is a functional sim build — `XLATE_BYPASS` carries an Fmax cost, so an
+FPGA/ASIC build drops it.
 
 Run one ACT ELF:
 
