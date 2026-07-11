@@ -248,13 +248,17 @@ endif
 
 # LSQ_MLP2=1 (Track A, plans/track-a-mlp.md): non-blocking L1D / memory-level
 # parallelism -- lifts the LSQ single-outstanding-load limit to 2 (LSQ_MLP=2).
-# OoO + L1D only (a real cache is required for miss overlap to matter; passthrough's
-# fixed-latency FIFO is not the target). A coherent build FORCES LSQ_MLP=1 in RTL
-# (the LSQ CCD/COHERENT pin) -- 2 in-flight loads open an RVWMO load-load reorder
-# window with no 9.11 squash -- so this composes with CCD only as an inert no-op.
+# OoO only; the win needs a real cache (L1D), but it compiles bit-identically on
+# passthrough/L1 too (the id round-trip threads the passthrough d_q FIFO as well).
+# INCOMPATIBLE with CCD: a coherent D-side would pin LSQ_MLP=1 anyway (2 in-flight
+# loads open an RVWMO load-load reorder window with no 9.11 squash), and the CCD
+# agent memsys arm has no id round-trip, so combining them is disallowed outright.
 # Default OFF is bit-identical (all gated by -DLSQ_MLP2). Functional sim lever like
 # XLATE_BYPASS (an FPGA/ASIC build likely drops it).
 ifeq ($(LSQ_MLP2),1)
+ifeq ($(CCD),1)
+$(error LSQ_MLP2=1 is incompatible with CCD=1: the coherent D-side pins LSQ_MLP=1 and the CCD memsys arm carries no dmem txn-id. Use L1D=1 (or PERF=1).)
+endif
 	VERILATOR_CFLAGS += -DLSQ_MLP2
 endif
 

@@ -36,6 +36,13 @@ module load_store_queue
     // no address matching is needed.
     input wire logic                 data_load_valid,
     input wire logic [XLEN-1:0]      data_load,
+`ifdef LSQ_MLP2
+    // Track A: transaction id of the returning data-port response (the outstanding
+    // slot it belongs to). Const-0 at P3a (single-outstanding); load-bearing at P3c
+    // (parked out-of-order completion) where a younger hit can return before an
+    // older miss. Threaded LSQ->core->memsys->l1_dcache and back. See track-a-mlp.md.
+    input wire logic [LSQ_ID_W-1:0]  dmem_resp_id,
+`endif
     // The memory subsystem can accept a data request (load issue or store
     // write beat) this cycle. Registered upstream; never depends on the
     // request being presented.
@@ -78,6 +85,12 @@ module load_store_queue
     // so the CCD agent applies the right atomic RMW. Don't-care on non-AMO beats /
     // non-CCD builds (sunk by the memsys).
     output logic [3:0]           dmem_req_amo,
+`ifdef LSQ_MLP2
+    // Track A: transaction id tagging the data-port request (the outstanding slot
+    // it allocates). Const-0 at P3a (single-outstanding); the allocated inflight
+    // slot at P3b+. Round-trips back as dmem_resp_id. See track-a-mlp.md.
+    output logic [LSQ_ID_W-1:0]  dmem_req_id,
+`endif
     // High while driving the second beat of a split store: the data_addr output
     // already carries the captured physical word address, so the core port must
     // bypass the (head-VA based) translation mux.
@@ -188,6 +201,14 @@ module load_store_queue
     localparam logic [2:0] DMEM_OP_AMO_RD = 3'd3;
     localparam logic [2:0] DMEM_OP_SC     = 3'd4;   // M4-S5b: agent-authoritative SC (COP_SC)
     localparam logic [2:0] DMEM_OP_AMO    = 3'd5;   // M4 #3: agent-authoritative AMO (COP_AMO)
+
+`ifdef LSQ_MLP2
+    // P3a: dmem_resp_id is threaded now for the P3c parked-completion slot match;
+    // in-order single-outstanding delivery ignores it until then. Sink it so the
+    // P3a (inert) build has no UNUSED lint on this not-yet-consumed input.
+    logic _unused_dmem_resp_id;
+    assign _unused_dmem_resp_id = ^dmem_resp_id;
+`endif
 
     // M3d Stage 3: coherence line = 64 B (the fixed PIPT line). LINE_OFF_W = the word-offset
     // bits within a line, so [MEMORY_ADDR_WIDTH-1:LINE_OFF_W] of a word address is its line.
@@ -1147,6 +1168,9 @@ module load_store_queue
         // LOAD/LR/AMO_RD tag). Idle -> don't-care (the port is invalid).
         dmem_req_op = DMEM_OP_LOAD;
         dmem_req_amo = 4'd0;            // M4 #3: only meaningful on the COP_AMO beat
+`ifdef LSQ_MLP2
+        dmem_req_id = '0;              // P3a: const-0 (single-outstanding). P3b: the allocated slot.
+`endif
         if (double_store_pending_q) begin
             data_addr = double_store_addr_q;
             data_store = double_store_data_q;

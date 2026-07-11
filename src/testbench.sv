@@ -101,6 +101,11 @@ module top;
     logic [XLEN_BYTES-1:0]         dmem_req_wmask;
     logic [2:0]                    dmem_req_op;   // M3d Stage 2: typed op (CCD agent)
     logic [3:0]                    dmem_req_amo;  // M4 #3: fine AMO op (CCD agent)
+`ifdef LSQ_MLP2
+    localparam int DMEM_ID_W = 1;               // Track A dmem txn-id width (LSQ_MLP<=2 => 1 bit)
+    logic [DMEM_ID_W-1:0]          dmem_req_id;  // core -> memsys
+    logic [DMEM_ID_W-1:0]          dmem_resp_id; // memsys -> core
+`endif
     logic                          dmem_resp_valid;
     logic [MEMORY_ADDR_WIDTH-1:0]  dmem_resp_addr;
     logic [XLEN-1:0]               dmem_resp_data;
@@ -159,6 +164,10 @@ module top;
         .dmem_req_wmask  (dmem_req_wmask),
         .dmem_req_op     (dmem_req_op),
         .dmem_req_amo    (dmem_req_amo),
+`ifdef LSQ_MLP2
+        .dmem_req_id     (dmem_req_id),
+        .dmem_resp_id    (dmem_resp_id),
+`endif
         .dmem_resp_valid (dmem_resp_valid),
         .dmem_resp_addr  (dmem_resp_addr),
         .dmem_resp_data  (dmem_resp_data),
@@ -204,6 +213,10 @@ module top;
         .dmem_req_wmask   (dmem_req_wmask),
         .dmem_req_op      (dmem_req_op),
         .dmem_req_amo     (dmem_req_amo),
+`ifdef LSQ_MLP2
+        .dmem_req_id      (dmem_req_id),
+        .dmem_resp_id     (dmem_resp_id),
+`endif
         .dmem_resp_valid  (dmem_resp_valid),
         .dmem_resp_addr   (dmem_resp_addr),
         .dmem_resp_data   (dmem_resp_data),

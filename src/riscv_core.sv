@@ -79,7 +79,17 @@ module riscv_core
     input  wire logic        ext_irq_s_external,
 `endif
     output logic             halted
+`ifdef LSQ_MLP2
+    ,
+    // Track A: dmem transaction id pass-through (LSQ/core <-> memsys). See riscv_core_ooo.
+    output logic [DMEM_ID_W-1:0] dmem_req_id,
+    input  wire logic [DMEM_ID_W-1:0] dmem_resp_id
+`endif
 );
+`ifdef LSQ_MLP2
+    // Track A dmem transaction-id width (LSQ_MLP<=2 => 1 bit); matches riscv_core_ooo.
+    localparam int DMEM_ID_W = 1;
+`endif
 
     riscv_core_ooo #(.HART_ID(HART_ID), .COHERENT(COHERENT)) OoOCore (
         .clk,
@@ -98,6 +108,10 @@ module riscv_core
         .dmem_req_wmask,
         .dmem_req_op,
         .dmem_req_amo,
+`ifdef LSQ_MLP2
+        .dmem_req_id,
+        .dmem_resp_id,
+`endif
         .dmem_resp_valid,
         .dmem_resp_addr,
         .dmem_resp_data,

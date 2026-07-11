@@ -36,6 +36,12 @@ module l1_dcache
     input wire logic [MEMORY_ADDR_WIDTH-1:0]  req_waddr,
     input wire logic [XLEN-1:0]               req_wdata,
     input wire logic [XLEN_BYTES-1:0]         req_wmask,
+`ifdef LSQ_MLP2
+    // Track A: transaction id sidecar. Latched with the op and echoed on resp_valid
+    // so the memsys/LSQ can match a load response to its outstanding slot (P3c).
+    input wire logic [DMEM_ID_W-1:0]          req_id,
+    output logic [DMEM_ID_W-1:0]              resp_id,
+`endif
     output logic                          resp_valid,    // load data this cycle
     output logic [XLEN-1:0]               resp_data,
     output logic [MEMORY_ADDR_WIDTH-1:0]  resp_addr,     // echo (word addr)
@@ -70,6 +76,9 @@ module l1_dcache
     localparam int LBY   = LINE_BITS/8;
     localparam int WB_W  = XLEN;
     localparam int WBY   = XLEN_BYTES;
+`ifdef LSQ_MLP2
+    localparam int DMEM_ID_W = 1;   // Track A dmem txn-id width (LSQ_MLP<=2 => 1 bit)
+`endif
 
     // ---------------- arrays + flop metadata ----------------
     logic                           tag_ren, tag_wen;
@@ -110,6 +119,9 @@ module l1_dcache
     logic [MEMORY_ADDR_WIDTH-1:0]  op_addr_q;
     logic [WB_W-1:0]               op_wdata_q;
     logic [WBY-1:0]                op_wmask_q;
+`ifdef LSQ_MLP2
+    logic [DMEM_ID_W-1:0]          op_id_q;   // Track A: id of the in-flight op, echoed on resp
+`endif
 
     // VIPT seam (M2; plans/multicore-ccd.md §V): the set index is taken from the page-offset
     // bits, which are translation-invariant (VA[idx] == PA[idx], alias-free per L1_VIPT_ALIAS_FREE
@@ -226,6 +238,9 @@ module l1_dcache
     assign load_resp_install = (state_q == S_INSTALL) && !op_write_q;
     assign resp_valid = load_resp_lookup || load_resp_install;
     assign resp_addr  = op_addr_q;
+`ifdef LSQ_MLP2
+    assign resp_id    = op_id_q;
+`endif
     always_comb begin
         if (load_resp_install) resp_data = refill_line_q[op_woff*XLEN +: XLEN];
         else                   resp_data = dat_rdata[hit_way][op_woff*XLEN +: XLEN];
@@ -436,18 +451,27 @@ module l1_dcache
     logic [MEMORY_ADDR_WIDTH-1:0] op_addr_n2;
     logic [WB_W-1:0] op_wdata_n2;
     logic [WBY-1:0]  op_wmask_n2;
+`ifdef LSQ_MLP2
+    logic [DMEM_ID_W-1:0] op_id_n2;
+`endif
     always_comb begin
         op_valid_n2 = op_valid_q;
         op_write_n2 = op_write_q;
         op_addr_n2  = op_addr_q;
         op_wdata_n2 = op_wdata_q;
         op_wmask_n2 = op_wmask_q;
+`ifdef LSQ_MLP2
+        op_id_n2    = op_id_q;
+`endif
         if ((state_q == S_IDLE) && req_fire) begin
             op_valid_n2 = 1'b1;
             op_write_n2 = req_write;
             op_addr_n2  = req_waddr;
             op_wdata_n2 = req_wdata;
             op_wmask_n2 = req_wmask;
+`ifdef LSQ_MLP2
+            op_id_n2    = req_id;
+`endif
         end else if (state_q == S_LOOKUP && any_hit) begin
             op_valid_n2 = 1'b0;
         end else if (state_q == S_INSTALL) begin
@@ -485,6 +509,9 @@ module l1_dcache
             op_addr_q     <= '0;
             op_wdata_q    <= '0;
             op_wmask_q    <= '0;
+`ifdef LSQ_MLP2
+            op_id_q       <= '0;
+`endif
             refill_line_q <= '0;
             fill_way_q    <= '0;
             wb_line_q     <= '0;
@@ -508,6 +535,9 @@ module l1_dcache
             op_addr_q     <= op_addr_n2;
             op_wdata_q    <= op_wdata_n2;
             op_wmask_q    <= op_wmask_n2;
+`ifdef LSQ_MLP2
+            op_id_q       <= op_id_n2;
+`endif
             refill_line_q <= refill_line_n;
             fill_way_q    <= fill_way_n;
             wb_line_q     <= wb_line_n;

@@ -112,6 +112,13 @@ module niigo_memsys
     input wire logic [2:0]                    dmem_req_op,
     // M4 #3: fine AMO sub-op (amo_op_t ordinal) for a COP_AMO beat; CCD-arm only.
     input wire logic [3:0]                    dmem_req_amo,
+`ifdef LSQ_MLP2
+    // Track A: dmem transaction id in/out (LSQ_MLP2 builds only; not on the CCD arm,
+    // which this flag is Makefile-incompatible with). Carried through the passthrough
+    // d_q FIFO and the L1D op/resp sidecar + device-bypass dev_id_q. See track-a-mlp.md.
+    input wire logic [DMEM_ID_W-1:0]          dmem_req_id,
+    output logic [DMEM_ID_W-1:0]              dmem_resp_id,
+`endif
     output logic                          dmem_resp_valid,
     output logic [MEMORY_ADDR_WIDTH-1:0]  dmem_resp_addr,
     output logic [XLEN-1:0]               dmem_resp_data,
@@ -192,6 +199,13 @@ module niigo_memsys
     // Response queue depth. The core bounds itself to 2 outstanding fetches
     // and 1 outstanding load, so 4 never fills; pushes guard on it anyway.
     localparam int QD = 4;
+
+`ifdef LSQ_MLP2
+    // Track A dmem transaction-id width (LSQ_MLP<=2 => 1 bit). Matches the LSQ's
+    // LSQ_ID_W and the core/wrapper DMEM_ID_W; carried on the passthrough d_q and
+    // the L1D op/resp sidecar so a response can be matched to its outstanding slot.
+    localparam int DMEM_ID_W = 1;
+`endif
 
     // M3d Stage 2: dmem_req_op is consumed only by the CCD agent arm. Sink it
     // unconditionally so the L1D/passthrough builds don't flag it unused (the extra
@@ -401,6 +415,9 @@ module niigo_memsys
         logic [MEMORY_ADDR_WIDTH-1:0] addr;
         logic [XLEN-1:0]              data;
         logic [63:0]                  due;
+`ifdef LSQ_MLP2
+        logic [DMEM_ID_W-1:0]         id;    // Track A: outstanding-slot id (in-order FIFO carries it)
+`endif
     } d_ent_t;
 
     d_ent_t      d_q [QD];
@@ -417,6 +434,9 @@ module niigo_memsys
     assign dmem_resp_valid = d_pop;
     assign dmem_resp_addr  = d_q[d_rd_q].addr;
     assign dmem_resp_data  = d_q[d_rd_q].data;
+`ifdef LSQ_MLP2
+    assign dmem_resp_id    = d_q[d_rd_q].id;
+`endif
 
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
@@ -430,6 +450,9 @@ module niigo_memsys
                 d_q[d_wr_q].addr <= dmem_req_addr;
                 d_q[d_wr_q].data <= mem_d_load_data[0];
                 d_q[d_wr_q].due  <= cyc_q + 64'(d_delay);
+`ifdef LSQ_MLP2
+                d_q[d_wr_q].id   <= dmem_req_id;
+`endif
                 d_wr_q <= d_wr_q + 2'd1;
                 if (fz_en) dlat_lcg <= lcg_next(dlat_lcg);
             end
@@ -506,6 +529,13 @@ module niigo_memsys
     logic [MEMORY_ADDR_WIDTH-1:0]  dev_addr_q;
     logic [63:0]                   dev_due_q;
     logic                          dev_ready, dev_load_fire, dev_resp_valid;
+`ifdef LSQ_MLP2
+    // Track A: the device-bypass response carries no address-recoverable slot id,
+    // so latch the requesting txn id and echo it on the response, else the LSQ would
+    // match a device completion to the wrong outstanding slot (the L1D sidecar's
+    // stale id). NOT for the byte offset (that stays head_load_off in the core).
+    logic [DMEM_ID_W-1:0]          dev_id_q;
+`endif
     assign dev_ready     = !dev_pend_q && (!fz_en || drdy_rand);
     assign dev_load_fire = dmem_req_valid && dmem_req_device && dev_ready && !dmem_req_write;
     assign dev_resp_valid = dev_pend_q && (cyc_q >= dev_due_q);
@@ -514,10 +544,16 @@ module niigo_memsys
             dev_pend_q <= 1'b0;
             dev_addr_q <= '0;
             dev_due_q  <= '0;
+`ifdef LSQ_MLP2
+            dev_id_q   <= '0;
+`endif
         end else begin
             if (dev_load_fire) begin
                 dev_pend_q <= 1'b1;
                 dev_addr_q <= dmem_req_addr;
+`ifdef LSQ_MLP2
+                dev_id_q   <= dmem_req_id;
+`endif
                 dev_due_q  <= cyc_q + 64'(fz_en ? lcg_range(dlat_lcg, fz_min, fz_max)
                                                : D_RESP_DELAY);
                 if (fz_en) dlat_lcg <= lcg_next(dlat_lcg);
@@ -535,6 +571,9 @@ module niigo_memsys
     logic                          l1d_resp_valid, l1d_wr_accept;
     logic [XLEN-1:0]               l1d_resp_data;
     logic [MEMORY_ADDR_WIDTH-1:0]  l1d_resp_addr;
+`ifdef LSQ_MLP2
+    logic [DMEM_ID_W-1:0]          l1d_resp_id;   // Track A: L1D op-sidecar id echo
+`endif
 
     logic present_dmem, present_ptw;
     logic owner_ptw_q;        // owner of the in-flight L1D op (0 = dmem, 1 = PTW)
@@ -546,6 +585,12 @@ module niigo_memsys
     assign l1d_req_waddr = present_dmem ? dmem_req_addr  : ptw_req_addr;
     assign l1d_req_wdata = present_dmem ? dmem_req_wdata : ptw_req_wdata;
     assign l1d_req_wmask = present_dmem ? dmem_req_wmask : {XLEN_BYTES{1'b1}};
+`ifdef LSQ_MLP2
+    // The dmem op carries the LSQ slot id; a PTW op is not LSQ-tracked (its response
+    // routes to the PTW port via owner_ptw_q), so its id is don't-care.
+    logic [DMEM_ID_W-1:0] l1d_req_id;
+    assign l1d_req_id = present_dmem ? dmem_req_id : '0;
+`endif
 
     logic l1d_req_fire;
     assign l1d_req_fire = l1d_req_valid && l1d_req_ready;
@@ -573,6 +618,9 @@ module niigo_memsys
         .req_wdata(l1d_req_wdata), .req_wmask(l1d_req_wmask),
         .resp_valid(l1d_resp_valid), .resp_data(l1d_resp_data),
         .resp_addr(l1d_resp_addr), .wr_accept(l1d_wr_accept),
+`ifdef LSQ_MLP2
+        .req_id(l1d_req_id), .resp_id(l1d_resp_id),
+`endif
         .flush_req(dcache_flush_req), .flush_done(dcache_flush_done),
         .probe_valid(l1d_probe_valid), .probe_waddr(l1d_probe_waddr),
         .probe_clean(l1d_probe_clean),
@@ -591,6 +639,19 @@ module niigo_memsys
     assign dmem_resp_valid = dev_resp_valid || (l1d_resp_valid && !owner_ptw_q);
     assign dmem_resp_addr  = dev_resp_valid ? dev_addr_q : l1d_resp_addr;
     assign dmem_resp_data  = dev_resp_valid ? '0 : l1d_resp_data;
+`ifdef LSQ_MLP2
+    // Track A: the device path uses its own latched dev_id_q (no address-recoverable
+    // slot); a cacheable load uses the L1D op-sidecar echo. Mutually exclusive by
+    // carve-out #4 (device and cacheable loads never in flight together).
+    assign dmem_resp_id    = dev_resp_valid ? dev_id_q : l1d_resp_id;
+    // Guard that invariant: the single dmem_resp lane must never carry a device and
+    // a cacheable completion the same cycle (would silently drop one -> slot leak).
+    always_ff @(posedge clk) begin
+        if (rst_l)
+            assert (!(dev_resp_valid && l1d_resp_valid && !owner_ptw_q))
+                else $fatal(1, "niigo_memsys: dev+cache dmem_resp collision (carve-out #4 violated)");
+    end
+`endif
 
     // PTW ack: acked when its L1D op completes -- a read on the load response,
     // a write (A/D update) on the store-accept pulse. Both come from the L1D's

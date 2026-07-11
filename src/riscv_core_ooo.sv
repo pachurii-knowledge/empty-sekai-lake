@@ -110,6 +110,15 @@ module riscv_core_ooo
 `endif
 
     output logic             halted
+`ifdef LSQ_MLP2
+    ,
+    // Track A: dmem transaction id, threaded LSQ->core->memsys->l1_dcache and back
+    // so a data response can be matched to its outstanding slot (P3c parked
+    // completion). Const-0 at P3a. Width via DMEM_ID_W (body localparam). Placed
+    // last so it composes with the optional FPGA_BUILD port block.
+    output logic [DMEM_ID_W-1:0] dmem_req_id,
+    input  wire logic [DMEM_ID_W-1:0] dmem_resp_id
+`endif
 `ifdef FPGA_BUILD
     ,
     // ---- FB1: vUART byte streams (rerouted from the sim console) + a debug
@@ -126,6 +135,12 @@ module riscv_core_ooo
 
     // Byte-address -> word-address shift for the word-granular memory bus.
     localparam int ADDR_SHIFT = $clog2(XLEN_BYTES);
+
+`ifdef LSQ_MLP2
+    // Track A dmem transaction-id width. LSQ_MLP in {1,2} (a coherent build pins 1)
+    // => 1 bit; matches the LSQ's LSQ_ID_W and the memsys id ports. Revisit for MLP>2.
+    localparam int DMEM_ID_W = 1;
+`endif
 
     import RISCV_ABI::ECALL_ARG_HALT;
     import MemorySegments::USER_TEXT_START;
@@ -662,6 +677,10 @@ module riscv_core_ooo
     logic [XLEN_BYTES-1:0] mem_data_store_mask;
     logic [2:0] mem_dmem_op;            // M3d Stage 2: LSQ typed op -> dmem_req_op
     logic [3:0] mem_dmem_amo;           // M4 #3: LSQ fine AMO op -> dmem_req_amo
+`ifdef LSQ_MLP2
+    logic [DMEM_ID_W-1:0] mem_dmem_id;  // Track A: LSQ-allocated dmem txn id -> dmem_req_id
+    assign dmem_req_id = mem_dmem_id;
+`endif
     logic lsq_store_second_beat;
     logic lsq_store_port_busy;
     logic lsq_sc_commit_done;           // M4-S5b: LSQ resolved the coherent SC -> release ROB retire
@@ -1794,6 +1813,10 @@ module riscv_core_ooo
         .data_store_mask(mem_data_store_mask),
         .dmem_req_op(mem_dmem_op),
         .dmem_req_amo(mem_dmem_amo),
+`ifdef LSQ_MLP2
+        .dmem_req_id(mem_dmem_id),
+        .dmem_resp_id(dmem_resp_id),
+`endif
         .store_second_beat(lsq_store_second_beat),
         .store_port_busy(lsq_store_port_busy),
         .head_load_off(dev_load_off),
