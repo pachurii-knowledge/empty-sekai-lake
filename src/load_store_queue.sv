@@ -203,11 +203,18 @@ module load_store_queue
     localparam logic [2:0] DMEM_OP_AMO    = 3'd5;   // M4 #3: agent-authoritative AMO (COP_AMO)
 
 `ifdef LSQ_MLP2
-    // P3a: dmem_resp_id is threaded now for the P3c parked-completion slot match;
-    // in-order single-outstanding delivery ignores it until then. Sink it so the
-    // P3a (inert) build has no UNUSED lint on this not-yet-consumed input.
+    // P3b delivers IN ORDER (oldest slot first); the memsys returns responses oldest-
+    // first, so a response's id must be the FIFO oldest slot. Assert it (P3c relaxes to
+    // out-of-order parked completion and makes dmem_resp_id load-bearing). Sink the id
+    // outside the assertion window so there is no UNUSED lint.
     logic _unused_dmem_resp_id;
     assign _unused_dmem_resp_id = ^dmem_resp_id;
+    always_ff @(posedge clk) begin
+        if (rst_l && data_load_valid && (inflight_count_q != '0))
+            assert (dmem_resp_id == inflight_head_q)
+                else $fatal(1, "LSQ P3b: out-of-order response id=%0d, expected oldest=%0d",
+                            dmem_resp_id, inflight_head_q);
+    end
 `endif
 
     // M3d Stage 3: coherence line = 64 B (the fixed PIPT line). LINE_OFF_W = the word-offset
@@ -352,6 +359,40 @@ module load_store_queue
     // load issues until the stale response drains (mem_inflight stays set).
     logic mem_inflight_q, mem_inflight_next;
     logic mem_inflight_kill_q, mem_inflight_kill_next;
+`ifdef LSQ_MLP2
+    // ===================== Track A P3b: non-blocking LSQ =====================
+    // Up to LSQ_MLP loads outstanding. The outstanding loads form a FIFO of slots
+    // in issue/age order (the memsys returns responses oldest-first -- passthrough
+    // d_q FIFO or blocking-L1D single-outstanding -- and the head retires in order),
+    // so delivery stays head-first (the existing head-complete block); the slot table
+    // only supplies the issue-gate COUNT and a per-slot LATCHED KILL that discards a
+    // squashed load's stale response (a mispredict can kill a suffix of the run).
+    localparam int MEM_PTR_W  = $clog2(MEM_Q_SIZE);
+    localparam int CNT_W      = $clog2(LSQ_MLP + 1);
+    // issue_ptr: the next entry the 2nd (younger-than-head) issue considers. Advances
+    // over a plain single-beat cacheable non-device load; reset to head on head pass.
+    logic [MEM_PTR_W-1:0]  issue_ptr_q, issue_ptr_next;
+    // Per-slot inflight descriptor FIFO (age order). owner = the issuing entry's ring
+    // index; kill = monotonic latch (owner squashed while outstanding); gen = owner
+    // active_id (reallocation guard). head/tail are the FIFO read/write pointers.
+    logic                  inflight_valid_q [LSQ_MLP], inflight_valid_next [LSQ_MLP];
+    logic [MEM_PTR_W-1:0]  inflight_owner_q [LSQ_MLP], inflight_owner_next [LSQ_MLP];
+    logic                  inflight_kill_q  [LSQ_MLP], inflight_kill_next  [LSQ_MLP];
+    active_id_t            inflight_gen_q   [LSQ_MLP], inflight_gen_next   [LSQ_MLP];
+    logic [LSQ_ID_W-1:0]   inflight_head_q, inflight_head_next;   // FIFO read ptr (oldest slot)
+    logic [LSQ_ID_W-1:0]   inflight_tail_q, inflight_tail_next;   // FIFO write ptr (next free slot)
+    logic [CNT_W-1:0]      inflight_count_q, inflight_count_next;
+    // Registered time-mux translate target: which entry mem_req_vaddr aims at. Driven
+    // off a REGISTER so the DTLB index stays register-driven (no FB2b path regression);
+    // head-priority keeps it == head_q whenever the head wants the port.
+    logic [MEM_PTR_W-1:0]  xlate_target_q, xlate_target_next;
+    logic [MEM_PTR_W-1:0]  xlate_tgt_q;   // which target the registered translate is for
+    // Combinational issue_ptr issue event + its per-cycle helpers (driven in block HD).
+    logic                  ip_issue_fire;
+    logic [MEM_PTR_W-1:0]  ip_load_addr_word;
+    // "the head still needs the translate port" -- head-priority arbitration input.
+    logic                  head_wants_xlate;
+`endif
     // High while the head store is probing its high-word translation (cross-word
     // store / FP double). Steers mem_req_vaddr up one word so the second page is
     // translated and verified before either word is written (store atomicity).
@@ -391,6 +432,37 @@ module load_store_queue
 
     // Expose the registered head's virtual address so the core can translate it
     // (DTLB lookup / PTW). Only meaningful once the address operand is resolved.
+`ifdef LSQ_MLP2
+    // Track A time-mux: the translate port aims at the REGISTERED xlate_target_q
+    // (head_q, or issue_ptr_q when the head does not want the port). Indexing off a
+    // register keeps the DTLB address-index path register-driven exactly as the
+    // head-only design (no FB2b lengthening); head-priority (below) keeps
+    // xlate_target_q == head_q whenever the head has a mem-op to translate, so the
+    // head translate + XLATE_BYPASS are unchanged in the common case. When aimed at
+    // issue_ptr it is always a plain single-beat cacheable load (carve-outs), so no
+    // store/probe offset applies.
+    wire mlp_xt_head = (xlate_target_q == head_q);
+    // Head's OWN request validity (independent of the time-mux target) -- the head
+    // translate-ready + XLATE_BYPASS gates must key on this, not the muxed mem_req_valid
+    // (which reflects issue_ptr on its port turns).
+    wire mlp_head_req_valid = entries_q[head_q].entry.valid && entries_q[head_q].addr_ready &&
+        (entries_q[head_q].entry.ctrl.memRead || entries_q[head_q].entry.ctrl.memWrite);
+    // issue_ptr's request validity: a plain single-beat cacheable load, address ready.
+    wire mlp_ip_req_valid = entries_q[issue_ptr_q].entry.valid && entries_q[issue_ptr_q].addr_ready &&
+        entries_q[issue_ptr_q].entry.ctrl.memRead && !entries_q[issue_ptr_q].entry.ctrl.memWrite;
+    assign mem_req_valid = mlp_xt_head ? mlp_head_req_valid : mlp_ip_req_valid;
+    // BLOCKER 1: device-ness of the registered translate's resolved PA (xlate_pa_q).
+    // issue_ptr must NOT emit a request to a device (irreversible response snoop), so
+    // its issue is gated on this being 0. Same byte-PA device hole the core decodes.
+    wire xlate_ip_is_device =
+        ((xlate_pa_q >= XLEN'('h0200_0000)) && (xlate_pa_q < XLEN'('h0201_0000))) ||
+        ((xlate_pa_q >= XLEN'('h0C00_0000)) && (xlate_pa_q < XLEN'('h1000_0000))) ||
+        ((xlate_pa_q >= XLEN'('h0D00_0000)) && (xlate_pa_q < XLEN'('h0D00_1000)));
+    assign mem_req_vaddr = mlp_xt_head
+        ? (entries_q[head_q].addr + (store_probe_hi_q ? XLEN'(XLEN_BYTES) : '0))
+        : entries_q[issue_ptr_q].addr;
+    assign mem_req_store = mlp_xt_head ? entries_q[head_q].entry.ctrl.memWrite : 1'b0;
+`else
     assign mem_req_valid = entries_q[head_q].entry.valid &&
         entries_q[head_q].addr_ready &&
         (entries_q[head_q].entry.ctrl.memRead ||
@@ -402,6 +474,7 @@ module load_store_queue
         (store_probe_hi_q ? XLEN'(XLEN_BYTES) : '0);
     // AMOs read and write; treat as a store so the walker checks W permission.
     assign mem_req_store = entries_q[head_q].entry.ctrl.memWrite;
+`endif
 
     // The in-order head load's byte offset (devices snoop the returned load
     // address, which lines up with the head load this matches).
@@ -512,8 +585,18 @@ module load_store_queue
         // mismatches and the head op waits one cycle for the fresh translate to
         // register (the +1 translate latency). This also guarantees a stale
         // translate from a different head (or a walk transition) is never consumed.
+`ifdef LSQ_MLP2
+        // Track A: the head consumes the registered translate only when it was aimed
+        // AT the head (xlate_tgt_q==head_q -- else it is issue_ptr's translate) and the
+        // head still has a valid request (mlp_head_req_valid, not the muxed mem_req_valid
+        // which reflects issue_ptr on its port turns).
+        xlate_ready = xlate_reqv_q && mlp_head_req_valid &&
+            (xlate_head_q == head_q) && (xlate_probe_q == store_probe_hi_q) &&
+            (xlate_tgt_q == head_q);
+`else
         xlate_ready = xlate_reqv_q && mem_req_valid &&
             (xlate_head_q == head_q) && (xlate_probe_q == store_probe_hi_q);
+`endif
         // Effective translate = registered when current, else (XLATE_BYPASS) the live
         // combinational DTLB/DataPMP result when it resolves this cycle (a hit or a
         // fault -- i.e. NOT a walk-stall), letting the head op issue/fault the SAME
@@ -535,7 +618,14 @@ module load_store_queue
         // drained, so issuing it a cycle early cannot reorder against an older store.
         if (!xlate_ready && mem_req_valid && head_match && !xlate_stall &&
                 headq.entry.ctrl.memRead && !headq.entry.ctrl.memWrite &&
-                (headq.entry.ctrl.exec_class != EXEC_AMO)) begin
+                (headq.entry.ctrl.exec_class != EXEC_AMO)
+`ifdef LSQ_MLP2
+                // BLOCKER 2: only bypass when the live translate is the HEAD's (the port
+                // is aimed at the head this cycle); an issue_ptr-aimed cycle carries a
+                // different entry's PA. mem_req_valid == mlp_head_req_valid when mlp_xt_head.
+                && mlp_xt_head
+`endif
+                ) begin
             xlate_pa_eff    = xlate_pa;
             xlate_fault_eff = xlate_fault;
             xlate_stall_eff = 1'b0;
@@ -754,7 +844,16 @@ module load_store_queue
         if (head_xlate_ok && !head_done && !double_store_pending_q && headq.entry.valid &&
                 headq.entry.ctrl.memRead &&
                 headq.entry.src1_ready && !headq.issued_load &&
-                !mem_inflight_q && dmem_req_ready) begin
+                !mem_inflight_q && dmem_req_ready
+`ifdef LSQ_MLP2
+                // Track A: the head load's PA is the LIVE translate of mem_req_vaddr,
+                // so the port must be aimed at the head this cycle (mlp_xt_head); and a
+                // free inflight slot must exist. (mlp_xt_head is true here by strict
+                // head-priority whenever !issued_load, so this only bulletproofs the
+                // 1-cycle target-register transition.)
+                && mlp_xt_head && (inflight_count_q < LSQ_MLP)
+`endif
+                ) begin
             head_done = 1'b1;
             head_data_load_en = 1'b1;
             load_data_addr = headq.addr[XLEN-1:ADDR_SHIFT];
@@ -832,7 +931,16 @@ module load_store_queue
                 headq.entry.ctrl.memRead &&
                 headq.issued_load && data_load_valid &&
                 !headq.load_complete &&
-                mem_inflight_q && !mem_inflight_kill_q) begin
+`ifdef LSQ_MLP2
+                // Track A: deliver the OLDEST outstanding slot only when it IS the current
+                // head's load (gen/active_id match -- robust to ring reuse) and was not
+                // killed (owner squashed => the response is stale => discard, not deliver).
+                (inflight_count_q != '0) && !inflight_kill_q[inflight_head_q] &&
+                (inflight_gen_q[inflight_head_q] == headq.entry.active_id)
+`else
+                mem_inflight_q && !mem_inflight_kill_q
+`endif
+                ) begin
             head_done = 1'b1;
             load_writeback.valid = 1'b1;
             load_writeback.active_id = headq.entry.active_id;
@@ -930,6 +1038,52 @@ module load_store_queue
             end
         end
 
+`ifdef LSQ_MLP2
+        // ---- Track A: issue_ptr issues a 2nd (younger-than-head) plain load ----
+        // Lowest port priority (only when the head is not using the data port and no
+        // store/AMO/SC commits). Requires: issue_ptr's registered translate resolved
+        // and aimed at issue_ptr (non-fault/stall/device); issue_ptr is a valid, in-
+        // range, plain single-beat cacheable load, addr+operand ready, not yet issued;
+        // a free inflight slot; not the same 64B line as any outstanding load.
+        ip_issue_fire = 1'b0;
+        ip_load_addr_word = '0;
+        begin
+            logic ip_ready_c, ip_carve_c, ip_same_line_c, ip_inrange_c;
+            ip_ready_c = xlate_reqv_q && (xlate_tgt_q == issue_ptr_q) &&
+                         !xlate_fault_q && !xlate_stall_q && !xlate_ip_is_device &&
+                         mlp_ip_req_valid;
+            ip_carve_c = entries_q[issue_ptr_q].entry.valid &&
+                         entries_q[issue_ptr_q].addr_ready &&
+                         entries_q[issue_ptr_q].entry.src1_ready &&
+                         !entries_q[issue_ptr_q].issued_load &&
+                         entries_q[issue_ptr_q].entry.ctrl.memRead &&
+                         !entries_q[issue_ptr_q].entry.ctrl.memWrite &&
+                         (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_AMO) &&
+                         !needs_two_beats(entries_q[issue_ptr_q].entry.ctrl,
+                                          entries_q[issue_ptr_q].addr);
+            // issue_ptr strictly younger than head AND within the valid queue region.
+            ip_inrange_c = (issue_ptr_q != head_q) &&
+                ({1'b0, ($clog2(MEM_Q_SIZE))'(issue_ptr_q - head_q)} < count_q);
+            ip_same_line_c = 1'b0;
+            for (int k = 0; k < LSQ_MLP; k += 1) begin
+                if (inflight_valid_q[k] &&
+                    (entries_q[inflight_owner_q[k]].addr[XLEN-1:ADDR_SHIFT+LINE_OFF_W] ==
+                     entries_q[issue_ptr_q].addr[XLEN-1:ADDR_SHIFT+LINE_OFF_W]))
+                    ip_same_line_c = 1'b1;
+            end
+            if (ip_ready_c && ip_carve_c && ip_inrange_c && !ip_same_line_c &&
+                    // this cycle the port must ALSO be aimed at issue_ptr, so the core's
+                    // LIVE data_pa == issue_ptr's PA (the issued load's actual address).
+                    (xlate_target_q == issue_ptr_q) &&
+                    (inflight_count_q < CNT_W'(LSQ_MLP)) && dmem_req_ready &&
+                    !head_data_load_en && !double_store_pending_q &&
+                    !sc_issue && !amo_issue && !commit_store) begin
+                ip_issue_fire = 1'b1;
+                ip_load_addr_word = entries_q[issue_ptr_q].addr[XLEN-1:ADDR_SHIFT];
+            end
+        end
+`endif
+
         // Flush: suppress this cycle's load issue + writeback + probe, and the
         // outstanding-load bookkeeping. Committed store WRITES are handled (and
         // intentionally preserved) by M. head_delta is moot under flush -- M / block
@@ -938,6 +1092,9 @@ module load_store_queue
             load_writeback = '0;
             head_data_load_en = 1'b0;
             store_probe_hi_next = 1'b0;
+`ifdef LSQ_MLP2
+            ip_issue_fire = 1'b0;    // no new issue under flush (drain only)
+`endif
             // A load issue suppressed by this flush must not leave a phantom
             // in-flight slot; an already-outstanding load stays outstanding and its
             // eventual response is discarded as stale.
@@ -1158,7 +1315,11 @@ module load_store_queue
         // data_load_en tracks the HD load issue independently (a store-commit does
         // not clear it), reproducing the original where load-issue set data_load_en
         // unconditionally and store-commit only overrode the address/store fields.
+`ifdef LSQ_MLP2
+        data_load_en = head_data_load_en || ip_issue_fire;
+`else
         data_load_en = head_data_load_en;
+`endif
         data_addr = '0;
         data_store = '0;
         data_store_mask = '0;
@@ -1169,7 +1330,8 @@ module load_store_queue
         dmem_req_op = DMEM_OP_LOAD;
         dmem_req_amo = 4'd0;            // M4 #3: only meaningful on the COP_AMO beat
 `ifdef LSQ_MLP2
-        dmem_req_id = '0;              // P3a: const-0 (single-outstanding). P3b: the allocated slot.
+        // The issuing load (head OR issue_ptr) is allocated the tail (next-free) slot.
+        dmem_req_id = inflight_tail_q;
 `endif
         if (double_store_pending_q) begin
             data_addr = double_store_addr_q;
@@ -1210,6 +1372,13 @@ module load_store_queue
         end else if (head_data_load_en) begin
             data_addr = load_data_addr;
             dmem_req_op = head_load_op;
+`ifdef LSQ_MLP2
+        end else if (ip_issue_fire) begin
+            // Track A: lowest-priority port user. A plain cacheable load at issue_ptr's
+            // VA word; the core translates it live (xlate_target_q==issue_ptr this cycle).
+            data_addr = ip_load_addr_word;
+            dmem_req_op = DMEM_OP_LOAD;
+`endif
         end
 
         // Precise-trap flush: discard the queued head; suppress the load issue.
@@ -1470,6 +1639,83 @@ module load_store_queue
 
 
 
+`ifdef LSQ_MLP2
+    // ==== Track A P3b: issue_ptr + inflight-FIFO next-state ====
+    // Reads registered state + this cycle's issue/free events (head_data_load_en,
+    // ip_issue_fire, data_load_valid) + the head-skip/retire results. NB reads only
+    // registered entries_q (never the wakeup array), so it adds no false loop edge.
+    always_comb begin
+        int unsigned k;
+        logic head_issue, ip_issue, resp_free, ip_want_c;
+        logic [MEM_PTR_W-1:0] head_owner, ip_adv;
+        head_issue = head_data_load_en && !flush;
+        ip_issue   = ip_issue_fire;              // already 0 under flush
+        resp_free  = data_load_valid;
+        head_owner = head_next_skip;             // the effective head's ring index
+
+        // --- xlate_target arbitration (registered next aim; strict head-priority) ---
+        head_wants_xlate = headq.entry.valid &&
+            (headq.entry.ctrl.memRead || headq.entry.ctrl.memWrite) && !headq.issued_load;
+        ip_want_c = entries_q[issue_ptr_q].entry.valid && entries_q[issue_ptr_q].addr_ready &&
+            entries_q[issue_ptr_q].entry.ctrl.memRead && !entries_q[issue_ptr_q].entry.ctrl.memWrite &&
+            (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_AMO) &&
+            !entries_q[issue_ptr_q].issued_load && (issue_ptr_q != head_q) &&
+            (inflight_count_q < CNT_W'(LSQ_MLP));
+        if (head_wants_xlate)   xlate_target_next = head_q;
+        else if (ip_want_c)     xlate_target_next = issue_ptr_q;
+        else                    xlate_target_next = head_q;
+
+        // --- issue_ptr advance (kept within [head_next, tail]; reset if head passes it) ---
+        ip_adv = ip_issue ? (issue_ptr_q + 1'b1) : issue_ptr_q;
+        if (flush)
+            issue_ptr_next = head_next;
+        else if ({1'b0, ($clog2(MEM_Q_SIZE))'(ip_adv - head_next)} <= count_next)
+            issue_ptr_next = ip_adv;
+        else
+            issue_ptr_next = head_next;   // head advanced past issue_ptr -> re-aim at head
+
+        // --- inflight FIFO next-state: copy, then kill / free / alloc ---
+        inflight_head_next  = inflight_head_q;
+        inflight_tail_next  = inflight_tail_q;
+        inflight_count_next = inflight_count_q;
+        for (k = 0; k < LSQ_MLP; k = k + 1) begin
+            inflight_valid_next[k] = inflight_valid_q[k];
+            inflight_owner_next[k] = inflight_owner_q[k];
+            inflight_kill_next[k]  = inflight_kill_q[k];
+            inflight_gen_next[k]   = inflight_gen_q[k];
+        end
+        // (a) monotonic per-slot kill: latch when the owner (while STILL the load) is
+        // squashed -- read the already-aged entries_q[owner].branch_mask this cycle
+        // (the load being squashed, pre-reallocation). Held until the slot drains.
+        for (k = 0; k < LSQ_MLP; k = k + 1) begin
+            if (inflight_valid_q[k] &&
+                ((entries_q[inflight_owner_q[k]].entry.branch_mask & abort_mask) != '0))
+                inflight_kill_next[k] = 1'b1;
+        end
+        if (flush) begin
+            for (k = 0; k < LSQ_MLP; k = k + 1)
+                if (inflight_valid_q[k]) inflight_kill_next[k] = 1'b1;
+        end
+        // (b) free the oldest slot on a response (deliver/discard decided in block HD).
+        if (resp_free && (inflight_count_q != '0)) begin
+            inflight_valid_next[inflight_head_q] = 1'b0;
+            inflight_head_next  = inflight_head_q + LSQ_ID_W'(1);
+            inflight_count_next = inflight_count_next - 1'b1;
+        end
+        // (c) allocate the tail slot on an issue (head OR issue_ptr, mutually exclusive).
+        if (head_issue || ip_issue) begin
+            inflight_valid_next[inflight_tail_q] = 1'b1;
+            inflight_owner_next[inflight_tail_q] = head_issue ? head_owner : issue_ptr_q;
+            inflight_gen_next[inflight_tail_q]   =
+                entries_q[head_issue ? head_owner : issue_ptr_q].entry.active_id;
+            inflight_kill_next[inflight_tail_q]  =
+                ((entries_q[head_issue ? head_owner : issue_ptr_q].entry.branch_mask & abort_mask) != '0);
+            inflight_tail_next  = inflight_tail_q + LSQ_ID_W'(1);
+            inflight_count_next = inflight_count_next + 1'b1;
+        end
+    end
+`endif
+
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             count_q <= '0;
@@ -1494,6 +1740,20 @@ module load_store_queue
             xlate_head_q <= '0;
             xlate_probe_q <= 1'b0;
             xlate_reqv_q <= 1'b0;
+`ifdef LSQ_MLP2
+            issue_ptr_q      <= '0;
+            inflight_head_q  <= '0;
+            inflight_tail_q  <= '0;
+            inflight_count_q <= '0;
+            xlate_target_q   <= '0;
+            xlate_tgt_q      <= '0;
+            for (int k = 0; k < LSQ_MLP; k += 1) begin
+                inflight_valid_q[k] <= 1'b0;
+                inflight_owner_q[k] <= '0;
+                inflight_kill_q[k]  <= 1'b0;
+                inflight_gen_q[k]   <= '0;
+            end
+`endif
             for (int i = 0; i < MEM_Q_SIZE; i += 1) begin
                 entries_q[i] <= '0;
             end
@@ -1524,6 +1784,23 @@ module load_store_queue
             xlate_head_q <= head_q;
             xlate_probe_q <= store_probe_hi_q;
             xlate_reqv_q <= mem_req_valid;
+`ifdef LSQ_MLP2
+            // Track A: register this cycle's translate target as the tag for the
+            // registered translate result (xlate_pa_q is the translate of mem_req_vaddr,
+            // which is aimed at xlate_target_q this cycle).
+            issue_ptr_q      <= issue_ptr_next;
+            inflight_head_q  <= inflight_head_next;
+            inflight_tail_q  <= inflight_tail_next;
+            inflight_count_q <= inflight_count_next;
+            xlate_target_q   <= xlate_target_next;
+            xlate_tgt_q      <= xlate_target_q;
+            for (int k = 0; k < LSQ_MLP; k += 1) begin
+                inflight_valid_q[k] <= inflight_valid_next[k];
+                inflight_owner_q[k] <= inflight_owner_next[k];
+                inflight_kill_q[k]  <= inflight_kill_next[k];
+                inflight_gen_q[k]   <= inflight_gen_next[k];
+            end
+`endif
             // Element-wise (not whole-array `entries_q <= entries_next`): a whole
             // unpacked-array NBA trips a Verilator V3Delayed internal error at the
             // larger MEM_Q_SIZE=32 (BIG_LSQ). Behaviourally identical, so the default
