@@ -67,6 +67,21 @@ package OOO_Types;
     localparam int MEM_Q_SIZE = 16;
 `endif
     localparam int BRANCH_STACK_SIZE = 4;
+`ifdef ALU4
+    // 3rd integer ALU issue port. ISSUE_ALU0/ALU1 stay 0/1; ISSUE_ALU2=2 inserts
+    // before MUL/DIV/FP (which shift up), and WB gets a 3rd ALU source. The ALU
+    // ports occupy the lowest ALU_ISSUE_PORTS issue indices (the IQ pick relies on
+    // this). WB_SOURCES 6->7 (3 ALU + load + MUL + DIV + FP). OFF keeps 2/5/6.
+    localparam int ALU_ISSUE_PORTS = 3;
+    localparam int FU_ISSUE_PORTS = 6;
+    localparam int WB_SOURCES = 7;
+    localparam int ISSUE_ALU0 = 0;
+    localparam int ISSUE_ALU1 = 1;
+    localparam int ISSUE_ALU2 = 2;
+    localparam int ISSUE_MUL = 3;
+    localparam int ISSUE_DIV = 4;
+    localparam int ISSUE_FP = 5;
+`else
     localparam int ALU_ISSUE_PORTS = 2;
     localparam int FU_ISSUE_PORTS = 5;
     localparam int WB_SOURCES = 6;
@@ -75,6 +90,7 @@ package OOO_Types;
     localparam int ISSUE_MUL = 2;
     localparam int ISSUE_DIV = 3;
     localparam int ISSUE_FP = 4;
+`endif
 
     localparam int ARCH_REG_BITS = 5;
     localparam int PHYS_REG_BITS = $clog2(PHYS_REGS);

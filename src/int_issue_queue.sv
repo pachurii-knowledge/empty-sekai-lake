@@ -56,10 +56,21 @@ module int_issue_queue
     // ports share a class, and only ALU ops can be control flow, so the branch
     // constraints live entirely in the ALU 2-pick.
     typedef logic [$clog2(INT_IQ_SIZE)-1:0] iq_idx_t;
-    logic [INT_IQ_SIZE-1:0] sel_rdy, sel_cf, sel_alu_cand, sel_alu1_cand;
+    logic [INT_IQ_SIZE-1:0] sel_rdy, sel_cf, sel_alu_cand, sel_csr;
     logic [INT_IQ_SIZE-1:0] sel_mul, sel_div, sel_fp;
-    iq_idx_t alu0_idx, alu1_idx, mul_idx, div_idx, fp_idx;
-    logic alu0_found, alu1_found, alu0_is_cf;
+    // Generalized ALU N-pick (scales with ALU_ISSUE_PORTS; at ALU_ISSUE_PORTS==2 it
+    // is value-identical to the former 2-pick). alu_taken tracks the running union
+    // of picked slots (distinctness); cf_prefix latches once any earlier port takes
+    // a control-flow op so later ports exclude CF (<=1 CF issue/cycle). CSR ops
+    // confine to ALU0/ALU1 (only CSR_RD_PORTS=2 csr read ports exist), so ports
+    // >= CSR_RD_PORTS exclude sel_csr.
+    localparam int CSR_RD_PORTS = 2;
+    logic [INT_IQ_SIZE-1:0]     alu_cand [ALU_ISSUE_PORTS];
+    iq_idx_t                    alu_idx  [ALU_ISSUE_PORTS];
+    logic [ALU_ISSUE_PORTS-1:0] alu_found;
+    logic [INT_IQ_SIZE-1:0]     alu_taken;
+    logic                       cf_prefix;
+    iq_idx_t mul_idx, div_idx, fp_idx;
 
     // Parallel insert: the (<= OOO_WIDTH) incoming ops fill the lowest free slots.
     logic [INT_IQ_SIZE-1:0] ins_free_mask;
@@ -144,6 +155,9 @@ module int_issue_queue
                 entries_wake[i].src1_ready && entries_wake[i].src2_ready &&
                 ((entries_q[i].branch_mask & abort_mask) == '0);
             sel_cf[i] = is_control_flow(entries_wake[i]);
+            // CSR ops read from the priv CSR file's 2 read ports (wired to ALU0/ALU1
+            // only), so they must confine to the first CSR_RD_PORTS ALU ports.
+            sel_csr[i] = (entries_wake[i].ctrl.exec_class == EXEC_CSR);
             // A control-flow op may issue only once every older branch it is
             // speculative under has resolved (branch_mask == 0).
             sel_alu_cand[i] = sel_rdy[i] && (entries_wake[i].fu_class == FU_ALU) &&
@@ -153,18 +167,26 @@ module int_issue_queue
             sel_fp[i]  = sel_rdy[i] && (entries_wake[i].fu_class == FU_FP);
         end
 
-        // ---- ALU 2-pick (ports 0,1) ----  a0 = lowest candidate; a1 = next lowest
-        // excluding a0, and -- if a0 is a control transfer -- excluding any other
-        // control transfer (at most one branch/jump issues per cycle).
-        alu0_idx   = lowest_idx(sel_alu_cand);
-        alu0_found = issue_ready[ISSUE_ALU0] && (sel_alu_cand != '0);
-        alu0_is_cf = alu0_found && sel_cf[alu0_idx];
-        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
-            sel_alu1_cand[i] = sel_alu_cand[i] && (iq_idx_t'(i) != alu0_idx) &&
-                !(alu0_is_cf && sel_cf[i]);
+        // ---- ALU N-pick (ports 0..ALU_ISSUE_PORTS-1) ----  each port picks the
+        // lowest remaining candidate, excluding already-picked slots (alu_taken),
+        // excluding any further control transfer once one is taken (cf_prefix, so
+        // <=1 CF/cycle), and excluding CSR ops on ports >= CSR_RD_PORTS. alu_found
+        // is monotone (port p requires p-1) so a failed port makes later idx
+        // don't-cares. At ALU_ISSUE_PORTS==2 this is value-identical to the 2-pick.
+        alu_taken = '0;
+        cf_prefix = 1'b0;
+        for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+            alu_cand[p] = sel_alu_cand & ~alu_taken &
+                (cf_prefix ? ~sel_cf : {INT_IQ_SIZE{1'b1}}) &
+                ((p < CSR_RD_PORTS) ? {INT_IQ_SIZE{1'b1}} : ~sel_csr);
+            alu_idx[p]   = lowest_idx(alu_cand[p]);
+            alu_found[p] = issue_ready[ISSUE_ALU0 + p] && (alu_cand[p] != '0) &&
+                ((p == 0) ? 1'b1 : alu_found[p-1]);
+            if (alu_found[p]) begin
+                alu_taken[alu_idx[p]] = 1'b1;
+                if (sel_cf[alu_idx[p]]) cf_prefix = 1'b1;
+            end
         end
-        alu1_idx   = lowest_idx(sel_alu1_cand);
-        alu1_found = alu0_found && issue_ready[ISSUE_ALU1] && (sel_alu1_cand != '0);
 
         // ---- MUL/DIV/FP single picks (independent; never control flow) ----
         mul_idx = lowest_idx(sel_mul);
@@ -174,15 +196,12 @@ module int_issue_queue
         // ---- Apply picks: drive the FU ports, clear the issued entries in the
         // post-select snapshot. The picked indices are distinct (a1 != a0;
         // MUL/DIV/FP are different fu_class), so the clears never collide. ----
-        if (alu0_found) begin
-            issue_valid[ISSUE_ALU0] = 1'b1;
-            issue_entry[ISSUE_ALU0] = entries_wake[alu0_idx];
-            entries_sel[alu0_idx] = '0;
-        end
-        if (alu1_found) begin
-            issue_valid[ISSUE_ALU1] = 1'b1;
-            issue_entry[ISSUE_ALU1] = entries_wake[alu1_idx];
-            entries_sel[alu1_idx] = '0;
+        for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+            if (alu_found[p]) begin
+                issue_valid[ISSUE_ALU0 + p] = 1'b1;
+                issue_entry[ISSUE_ALU0 + p] = entries_wake[alu_idx[p]];
+                entries_sel[alu_idx[p]] = '0;
+            end
         end
         if (issue_ready[ISSUE_MUL] && (sel_mul != '0)) begin
             issue_valid[ISSUE_MUL] = 1'b1;

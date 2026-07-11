@@ -90,6 +90,7 @@ ifeq ($(PERF),1)
 	BTB := 1
 	XLATE_BYPASS := 1
 	FP_OOO := 1
+	ALU4 := 1
 endif
 
 ifeq ($(SUPERSCALAR),4)
@@ -232,6 +233,17 @@ endif
 # -DFP_OOO). OOO only.
 ifeq ($(FP_OOO),1)
 	VERILATOR_CFLAGS += -DFP_OOO
+endif
+
+# ALU4=1 adds a 3rd integer ALU issue port (ALU_ISSUE_PORTS 2->3, plans/ooo-perf.md)
+# so up to 3 independent ALU ops issue/cycle -- relieves the 2-ALU-port throughput
+# binder on integer-ILP code (alu_ilp +25.7%; neutral where ALU1 is already idle).
+# Widens the IQ ALU pick (parameterized N-pick, bit-identical at 2 ports), adds a
+# 3rd ALU pipe (CSR confined to ALU0/1) + regfile read ports + a 3rd writeback
+# source. Folded into PERF. Default OFF is bit-identical. OOO only; area/Fmax cost
+# (like XLATE_BYPASS) -> an FPGA/ASIC build should drop it.
+ifeq ($(ALU4),1)
+	VERILATOR_CFLAGS += -DALU4
 endif
 
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \

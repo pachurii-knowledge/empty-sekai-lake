@@ -7,6 +7,9 @@ module ooo_writeback_bus
 (
     input wire writeback_packet_t alu0_writeback,
     input wire writeback_packet_t alu1_writeback,
+`ifdef ALU4
+    input wire writeback_packet_t alu2_writeback,
+`endif
     input wire writeback_packet_t load_writeback,
     input wire writeback_packet_t mul_writeback,
     input wire writeback_packet_t div_writeback,
@@ -38,13 +41,27 @@ module ooo_writeback_bus
     logic [WB_SOURCES-1:0] source_valid;
     logic [WB_SOURCES-1:0] source_accepted;
 
+    // Source indices = arbitration priority (ALU0 highest). Gated so OFF is
+    // byte-identical (WB_LOAD=2/MUL=3/DIV=4/FP=5). Under ALU4 the 3rd ALU takes
+    // index 2 and load/mul/div/fp shift up; load stays above the backpressurable
+    // mul/div/fp with only 3 ALUs over it, so load is never dropped (never needs a
+    // ready port) at 3 ports.
+`ifdef ALU4
+    localparam int WB_ALU2 = 2, WB_LOAD = 3, WB_MUL = 4, WB_DIV = 5, WB_FP = 6;
+`else
+    localparam int WB_LOAD = 2, WB_MUL = 3, WB_DIV = 4, WB_FP = 5;
+`endif
+
     always_comb begin
         packets[0] = alu0_writeback;
         packets[1] = alu1_writeback;
-        packets[2] = load_writeback;
-        packets[3] = mul_writeback;
-        packets[4] = div_writeback;
-        packets[5] = fp_writeback;
+`ifdef ALU4
+        packets[WB_ALU2] = alu2_writeback;
+`endif
+        packets[WB_LOAD] = load_writeback;
+        packets[WB_MUL]  = mul_writeback;
+        packets[WB_DIV]  = div_writeback;
+        packets[WB_FP]   = fp_writeback;
         source_valid = '0;
         source_accepted = '0;
 
@@ -98,11 +115,11 @@ module ooo_writeback_bus
             end
         end
 
-        mul_writeback_ready = !mul_writeback.valid || source_accepted[3] ||
+        mul_writeback_ready = !mul_writeback.valid || source_accepted[WB_MUL] ||
             ((mul_writeback.branch_mask & abort_mask_q) != '0);
-        div_writeback_ready = !div_writeback.valid || source_accepted[4] ||
+        div_writeback_ready = !div_writeback.valid || source_accepted[WB_DIV] ||
             ((div_writeback.branch_mask & abort_mask_q) != '0);
-        fp_writeback_ready = !fp_writeback.valid || source_accepted[5] ||
+        fp_writeback_ready = !fp_writeback.valid || source_accepted[WB_FP] ||
             ((fp_writeback.branch_mask & abort_mask_q) != '0);
     end
 
@@ -125,6 +142,12 @@ module ooo_writeback_bus
                 ((alu1_writeback.branch_mask & abort_mask_q) == '0)) begin
             branch_writeback = alu1_writeback;
         end
+`ifdef ALU4
+        if (alu2_writeback.valid && alu2_writeback.branch_valid &&
+                ((alu2_writeback.branch_mask & abort_mask_q) == '0)) begin
+            branch_writeback = alu2_writeback;
+        end
+`endif
     end
 
 endmodule: ooo_writeback_bus

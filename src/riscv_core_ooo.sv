@@ -519,6 +519,9 @@ module riscv_core_ooo
 
     writeback_packet_t alu0_writeback;
     writeback_packet_t alu1_writeback;
+`ifdef ALU4
+    writeback_packet_t alu2_writeback;   // 3rd integer ALU issue port
+`endif
     writeback_packet_t load_writeback;
     writeback_packet_t mul_writeback;
     writeback_packet_t div_writeback;
@@ -1685,6 +1688,27 @@ module riscv_core_ooo
     assign int_issue_ready[ISSUE_ALU0] = 1'b1;
     assign int_issue_ready[ISSUE_ALU1] = 1'b1;
 
+`ifdef ALU4
+    // 3rd integer ALU issue port. Mirrors ALU0/ALU1 (S2-registered issue + phys
+    // read at index ISSUE_ALU2, auto-routed by the parameterized fan-outs); CSR is
+    // tied off since the priv CSR file has only 2 read ports (the IQ N-pick keeps
+    // CSR ops on ALU0/ALU1 via sel_csr).
+    ooo_alu_pipe ALU2 (
+        .clk,
+        .rst_l,
+        .issue_valid(alu_issue_valid_q[ISSUE_ALU2]),
+        .issue_entry(alu_issue_entry_q[ISSUE_ALU2]),
+        .rs1_data(phys_rs1_data[ISSUE_ALU2]),
+        .rs2_data(phys_rs2_data[ISSUE_ALU2]),
+        .csr_rdata('0),
+        .csr_illegal(1'b0),
+        .abort_mask,
+        .flush(trap_take),
+        .writeback(alu2_writeback)
+    );
+    assign int_issue_ready[ISSUE_ALU2] = 1'b1;
+`endif
+
     ooo_mul_unit MulUnit (
         .clk,
         .rst_l,
@@ -1782,6 +1806,9 @@ module riscv_core_ooo
     ooo_writeback_bus WritebackBus (
         .alu0_writeback,
         .alu1_writeback,
+`ifdef ALU4
+        .alu2_writeback,
+`endif
         .load_writeback,
         .mul_writeback,
         .div_writeback,
