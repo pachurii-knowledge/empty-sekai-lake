@@ -134,7 +134,15 @@ module l1_dcache
 `ifdef LSQ_MLP2
     logic [DMEM_ID_W-1:0]          op_id_q;   // Track A: id of the in-flight op, echoed on resp
     // ---------------- P3c-3 op2 latch + phase (accept-and-park hit-under-miss) ----------------
-    typedef enum logic [1:0] { OP2_EMPTY, OP2_PEND, OP2_READ, OP2_PARK } op2_phase_e;
+    // P3d-2 extends the phase enum with a CONCURRENT MSHR fill leg (OP2_MISS_*): a different-set
+    // LOAD MISS whose victim is invalid/CLEAN launches its own fill concurrently with the primary
+    // miss instead of parking. Clean-victim only (dirty/same-set/store keep the P3c PARK+promote):
+    // this is coherence-safe by construction (a load fill only copies memory into a CLEAN line, so
+    // it never creates dirty state and cannot violate the C4a clean-before-refill / SMC contract).
+    typedef enum logic [2:0] {
+        OP2_EMPTY, OP2_PEND, OP2_READ, OP2_PARK,
+        OP2_MISS_FILLREQ, OP2_MISS_FILLWAIT, OP2_MISS_INSTALL
+    } op2_phase_e;
     op2_phase_e                    op2_phase_q, op2_phase_n2;
     logic                          op2_write_q;
     logic [MEMORY_ADDR_WIDTH-1:0]  op2_addr_q;
@@ -145,6 +153,13 @@ module l1_dcache
     wire [L1_INDEX_BITS-1:0]  op2_idx  = l1_index(op2_addr_q);
     wire [L1_TAG_BITS-1:0]    op2_tag  = l1_tag(op2_addr_q);
     wire [LINE_WORD_BITS-1:0] op2_woff = l1_word_off(op2_addr_q);
+    // P3d-2 concurrent op2-MSHR fill-leg context (clean-victim different-set LOAD miss only).
+    wire op2_mshr_active = (op2_phase_q == OP2_MISS_FILLREQ) ||
+                           (op2_phase_q == OP2_MISS_FILLWAIT) ||
+                           (op2_phase_q == OP2_MISS_INSTALL);
+    logic [LB-1:0]          op2_refill_line_q, op2_refill_line_n;
+    logic [L1_WAY_BITS-1:0] op2_fill_way_q, op2_fill_way_n;
+    logic [3:0]            op2_exp_fill_id_q;   // {DFILL,gen} the op2 fill was issued with (P3d-0 id-match)
 `endif
 
     // VIPT seam (M2; plans/multicore-ccd.md §V): the set index is taken from the page-offset
@@ -199,7 +214,14 @@ module l1_dcache
     logic [L1_WAY_BITS-1:0]    pway_q, pway_n;
     logic                      probe_done_q, probe_done_n;  // this probe resolved
     logic                      probe_start;                 // begin a probe in S_IDLE
-    assign probe_start = probe_valid && !probe_done_q && !flush_req;
+    // P3d-2: hold a probe off while the op2-MSHR is filling/installing -- keeps the C4a probe read
+    // from racing the op2 install on the single-port array, and the probe then snoops a quiescent
+    // array. (op2 fills are clean-only so this is a latency guard, not a coherence requirement.)
+    assign probe_start = probe_valid && !probe_done_q && !flush_req
+`ifdef LSQ_MLP2
+                         && !op2_mshr_active
+`endif
+                         ;
     assign probe_clean = probe_done_q;
 
     // ---------------- hit detection ----------------
@@ -240,6 +262,26 @@ module l1_dcache
         .state(plru_q[op_idx]), .valid(valid_q[op_idx]), .victim(victim),
         .update_en(plru_upd_en), .access_way(plru_acc_way), .next_state(plru_next)
     );
+`ifdef LSQ_MLP2
+    // P3d-2: a 2nd PLRU for the op2-MSHR's victim in op2_idx (a DIFFERENT set from op_idx, so the
+    // two never contend). Its update rides the op2-MSHR install (plru_q[op2_idx] <= op2_plru_next).
+    logic [L1_WAY_BITS-1:0] op2_victim;
+    logic                   op2_plru_upd_en;
+    logic [2:0]             op2_plru_next;
+    l1_plru #(.WAYS(L1_WAYS)) Plru2 (
+        .state(plru_q[op2_idx]), .valid(valid_q[op2_idx]), .victim(op2_victim),
+        .update_en(op2_plru_upd_en), .access_way(op2_fill_way_q), .next_state(op2_plru_next)
+    );
+    assign op2_plru_upd_en = op2_install_fire;   // touch the op2 way on its install
+    // The op2-MSHR launches only when its victim needs no writeback (invalid or CLEAN) -- keeps the
+    // leg WB-free (coherence-safe, no C2 cross-MSHR WB) so a dirty victim keeps the P3c PARK fallback.
+    wire op2_victim_clean = !(valid_q[op2_idx][op2_victim] && dirty_q[op2_idx][op2_victim]);
+    // op2 load-miss to a different set (the only op2 kind that launches an MSHR; else PARK).
+    wire op2_is_diffset_load_miss = (op2_phase_q == OP2_READ) && !op2_write_q &&
+                                    !op2_any_hit && (op2_idx != op_idx);
+    // The concurrent-MSHR launch edge (1-cycle, at OP2_READ): a genuine access + line miss.
+    wire op2_mshr_launch = op2_is_diffset_load_miss && op2_victim_clean;
+`endif
 
     // Reconstruct the byte (word) address of a (tag, set) line.
     function automatic logic [MEMORY_ADDR_WIDTH-1:0]
@@ -270,7 +312,12 @@ module l1_dcache
     // S_IDLE term (op2 is only accepted in a WAIT state, S_IDLE is not a WAIT state).
     wire op2_accept_ready = (state_q == S_WB_WAIT || state_q == S_FILL_WAIT) &&
                             !op2_occupied && !probe_valid && !flush_req;
-    assign req_ready = ((state_q == S_IDLE) && !flush_req && !probe_start) || op2_accept_ready;
+    // P3d-2 (B-NEWPRIM): while the op2-MSHR is filling, the primary FSM may sit in S_IDLE but must
+    // NOT start a FRESH primary (nor a probe) -- that would exceed the LSQ_MLP=2 budget and let a
+    // probe race the op2 install on the single-port array. So the S_IDLE accept term also gates on
+    // !op2_mshr_active.
+    assign req_ready = ((state_q == S_IDLE) && !flush_req && !probe_start && !op2_mshr_active)
+                       || op2_accept_ready;
     assign op2_accepting = op2_accept_ready;
     wire op2_latch_fire = req_fire && op2_accept_ready;
     // op2 borrows the read port ONE cycle inside a WAIT state (the !nmi_resp.valid gate keeps the
@@ -278,9 +325,24 @@ module l1_dcache
     // then fires only in {S_WB_WAIT,S_FILL_WAIT}, disjoint from resp_valid's {S_LOOKUP,S_INSTALL}).
     wire op2_read_present = (state_q == S_WB_WAIT || state_q == S_FILL_WAIT) &&
                             (op2_phase_q == OP2_PEND) && !nmi_resp.valid;
-    // op2 promotes to primary when the primary install completes (S_INSTALL) with op2 occupied.
-    wire op2_promote = (state_q == S_INSTALL) && op2_occupied;
+    // op2 promotes to primary when the primary install completes and the op2 still needs primary
+    // processing -- i.e. it is occupied but NOT an active op2-MSHR (which self-completes on resp2).
+    // This is the P3c-3 promote (any occupied op2: PEND that never got to read, or PARK) MINUS the
+    // MSHR phases. Critically it MUST include OP2_PEND: an op2 accepted late in the primary's miss
+    // can be stuck in PEND when the primary installs (op2_read_present is blocked by nmi_resp.valid
+    // on the transition cycle); orphaning it (never promoting) freezes its LSQ slot -> memq deadlock.
+    wire op2_promote = (state_q == S_INSTALL) && op2_occupied && !op2_mshr_active;
     assign op2_promote_o = op2_promote;
+    // ---- P3d-2 concurrent op2-MSHR shared-resource arbitration (primary always wins) ----
+    // NMI master port: the primary requests in its REQ states; the op2-MSHR fill issues only when
+    // the primary is not requesting (its FILL_WAIT window). Single tag/data write port: the op2-MSHR
+    // install fires only when neither a store-hit byte-write nor the primary S_INSTALL is writing.
+    wire primary_nmi_req = (state_q == S_WB_REQ) || (state_q == S_FILL_REQ) ||
+                           (state_q == S_FLUSH_WB_REQ) || (state_q == S_PROBE_WB_REQ);
+    wire op2_fill_present = (op2_phase_q == OP2_MISS_FILLREQ) && !primary_nmi_req;
+    wire op2_fill_req_fire = op2_fill_present && nmi_req_ready;
+    wire primary_install   = store_hit || (state_q == S_INSTALL);
+    wire op2_install_fire  = (op2_phase_q == OP2_MISS_INSTALL) && !primary_install;
 `else
     // A pending probe takes priority over a new request in S_IDLE.
     assign req_ready = (state_q == S_IDLE) && !flush_req && !probe_start;
@@ -307,8 +369,14 @@ module l1_dcache
     // victim-way / S_INSTALL-alias in one compare). A store op2 (op2_write_q) never serves -> parks.
     wire op2_serve_hit = (op2_phase_q == OP2_READ) && !op2_write_q &&
                          op2_any_hit && (op2_idx != op_idx);
-    assign resp2_valid = op2_serve_hit;
-    assign resp2_data  = dat_rdata[op2_hit_way][op2_woff*XLEN +: XLEN];
+    // resp2 returns EITHER an early op2 HIT (read from the array) OR the op2-MSHR's INSTALL word
+    // (read from its captured refill line). Both are mutually exclusive with the primary resp_valid:
+    // op2_serve_hit fires in {S_WB_WAIT,S_FILL_WAIT}; op2_install_fire fires only while op2_mshr_active,
+    // during which req_ready's S_IDLE term is gated off so the primary can never be at S_LOOKUP/S_INSTALL
+    // (asserted by !(resp_valid && resp2_valid) below).
+    assign resp2_valid = op2_serve_hit || op2_install_fire;
+    assign resp2_data  = op2_serve_hit ? dat_rdata[op2_hit_way][op2_woff*XLEN +: XLEN]
+                                       : op2_refill_line_q[op2_woff*XLEN +: XLEN];
     assign resp2_addr  = op2_addr_q;
     assign resp2_id    = op2_id_q;
 `endif
@@ -332,12 +400,19 @@ module l1_dcache
 
     // M7: ev_access is a continuous assign, so an op2 hit (a genuine access+hit) is OR-ed into
     // the single driver -- NOT a procedural |= (which would be a 2nd driver, illegal).
+    // P3d-2 (F3): the op2-MSHR launch is a genuine access+MISS -- count it in ev_access/ev_miss so
+    // the C3 HPM counters stay consistent with the op2-hit case (observability; the launch is a
+    // 1-cycle OP2_READ edge). op2_mshr_launch is defined with the op2 control below.
     assign ev_access = serve_hit || serve_miss
 `ifdef LSQ_MLP2
-                       || op2_serve_hit
+                       || op2_serve_hit || op2_mshr_launch
 `endif
                        ;
-    assign ev_miss   = serve_miss;
+    assign ev_miss   = serve_miss
+`ifdef LSQ_MLP2
+                       || op2_mshr_launch
+`endif
+                       ;
     assign ev_wb     = (state_q == S_WB_REQ && nmi_req_ready) ||
                        (state_q == S_FLUSH_WB_REQ && nmi_req_ready) ||
                        (state_q == S_PROBE_WB_REQ && nmi_req_ready);
@@ -363,6 +438,17 @@ module l1_dcache
             end
             default: ;
         endcase
+`ifdef LSQ_MLP2
+        // P3d-2: the concurrent op2-MSHR fill borrows the NMI port ONLY when the primary is not
+        // requesting (op2_fill_present already ANDs !primary_nmi_req), with a DISTINCT gen (gen_q
+        // increments on this fire too, below) so its {DFILL,gen} id never aliases the primary's.
+        if (op2_fill_present) begin
+            nmi_req.valid = 1'b1;
+            nmi_req.op    = NMI_RD_LINE;
+            nmi_req.waddr = l1_line_base(op2_addr_q);
+            nmi_req.id    = {NMI_SRC_DFILL, gen_q};
+        end
+`endif
     end
 
     // Array read presentation.
@@ -415,6 +501,15 @@ module l1_dcache
         end else if (state_q == S_INSTALL) begin
             tag_wen = 1'b1;
             dat_wen = 1'b1;       // full-line install (store bytes merged in)
+`ifdef LSQ_MLP2
+        end else if (op2_install_fire) begin
+            // P3d-2: the op2-MSHR installs its clean load fill at op2_idx/op2_fill_way. Fixed
+            // priority (store_hit > primary S_INSTALL > op2 install; op2_install_fire already ANDs
+            // !primary_install), and op2_idx != op_idx so the two never target the same set.
+            tag_wen   = 1'b1; tag_widx = op2_idx; tag_wway = op2_fill_way_q; tag_wtag = op2_tag;
+            dat_wen   = 1'b1; dat_widx = op2_idx; dat_wway = op2_fill_way_q;
+            dat_wdata = op2_refill_line_q; dat_wmask = '1;
+`endif
         end
     end
 
@@ -447,7 +542,14 @@ module l1_dcache
 
         unique case (state_q)
             S_IDLE: begin
-                if (flush_req) begin
+                if (flush_req
+`ifdef LSQ_MLP2
+                    // P3d-2 (F1): drain the op2-MSHR before the flush walk -- else the flush read
+                    // could race the op2 install on the single-port array. Today masked (fence.i is
+                    // serializing so op2_mshr_active is already 0), but gated + asserted defensively.
+                    && !op2_mshr_active
+`endif
+                    ) begin
                     flush_set_n = '0;
                     state_n     = S_FLUSH_READ;
                 end else if (probe_start) begin
@@ -515,7 +617,10 @@ module l1_dcache
             // registers into op_*_q on this edge (op-latch below), so S_OP2_PROMOTE presents its
             // set read against the POST-INSTALL array and S_LOOKUP resolves it fresh (M8: this arm
             // is mandatory -- default would fall to S_IDLE and silently drop the promoted op).
-            S_INSTALL: state_n = op2_occupied ? S_OP2_PROMOTE : S_IDLE;
+            // P3d-2: promote any occupied op2 EXCEPT an active op2-MSHR (which keeps filling; the
+            // primary returns to S_IDLE, whose fresh-primary accept is gated on !op2_mshr_active).
+            // Must match op2_promote (includes OP2_PEND, else a late op2 orphans -> memq deadlock).
+            S_INSTALL: state_n = (op2_occupied && !op2_mshr_active) ? S_OP2_PROMOTE : S_IDLE;
             S_OP2_PROMOTE: state_n = S_LOOKUP;
 `else
             S_INSTALL: state_n = S_IDLE;
@@ -598,8 +703,9 @@ module l1_dcache
             // M10 (replace-in-place): if a parked op2 is waiting, PROMOTE it into the primary op
             // latch on the S_INSTALL->S_OP2_PROMOTE edge (op2 is dmem-only + cacheable). Its own
             // resp fires later with op2's id; the primary's resp already fired this cycle with the
-            // primary's id. If no op2, the primary just retires (op_valid=0) as before.
-            if (op2_occupied) begin
+            // primary's id. P3d-2: promote any occupied op2 EXCEPT an active op2-MSHR (self-completes);
+            // must match op2_promote above (includes OP2_PEND, else a late op2 orphans -> memq deadlock).
+            if (op2_occupied && !op2_mshr_active) begin
                 op_valid_n2 = 1'b1;
                 op_write_n2 = op2_write_q;
                 op_addr_n2  = op2_addr_q;
@@ -626,6 +732,8 @@ module l1_dcache
         op2_phase_n2 = op2_phase_q;
         op2_write_n2 = op2_write_q; op2_addr_n2 = op2_addr_q;
         op2_wdata_n2 = op2_wdata_q; op2_wmask_n2 = op2_wmask_q; op2_id_n2 = op2_id_q;
+        op2_fill_way_n    = op2_fill_way_q;
+        op2_refill_line_n = op2_refill_line_q;
         if (op2_latch_fire) begin
             // Accept-and-park: latch ANY presented op (address-/kind-agnostic, so req_ready has no
             // comb dependence on req_write -> loop-free). A store / miss / same-set op parks; a
@@ -638,8 +746,25 @@ module l1_dcache
         end else begin
             unique case (op2_phase_q)
                 OP2_PEND: if (op2_read_present) op2_phase_n2 = OP2_READ;
-                OP2_READ: op2_phase_n2 = op2_serve_hit ? OP2_EMPTY : OP2_PARK;  // hit->done; else HELD
+                OP2_READ: begin
+                    if (op2_serve_hit) begin
+                        op2_phase_n2 = OP2_EMPTY;                     // hit -> served on resp2, done
+                    end else if (op2_is_diffset_load_miss && op2_victim_clean) begin
+                        // P3d-2 LAUNCH the concurrent MSHR: capture the (clean) victim way now, then
+                        // run the WB-free fill leg. Different-set (op2_idx!=op_idx) so no contention.
+                        op2_fill_way_n = op2_victim;
+                        op2_phase_n2   = OP2_MISS_FILLREQ;
+                    end else begin
+                        op2_phase_n2 = OP2_PARK;    // dirty-victim / same-set / store -> P3c fallback
+                    end
+                end
                 OP2_PARK: ;                                                     // held until promote
+                OP2_MISS_FILLREQ:  if (op2_fill_req_fire) op2_phase_n2 = OP2_MISS_FILLWAIT;
+                OP2_MISS_FILLWAIT: if (nmi_resp.valid && (nmi_resp.id == op2_exp_fill_id_q)) begin
+                    op2_refill_line_n = nmi_resp.rdata;
+                    op2_phase_n2      = OP2_MISS_INSTALL;
+                end
+                OP2_MISS_INSTALL:  if (op2_install_fire) op2_phase_n2 = OP2_EMPTY;
                 default: ;
             endcase
         end
@@ -666,6 +791,14 @@ module l1_dcache
         if (state_q == S_PROBE_WB_WAIT && nmi_resp.valid) begin
             dirty_n[pidx_q][pway_q] = 1'b0;
         end
+`ifdef LSQ_MLP2
+        // P3d-2: the op2-MSHR installs a valid-CLEAN line (a load fill; never dirty -> no new
+        // coherence/SMC state). Different set from the primary install (op2_idx != op_idx).
+        if (op2_install_fire) begin
+            valid_n[op2_idx][op2_fill_way_q] = 1'b1;
+            dirty_n[op2_idx][op2_fill_way_q] = 1'b0;
+        end
+`endif
     end
 
     always_ff @(posedge clk or negedge rst_l) begin
@@ -684,6 +817,9 @@ module l1_dcache
             op2_wdata_q   <= '0;
             op2_wmask_q   <= '0;
             op2_id_q      <= '0;
+            op2_refill_line_q <= '0;
+            op2_fill_way_q    <= '0;
+            op2_exp_fill_id_q <= '0;
             exp_wb_id_q   <= '0;
             exp_fill_id_q <= '0;
 `endif
@@ -718,6 +854,8 @@ module l1_dcache
             op2_wdata_q   <= op2_wdata_n2;
             op2_wmask_q   <= op2_wmask_n2;
             op2_id_q      <= op2_id_n2;
+            op2_refill_line_q <= op2_refill_line_n;
+            op2_fill_way_q    <= op2_fill_way_n;
 `endif
             refill_line_q <= refill_line_n;
             fill_way_q    <= fill_way_n;
@@ -729,20 +867,36 @@ module l1_dcache
             ptag_q        <= ptag_n;
             pway_q        <= pway_n;
             probe_done_q  <= probe_done_n;
+`ifdef LSQ_MLP2
+            // P3d-2: the op2-MSHR fill also consumes a distinct gen (kept in an ifdef/else so the
+            // OFF token stream is byte-identical to the pre-P3d condition -- no leaked parens).
+            if (((state_q == S_WB_REQ || state_q == S_FILL_REQ ||
+                 state_q == S_FLUSH_WB_REQ || state_q == S_PROBE_WB_REQ) && nmi_req_ready)
+                || op2_fill_req_fire)
+                gen_q <= gen_q + 2'd1;
+`else
             if ((state_q == S_WB_REQ || state_q == S_FILL_REQ ||
                  state_q == S_FLUSH_WB_REQ || state_q == S_PROBE_WB_REQ) && nmi_req_ready)
                 gen_q <= gen_q + 2'd1;
+`endif
 `ifdef LSQ_MLP2
             // P3d-0: latch the id each miss leg was issued with (same edge as the gen_q bump, so
             // it captures the gen_q value the outgoing nmi_req.id used, before the increment).
             if ((state_q == S_WB_REQ)   && nmi_req_ready) exp_wb_id_q   <= {NMI_SRC_DWB,   gen_q};
             if ((state_q == S_FILL_REQ) && nmi_req_ready) exp_fill_id_q <= {NMI_SRC_DFILL, gen_q};
+            // P3d-2: the op2-MSHR fill's expected response id (its own gen, distinct from primary).
+            if (op2_fill_req_fire) op2_exp_fill_id_q <= {NMI_SRC_DFILL, gen_q};
 `endif
             for (int s = 0; s < L1_SETS; s += 1) begin
                 valid_q[s] <= valid_n[s];
                 dirty_q[s] <= dirty_n[s];
             end
             if (plru_upd_en) plru_q[op_idx] <= plru_next;
+`ifdef LSQ_MLP2
+            // P3d-2: the op2-MSHR install touches its (different-set) way. Distinct index from
+            // plru_q[op_idx] above, so both can update the same cycle without conflict.
+            if (op2_plru_upd_en) plru_q[op2_idx] <= op2_plru_next;
+`endif
         end
     end
 
@@ -765,8 +919,41 @@ module l1_dcache
             assert (!((op2_phase_q == OP2_READ) && !op2_write_q && op2_any_hit &&
                       (op2_idx == op_idx) && resp2_valid))
                 else $fatal(1, "l1_dcache: same-set op2 served early (interlock bypassed)");
+            // P3d-2: the op2-MSHR always operates on a DIFFERENT set than the primary (disjoint =>
+            // no victim/PLRU/tag/valid collision, C1/C2 closed) -- a new primary can't start while it
+            // is active (req_ready S_IDLE gated on !op2_mshr_active), so op_idx is stable and distinct.
+            assert (!(op2_mshr_active && (op2_idx == op_idx)))
+                else $fatal(1, "l1_dcache: op2-MSHR same set as primary (C1/C2 invariant broken)");
+            // P3d-2 (C4): two concurrent DFILL waits must carry DISTINCT ids (else a response would
+            // install into the wrong context = silent corruption).
+            assert (!((state_q == S_FILL_WAIT) && (op2_phase_q == OP2_MISS_FILLWAIT) &&
+                      (exp_fill_id_q == op2_exp_fill_id_q)))
+                else $fatal(1, "l1_dcache: primary + op2 fill id alias (C4)");
+            // P3d-2 (install serialize): at most one writer of the array per cycle.
+            assert (!(op2_install_fire && primary_install))
+                else $fatal(1, "l1_dcache: op2 install races primary install (write-port)");
         end
     end
+`endif
+
+`ifdef LSQ_MLP_STAT
+    // P3d-2 activation: cycles the L1D holds TWO miss contexts at once (a primary miss S_{WB,FILL}_*
+    // AND the concurrent op2-MSHR). == 0 at P3c-3, > 0 at P3d-2 on mlp_stream => the concurrent-MSHR
+    // structure engages. (IPC is still flat at P3d-2 -- the single-outstanding backend serializes the
+    // two fills; P3d-3's concurrent adapter is what overlaps them.)
+    wire l1d_primary_miss = (state_q == S_WB_REQ) || (state_q == S_WB_WAIT) ||
+                            (state_q == S_FILL_REQ) || (state_q == S_FILL_WAIT) || (state_q == S_INSTALL);
+    longint unsigned l1d_two_miss_cyc, l1d_op2_mshr_launches;
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin l1d_two_miss_cyc <= '0; l1d_op2_mshr_launches <= '0; end
+        else begin
+            if (l1d_primary_miss && op2_mshr_active) l1d_two_miss_cyc <= l1d_two_miss_cyc + 1;
+            if ((op2_phase_q == OP2_READ) && op2_is_diffset_load_miss && op2_victim_clean)
+                l1d_op2_mshr_launches <= l1d_op2_mshr_launches + 1;
+        end
+    end
+    final $display("L1D-P3D-STAT: two_miss_cyc=%0d op2_mshr_launches=%0d",
+                   l1d_two_miss_cyc, l1d_op2_mshr_launches);
 `endif
 
 `ifdef AGENT_DEBUG
