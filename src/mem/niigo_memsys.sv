@@ -573,12 +573,29 @@ module niigo_memsys
     logic [MEMORY_ADDR_WIDTH-1:0]  l1d_resp_addr;
 `ifdef LSQ_MLP2
     logic [DMEM_ID_W-1:0]          l1d_resp_id;   // Track A: L1D op-sidecar id echo
+    // P3c-3 hit-under-miss: the L1D's 2nd (op2) response lane + the op2-accept/promote seam
+    // signals (M6: declared + wired under ifdef so the OFF l1_dcache -- which has no such ports --
+    // is never referenced).
+    logic                          l1d_resp2_valid;
+    logic [XLEN-1:0]               l1d_resp2_data;
+    logic [MEMORY_ADDR_WIDTH-1:0]  l1d_resp2_addr;
+    logic [DMEM_ID_W-1:0]          l1d_resp2_id;
+    logic                          l1d_op2_accepting;
+    logic                          l1d_op2_promote;
 `endif
 
     logic present_dmem, present_ptw;
     logic owner_ptw_q;        // owner of the in-flight L1D op (0 = dmem, 1 = PTW)
     assign present_dmem = dmem_req_valid && !dmem_req_device;
+    // B1 (P3c-3): during an op2-accept window the L1D is servicing a primary miss, so ONLY a dmem
+    // op may be presented as op2 (op2 is dmem-only by construction) -- suppress the PTW so it is
+    // never latched as op2 and its level-held request is preserved. OFF/primary path identical
+    // (l1d_op2_accepting is 0 whenever the L1D can take a fresh primary).
+`ifdef LSQ_MLP2
+    assign present_ptw  = !present_dmem && ptw_req_valid && !l1d_op2_accepting;
+`else
     assign present_ptw  = !present_dmem && ptw_req_valid;
+`endif
 
     assign l1d_req_valid = present_dmem || present_ptw;
     assign l1d_req_write = present_dmem ? dmem_req_write : ptw_req_we;
@@ -596,7 +613,16 @@ module niigo_memsys
     assign l1d_req_fire = l1d_req_valid && l1d_req_ready;
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l)            owner_ptw_q <= 1'b0;
+`ifdef LSQ_MLP2
+        // B1: an op2 accept (l1d_req_fire while l1d_op2_accepting) must NOT clobber the primary's
+        // owner bit. B2: a promoted op2 becomes the new PRIMARY and is dmem-only, so reset owner to
+        // dmem on the promote edge -- else a dmem load promoted behind a fetch-side PTW miss would
+        // inherit owner_ptw_q=1 and false-ack the walker while its own response is swallowed (deadlock).
+        else if (l1d_op2_promote)                       owner_ptw_q <= 1'b0;
+        else if (l1d_req_fire && !l1d_op2_accepting)    owner_ptw_q <= present_ptw;
+`else
         else if (l1d_req_fire) owner_ptw_q <= present_ptw;
+`endif
     end
 
     nmi_req_t  l1d_nmi_req;
@@ -620,6 +646,9 @@ module niigo_memsys
         .resp_addr(l1d_resp_addr), .wr_accept(l1d_wr_accept),
 `ifdef LSQ_MLP2
         .req_id(l1d_req_id), .resp_id(l1d_resp_id),
+        .resp2_valid(l1d_resp2_valid), .resp2_data(l1d_resp2_data),
+        .resp2_addr(l1d_resp2_addr), .resp2_id(l1d_resp2_id),
+        .op2_accepting(l1d_op2_accepting), .op2_promote_o(l1d_op2_promote),
 `endif
         .flush_req(dcache_flush_req), .flush_done(dcache_flush_done),
         .probe_valid(l1d_probe_valid), .probe_waddr(l1d_probe_waddr),
@@ -634,23 +663,37 @@ module niigo_memsys
     // from that address) would form a combinational cycle. Requiring both free
     // is loss-free here: the LSQ keeps one D-access outstanding, so whichever
     // path the previous op used is already idle by the time the next op issues.
+    // l1d_req_ready is now relaxed INSIDE the L1D (it asserts during an op2-accept window too), so
+    // this is unchanged: during a primary miss it goes high only when the L1D can take an op2, and
+    // both terms stay registered-state-derived (loop-free, same discipline as before).
     assign dmem_req_ready = dev_ready && l1d_req_ready;
+`ifdef LSQ_MLP2
+    // B4 (P3c-3): resp2-aware response mux. resp2 (op2 hit-under-miss, dmem-only) is OR-muxed onto
+    // the single dmem lane with NO skid: it is provably per-cycle exclusive with the primary
+    // (resp fires only in {S_LOOKUP,S_INSTALL}, resp2 only in {S_WB_WAIT,S_FILL_WAIT} -- the L1D
+    // asserts !(resp_valid && resp2_valid)) and with the device path (device/cacheable never in
+    // flight together, B3 device gate). Priority is immaterial (all three mutually exclusive).
+    assign dmem_resp_valid = dev_resp_valid || (l1d_resp_valid && !owner_ptw_q) || l1d_resp2_valid;
+    assign dmem_resp_addr  = l1d_resp2_valid ? l1d_resp2_addr
+                           : dev_resp_valid  ? dev_addr_q : l1d_resp_addr;
+    assign dmem_resp_data  = l1d_resp2_valid ? l1d_resp2_data
+                           : dev_resp_valid  ? '0 : l1d_resp_data;
+    assign dmem_resp_id    = l1d_resp2_valid ? l1d_resp2_id
+                           : dev_resp_valid  ? dev_id_q : l1d_resp_id;
+    always_ff @(posedge clk) begin
+        if (rst_l) begin
+            assert (!(dev_resp_valid && l1d_resp_valid && !owner_ptw_q))
+                else $fatal(1, "niigo_memsys: dev+cache dmem_resp collision (carve-out #4 violated)");
+            // resp2 must never coincide with a primary/device completion on the shared lane.
+            assert (!(l1d_resp2_valid && (dev_resp_valid || (l1d_resp_valid && !owner_ptw_q))))
+                else $fatal(1, "niigo_memsys: resp2 collides with primary/device dmem_resp");
+        end
+    end
+`else
     // dmem response: device dummy (core overrides data) or L1D load.
     assign dmem_resp_valid = dev_resp_valid || (l1d_resp_valid && !owner_ptw_q);
     assign dmem_resp_addr  = dev_resp_valid ? dev_addr_q : l1d_resp_addr;
     assign dmem_resp_data  = dev_resp_valid ? '0 : l1d_resp_data;
-`ifdef LSQ_MLP2
-    // Track A: the device path uses its own latched dev_id_q (no address-recoverable
-    // slot); a cacheable load uses the L1D op-sidecar echo. Mutually exclusive by
-    // carve-out #4 (device and cacheable loads never in flight together).
-    assign dmem_resp_id    = dev_resp_valid ? dev_id_q : l1d_resp_id;
-    // Guard that invariant: the single dmem_resp lane must never carry a device and
-    // a cacheable completion the same cycle (would silently drop one -> slot leak).
-    always_ff @(posedge clk) begin
-        if (rst_l)
-            assert (!(dev_resp_valid && l1d_resp_valid && !owner_ptw_q))
-                else $fatal(1, "niigo_memsys: dev+cache dmem_resp collision (carve-out #4 violated)");
-    end
 `endif
 
     // PTW ack: acked when its L1D op completes -- a read on the load response,

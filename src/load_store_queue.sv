@@ -412,6 +412,11 @@ module load_store_queue
     logic [MEMORY_ADDR_WIDTH-1:0] ip_load_addr_word;
     // "the head still needs the translate port" -- head-priority arbitration input.
     logic                  head_wants_xlate;
+    // B3 (P3c-3): the head load's resolved PA (xlate_pa_eff) is a device -- a device load and a
+    // cacheable load must never be in flight together (they use different memsys response lanes;
+    // a coincident device+cacheable completion would mask one -> slot leak/deadlock). So a device
+    // head load may only issue when NO cacheable load is outstanding (inflight_count_q==0).
+    logic                  head_dev_load;
     // ---- P3b review fixes (wf_71a9e035-6d8) ----
     // MF2/MF5: issue_ptr's forward distance from head_q as its OWN register (kills the
     // mod-ring teleport). Invariant: issue_ptr_q == (head_q + ip_off_q) mod MEM_Q_SIZE.
@@ -580,6 +585,7 @@ module load_store_queue
         park_delta_we = 1'b0;          // P3c-2: no park write unless a younger response completes
         park_delta_idx = '0;
         park_delta_data = '0;
+        head_dev_load = 1'b0;          // B3: recomputed from xlate_pa_eff below (before the issue gate)
 `endif
         store_probe_hi_next = 1'b0;
         mem_inflight_next = mem_inflight_q;
@@ -730,6 +736,15 @@ module load_store_queue
         head_xlate_ok  = !xlate_fault_eff && xlate_ready_eff &&
             (!paging_data || (head_match && !xlate_stall_eff));
         head_xlate_flt = head_match && xlate_ready_eff && xlate_fault_eff;
+
+`ifdef LSQ_MLP2
+        // B3: device-ness of the head load's issued PA (xlate_pa_eff, now finalized) -- same byte-PA
+        // device hole the core decodes. Gates the head device-load issue on inflight_count_q==0 below.
+        head_dev_load =
+            ((xlate_pa_eff >= XLEN'('h0200_0000)) && (xlate_pa_eff < XLEN'('h0201_0000))) ||
+            ((xlate_pa_eff >= XLEN'('h0C00_0000)) && (xlate_pa_eff < XLEN'('h1000_0000))) ||
+            ((xlate_pa_eff >= XLEN'('h0D00_0000)) && (xlate_pa_eff < XLEN'('h0D00_1000)));
+`endif
 
         // The per-op head blocks below write the single head entry via head_delta
         // (sparse per-field write-enables) instead of indexing entries_premerge,
@@ -945,8 +960,11 @@ module load_store_queue
                 // so the port must be aimed at the head this cycle (mlp_xt_head); and a
                 // free inflight slot must exist. (mlp_xt_head is true here by strict
                 // head-priority whenever !issued_load, so this only bulletproofs the
-                // 1-cycle target-register transition.)
-                && mlp_xt_head && (inflight_count_q < LSQ_MLP)
+                // 1-cycle target-register transition.) B3: a DEVICE head load may issue ONLY
+                // when no cacheable load is outstanding (count==0), so a device response can
+                // never coincide with a cacheable one on the shared dmem lane.
+                && mlp_xt_head
+                && (head_dev_load ? (inflight_count_q == '0) : (inflight_count_q < LSQ_MLP))
 `endif
                 ) begin
             head_done = 1'b1;

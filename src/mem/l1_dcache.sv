@@ -41,6 +41,18 @@ module l1_dcache
     // so the memsys/LSQ can match a load response to its outstanding slot (P3c).
     input wire logic [DMEM_ID_W-1:0]          req_id,
     output logic [DMEM_ID_W-1:0]              resp_id,
+    // P3c-3 hit-under-miss: a 2nd op (op2) is accepted during a primary miss (S_WB_WAIT/
+    // S_FILL_WAIT), read-only, and if it HITS its data returns on this dedicated resp2 lane;
+    // a miss/store/same-set op2 is held and promoted to the next primary. op2_accepting tells
+    // the memsys THIS req_fire landed in op2 (not S_IDLE) so it does not clobber owner_ptw_q;
+    // op2_promote pulses when a parked op2 is promoted to primary (dmem-only) so the memsys
+    // resets owner_ptw_q (B2). All read-only / dmem-only by construction.
+    output logic                          resp2_valid,
+    output logic [XLEN-1:0]               resp2_data,
+    output logic [MEMORY_ADDR_WIDTH-1:0]  resp2_addr,
+    output logic [DMEM_ID_W-1:0]          resp2_id,
+    output logic                          op2_accepting,
+    output logic                          op2_promote_o,
 `endif
     output logic                          resp_valid,    // load data this cycle
     output logic [XLEN-1:0]               resp_data,
@@ -121,6 +133,18 @@ module l1_dcache
     logic [WBY-1:0]                op_wmask_q;
 `ifdef LSQ_MLP2
     logic [DMEM_ID_W-1:0]          op_id_q;   // Track A: id of the in-flight op, echoed on resp
+    // ---------------- P3c-3 op2 latch + phase (accept-and-park hit-under-miss) ----------------
+    typedef enum logic [1:0] { OP2_EMPTY, OP2_PEND, OP2_READ, OP2_PARK } op2_phase_e;
+    op2_phase_e                    op2_phase_q, op2_phase_n2;
+    logic                          op2_write_q;
+    logic [MEMORY_ADDR_WIDTH-1:0]  op2_addr_q;
+    logic [WB_W-1:0]               op2_wdata_q;
+    logic [WBY-1:0]                op2_wmask_q;
+    logic [DMEM_ID_W-1:0]          op2_id_q;
+    wire op2_occupied = (op2_phase_q != OP2_EMPTY);   // review's "op2_valid" (single source of truth)
+    wire [L1_INDEX_BITS-1:0]  op2_idx  = l1_index(op2_addr_q);
+    wire [L1_TAG_BITS-1:0]    op2_tag  = l1_tag(op2_addr_q);
+    wire [LINE_WORD_BITS-1:0] op2_woff = l1_word_off(op2_addr_q);
 `endif
 
     // VIPT seam (M2; plans/multicore-ccd.md §V): the set index is taken from the page-offset
@@ -146,7 +170,10 @@ module l1_dcache
     typedef enum logic [3:0] {
         S_IDLE, S_LOOKUP, S_WB_REQ, S_WB_WAIT, S_FILL_REQ, S_FILL_WAIT, S_INSTALL,
         S_FLUSH_READ, S_FLUSH_SCAN, S_FLUSH_WB_REQ, S_FLUSH_WB_WAIT, S_FLUSH_DONE,
-        S_PROBE_LOOK, S_PROBE_WB_REQ, S_PROBE_WB_WAIT
+        S_PROBE_LOOK, S_PROBE_WB_REQ, S_PROBE_WB_WAIT   // 0..14 (encoding frozen for OFF byte-identity)
+`ifdef LSQ_MLP2
+        , S_OP2_PROMOTE                                 // 15: re-lookup a promoted parked op2 (P3c-3)
+`endif
     } state_e;
     state_e state_q, state_n;
 
@@ -225,12 +252,57 @@ module l1_dcache
 
     // ---------------- control ----------------
     logic req_fire, serve_hit, serve_miss, store_hit;
+`ifdef LSQ_MLP2
+    // P3c-3: the read port is idle throughout a primary miss's WAIT states, so a 2nd HIT-ONLY
+    // op (op2) can borrow it. Accept op2 when: in a WAIT state, op2 slot empty, no probe pending,
+    // no flush queued. Every term is REGISTERED state / an out-of-band input -- NONE touches
+    // req_write/req_waddr/req_id -- so req_ready never depends on op kind (same loop-freedom as the
+    // memsys dmem_req_ready = dev_ready && l1d_req_ready). op2_accept_ready is disjoint from the
+    // S_IDLE term (op2 is only accepted in a WAIT state, S_IDLE is not a WAIT state).
+    wire op2_accept_ready = (state_q == S_WB_WAIT || state_q == S_FILL_WAIT) &&
+                            !op2_occupied && !probe_valid && !flush_req;
+    assign req_ready = ((state_q == S_IDLE) && !flush_req && !probe_start) || op2_accept_ready;
+    assign op2_accepting = op2_accept_ready;
+    wire op2_latch_fire = req_fire && op2_accept_ready;
+    // op2 borrows the read port ONE cycle inside a WAIT state (the !nmi_resp.valid gate keeps the
+    // resulting OP2_READ cycle STILL inside that WAIT state -- the B3-review no-skid proof: resp2
+    // then fires only in {S_WB_WAIT,S_FILL_WAIT}, disjoint from resp_valid's {S_LOOKUP,S_INSTALL}).
+    wire op2_read_present = (state_q == S_WB_WAIT || state_q == S_FILL_WAIT) &&
+                            (op2_phase_q == OP2_PEND) && !nmi_resp.valid;
+    // op2 promotes to primary when the primary install completes (S_INSTALL) with op2 occupied.
+    wire op2_promote = (state_q == S_INSTALL) && op2_occupied;
+    assign op2_promote_o = op2_promote;
+`else
     // A pending probe takes priority over a new request in S_IDLE.
     assign req_ready = (state_q == S_IDLE) && !flush_req && !probe_start;
+`endif
     assign req_fire  = req_valid && req_ready;
     assign serve_hit  = (state_q == S_LOOKUP) && op_valid_q &&  any_hit;
     assign serve_miss = (state_q == S_LOOKUP) && op_valid_q && !any_hit;
     assign store_hit  = serve_hit && op_write_q;
+
+`ifdef LSQ_MLP2
+    // ---- op2 hit detection (valid only in OP2_READ, when tag_rdata holds op2's set) ----
+    logic [L1_WAYS-1:0]     op2_hit_oh;
+    logic                   op2_any_hit;
+    logic [L1_WAY_BITS-1:0] op2_hit_way;
+    always_comb begin
+        for (int w = 0; w < L1_WAYS; w += 1)
+            op2_hit_oh[w] = valid_q[op2_idx][w] && (tag_rdata[w] == op2_tag);
+        op2_any_hit = |op2_hit_oh;
+        op2_hit_way = '0;
+        for (int w = 0; w < L1_WAYS; w += 1) if (op2_hit_oh[w]) op2_hit_way = L1_WAY_BITS'(w);
+    end
+    // SERVE (read-only): an op2 that is a cacheable LOAD HIT to a DIFFERENT SET than the in-flight
+    // miss (op_idx). op2_idx==op_idx PARKS (same-set interlock, C1: forecloses same-line-refill /
+    // victim-way / S_INSTALL-alias in one compare). A store op2 (op2_write_q) never serves -> parks.
+    wire op2_serve_hit = (op2_phase_q == OP2_READ) && !op2_write_q &&
+                         op2_any_hit && (op2_idx != op_idx);
+    assign resp2_valid = op2_serve_hit;
+    assign resp2_data  = dat_rdata[op2_hit_way][op2_woff*XLEN +: XLEN];
+    assign resp2_addr  = op2_addr_q;
+    assign resp2_id    = op2_id_q;
+`endif
 
     // Load response: a hit in S_LOOKUP, or the install of a load miss.
     logic load_resp_lookup, load_resp_install;
@@ -249,7 +321,13 @@ module l1_dcache
     // miss. (The LSQ ignores this; the PTW uses it as its write ack.)
     assign wr_accept = store_hit || ((state_q == S_INSTALL) && op_write_q);
 
-    assign ev_access = serve_hit || serve_miss;
+    // M7: ev_access is a continuous assign, so an op2 hit (a genuine access+hit) is OR-ed into
+    // the single driver -- NOT a procedural |= (which would be a 2nd driver, illegal).
+    assign ev_access = serve_hit || serve_miss
+`ifdef LSQ_MLP2
+                       || op2_serve_hit
+`endif
+                       ;
     assign ev_miss   = serve_miss;
     assign ev_wb     = (state_q == S_WB_REQ && nmi_req_ready) ||
                        (state_q == S_FLUSH_WB_REQ && nmi_req_ready) ||
@@ -292,6 +370,18 @@ module l1_dcache
         end else if (state_q == S_FLUSH_READ) begin
             tag_ren = 1'b1; tag_ridx = flush_set_q;
             dat_ren = 1'b1; dat_ridx = flush_set_q;
+`ifdef LSQ_MLP2
+        // P3c-3: op2 borrows the idle read port for one cycle inside a WAIT state (op2_read_present),
+        // and again for the promoted op2's re-lookup (S_OP2_PROMOTE). Both are in cycles with NO array
+        // write (dat_wen/tag_wen assert only in store_hit@S_LOOKUP and S_INSTALL), so read and write are
+        // always in disjoint cycles (B7; asserted below).
+        end else if (op2_read_present) begin
+            tag_ren = 1'b1; tag_ridx = op2_idx;
+            dat_ren = 1'b1; dat_ridx = op2_idx;
+        end else if (state_q == S_OP2_PROMOTE) begin
+            tag_ren = 1'b1; tag_ridx = op_idx;   // op_idx is now the promoted op2's index
+            dat_ren = 1'b1; dat_ridx = op_idx;
+`endif
         end
     end
 
@@ -400,7 +490,16 @@ module l1_dcache
                 refill_line_n = nmi_resp.rdata;
                 state_n       = S_INSTALL;
             end
+`ifdef LSQ_MLP2
+            // P3c-3: drain a parked op2 (promote it to primary) before returning idle. The op2
+            // registers into op_*_q on this edge (op-latch below), so S_OP2_PROMOTE presents its
+            // set read against the POST-INSTALL array and S_LOOKUP resolves it fresh (M8: this arm
+            // is mandatory -- default would fall to S_IDLE and silently drop the promoted op).
+            S_INSTALL: state_n = op2_occupied ? S_OP2_PROMOTE : S_IDLE;
+            S_OP2_PROMOTE: state_n = S_LOOKUP;
+`else
             S_INSTALL: state_n = S_IDLE;
+`endif
 
             // ---- flush walk ----
             S_FLUSH_READ: state_n = S_FLUSH_SCAN;
@@ -475,9 +574,57 @@ module l1_dcache
         end else if (state_q == S_LOOKUP && any_hit) begin
             op_valid_n2 = 1'b0;
         end else if (state_q == S_INSTALL) begin
+`ifdef LSQ_MLP2
+            // M10 (replace-in-place): if a parked op2 is waiting, PROMOTE it into the primary op
+            // latch on the S_INSTALL->S_OP2_PROMOTE edge (op2 is dmem-only + cacheable). Its own
+            // resp fires later with op2's id; the primary's resp already fired this cycle with the
+            // primary's id. If no op2, the primary just retires (op_valid=0) as before.
+            if (op2_occupied) begin
+                op_valid_n2 = 1'b1;
+                op_write_n2 = op2_write_q;
+                op_addr_n2  = op2_addr_q;
+                op_wdata_n2 = op2_wdata_q;
+                op_wmask_n2 = op2_wmask_q;
+                op_id_n2    = op2_id_q;
+            end else begin
+                op_valid_n2 = 1'b0;
+            end
+`else
             op_valid_n2 = 1'b0;
+`endif
         end
     end
+
+`ifdef LSQ_MLP2
+    // ---- op2 phase next-state + field latches ----
+    logic op2_write_n2;
+    logic [MEMORY_ADDR_WIDTH-1:0] op2_addr_n2;
+    logic [WB_W-1:0] op2_wdata_n2;
+    logic [WBY-1:0]  op2_wmask_n2;
+    logic [DMEM_ID_W-1:0] op2_id_n2;
+    always_comb begin
+        op2_phase_n2 = op2_phase_q;
+        op2_write_n2 = op2_write_q; op2_addr_n2 = op2_addr_q;
+        op2_wdata_n2 = op2_wdata_q; op2_wmask_n2 = op2_wmask_q; op2_id_n2 = op2_id_q;
+        if (op2_latch_fire) begin
+            // Accept-and-park: latch ANY presented op (address-/kind-agnostic, so req_ready has no
+            // comb dependence on req_write -> loop-free). A store / miss / same-set op parks; a
+            // different-set load HIT serves early (resp2) then leaves.
+            op2_phase_n2 = OP2_PEND;
+            op2_write_n2 = req_write; op2_addr_n2 = req_waddr;
+            op2_wdata_n2 = req_wdata; op2_wmask_n2 = req_wmask; op2_id_n2 = req_id;
+        end else if (op2_promote) begin
+            op2_phase_n2 = OP2_EMPTY;   // moved into the primary op latch (above)
+        end else begin
+            unique case (op2_phase_q)
+                OP2_PEND: if (op2_read_present) op2_phase_n2 = OP2_READ;
+                OP2_READ: op2_phase_n2 = op2_serve_hit ? OP2_EMPTY : OP2_PARK;  // hit->done; else HELD
+                OP2_PARK: ;                                                     // held until promote
+                default: ;
+            endcase
+        end
+    end
+`endif
 
     // valid / dirty next state.
     always_comb begin
@@ -511,6 +658,12 @@ module l1_dcache
             op_wmask_q    <= '0;
 `ifdef LSQ_MLP2
             op_id_q       <= '0;
+            op2_phase_q   <= OP2_EMPTY;
+            op2_write_q   <= 1'b0;
+            op2_addr_q    <= '0;
+            op2_wdata_q   <= '0;
+            op2_wmask_q   <= '0;
+            op2_id_q      <= '0;
 `endif
             refill_line_q <= '0;
             fill_way_q    <= '0;
@@ -537,6 +690,12 @@ module l1_dcache
             op_wmask_q    <= op_wmask_n2;
 `ifdef LSQ_MLP2
             op_id_q       <= op_id_n2;
+            op2_phase_q   <= op2_phase_n2;
+            op2_write_q   <= op2_write_n2;
+            op2_addr_q    <= op2_addr_n2;
+            op2_wdata_q   <= op2_wdata_n2;
+            op2_wmask_q   <= op2_wmask_n2;
+            op2_id_q      <= op2_id_n2;
 `endif
             refill_line_q <= refill_line_n;
             fill_way_q    <= fill_way_n;
@@ -558,6 +717,29 @@ module l1_dcache
             if (plru_upd_en) plru_q[op_idx] <= plru_next;
         end
     end
+
+`ifdef LSQ_MLP2
+    // ---- P3c-3 assertions (sim-only) ----
+    always_ff @(posedge clk) begin
+        if (rst_l) begin
+            // B3 no-skid proof: resp (primary, in {S_LOOKUP,S_INSTALL}) and resp2 (op2 hit, in a
+            // WAIT state via the !nmi_resp gate) are in disjoint state sets -> never both valid.
+            assert (!(resp_valid && resp2_valid))
+                else $fatal(1, "l1_dcache: resp/resp2 same-cycle collision (B3 invariant broken)");
+            // B7: op2's read is presented only in cycles with NO array write -> disjoint.
+            assert (!(dat_ren && dat_wen))
+                else $fatal(1, "l1_dcache: dat_ren && dat_wen same cycle (B7)");
+            assert (!(tag_ren && tag_wen))
+                else $fatal(1, "l1_dcache: tag_ren && tag_wen same cycle (B7)");
+            // M11: the same-set interlock, asserted on the DECOMPOSED precondition (op2_serve_hit
+            // already ANDs op2_idx!=op_idx, so asserting it there is tautological). A same-set op2
+            // that would otherwise hit must NEVER produce resp2 -- it must park.
+            assert (!((op2_phase_q == OP2_READ) && !op2_write_q && op2_any_hit &&
+                      (op2_idx == op_idx) && resp2_valid))
+                else $fatal(1, "l1_dcache: same-set op2 served early (interlock bypassed)");
+        end
+    end
+`endif
 
 `ifdef AGENT_DEBUG
     always_ff @(posedge clk) begin
