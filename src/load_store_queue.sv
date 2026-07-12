@@ -163,6 +163,15 @@ module load_store_queue
         // which can have been evicted from the small DTLB by the time the store
         // reaches commit (a later cycle), orphaning the committed store.
         logic [XLEN-1:0] store_lo_pa;
+`ifdef LSQ_MLP2
+        // P3c out-of-order parked completion: a younger hit-under-miss load whose response
+        // returns BEFORE it reaches the head latches its RAW returned word here + sets
+        // parked_done; on becoming head the entry retires from parked_data (formatted by the
+        // same live path) with no fresh response. Both fields are LSQ_MLP2-only so the OFF
+        // struct width (and every LSQ-instantiating module's netlist) is unchanged (M1).
+        logic [XLEN-1:0] parked_data;
+        logic            parked_done;
+`endif
     } mem_entry_t;
 
     // Byte-address -> word-address shift for the word-granular memory bus.
@@ -421,6 +430,18 @@ module load_store_queue
     // A3: write issued_load=1 on the issue_ptr-issued entry (else it re-issues at head).
     logic                  ip_delta_we_issued;
     logic [MEM_PTR_W-1:0]  ip_delta_idx;
+    // P3c-2: park delta -- a completed load whose owner is NOT the head (younger hit-under-
+    // miss) latches its RAW word into entries[owner].parked_data. Its own delta path (applied
+    // in block M after ip_delta, re-guarded on !squashed) so it never clashes with the head/ip
+    // deltas. head_park_ready = the head's load already parked (retire from parked_data with no
+    // live response). deliver_word = the word the single-beat formatter consumes (parked_data on
+    // a head_park_ready retire, else the live data_load). Already inside `ifdef LSQ_MLP2 (line
+    // 378) -> OFF strips them; the formatter line is separately ifdef'd for byte-identity (M2).
+    logic                  park_delta_we;
+    logic [MEM_PTR_W-1:0]  park_delta_idx;
+    logic [XLEN-1:0]       park_delta_data;
+    logic                  head_park_ready;
+    logic [XLEN-1:0]       deliver_word;
     // MF6: the PHYSICAL 64B line each outstanding load was ISSUED at (A4 issues at the
     // PA, so the same-line guard must compare physical lines, not virtual entry addrs).
     logic [XLEN-1:ADDR_SHIFT+LINE_OFF_W] inflight_line_q   [LSQ_MLP];
@@ -556,6 +577,9 @@ module load_store_queue
         head_load_pa_direct = 1'b0;   // MF1: default live-translate path
         ip_delta_we_issued = 1'b0;     // A3: no issued_load write unless ip issues
         ip_delta_idx = '0;
+        park_delta_we = 1'b0;          // P3c-2: no park write unless a younger response completes
+        park_delta_idx = '0;
+        park_delta_data = '0;
 `endif
         store_probe_hi_next = 1'b0;
         mem_inflight_next = mem_inflight_q;
@@ -627,6 +651,14 @@ module load_store_queue
         // off the deep squash->wakeup->format chain. A head op fires one cycle
         // after its operand registers; the LSQ tolerates the extra latency.
         headq = entries_q[head_next_skip];
+
+        // P3c-2: the head's load may already have completed OUT OF ORDER (a younger hit-under-
+        // miss parked before the older miss returned). head_park_ready => retire from parked_data
+        // with no live response; deliver_word feeds the single-beat formatter (ifdef'd there too).
+`ifdef LSQ_MLP2
+        head_park_ready = headq.parked_done;
+        deliver_word    = head_park_ready ? headq.parked_data : data_load;
+`endif
 
         // ---- Sv32 data translation gating ----
         // Under paging, a head memory op may only touch memory once its
@@ -1007,21 +1039,26 @@ module load_store_queue
 
         if (!head_done && !double_store_pending_q && headq.entry.valid &&
                 headq.entry.ctrl.memRead &&
-                headq.issued_load && data_load_valid &&
-                !headq.load_complete &&
+                headq.issued_load &&
 `ifdef LSQ_MLP2
-                // Track A (P3c-1): deliver the response that NAMES its slot (dmem_resp_id, now
-                // load-bearing) when that slot IS the current head's load: valid (not yet drained),
-                // owner index == the post-skip head (A3, closes the active_id-recycle collision),
-                // gen/active_id match (robust to ring reuse), and not killed (owner squashed =>
-                // the response is stale => discard, not deliver). Value-identical to the P3b
-                // oldest-slot form on the in-order L1D (dmem_resp_id == the oldest valid slot);
-                // P3c-2 adds the head_park_ready OR-term for parked out-of-order completion.
-                (inflight_count_q != '0) && inflight_valid_q[dmem_resp_id] &&
-                !inflight_kill_q[dmem_resp_id] &&
-                (inflight_owner_q[dmem_resp_id] == head_next_skip) &&
-                (inflight_gen_q[dmem_resp_id] == headq.entry.active_id)
+                !headq.load_complete &&
+                // P3c-2: retire the head's load either from an out-of-order PARK (head_park_ready:
+                // its response already came back as a younger hit and was latched into parked_data,
+                // NO live response this cycle) OR from a live response that NAMES the head's slot
+                // (dmem_resp_id load-bearing): valid, owner==post-skip head (A3, closes the
+                // active_id-recycle collision), gen-match (ring reuse), not killed (squashed =>
+                // stale => discard). data_load_valid is INSIDE the live arm so head_park_ready
+                // can fire without it. The two are mutually exclusive (a parked head freed its
+                // slot at park, so no live response carries owner==head). (OFF keeps the original
+                // term order below so the OFF condition stays byte-identical.)
+                ( head_park_ready ||
+                  ( data_load_valid && (inflight_count_q != '0) &&
+                    inflight_valid_q[dmem_resp_id] && !inflight_kill_q[dmem_resp_id] &&
+                    (inflight_owner_q[dmem_resp_id] == head_next_skip) &&
+                    (inflight_gen_q[dmem_resp_id] == headq.entry.active_id) ) )
 `else
+                data_load_valid &&
+                !headq.load_complete &&
                 mem_inflight_q && !mem_inflight_kill_q
 `endif
                 ) begin
@@ -1093,9 +1130,20 @@ module load_store_queue
                             headq.addr[ADDR_SHIFT-1:0],
                             headq.entry.ctrl.ldst_mode);
                     end else begin
+                        // P3c-2: deliver_word == parked_data on a head_park_ready retire (no live
+                        // response), else == data_load. Only THIS single-beat integer path is
+                        // reachable by a parked load (ip excludes AMO/two-beat/FP), so the AMO /
+                        // two-beat / FP formatters keep data_load. ifdef'd so OFF reads data_load
+                        // verbatim (byte-identical).
+`ifdef LSQ_MLP2
+                        load_writeback.data = format_load(deliver_word,
+                            headq.addr[ADDR_SHIFT-1:0],
+                            headq.entry.ctrl.ldst_mode);
+`else
                         load_writeback.data = format_load(data_load,
                             headq.addr[ADDR_SHIFT-1:0],
                             headq.entry.ctrl.ldst_mode);
+`endif
                     end
                     if (headq.entry.ctrl.exec_class == EXEC_FP) begin
                     load_writeback.fp_write =
@@ -1123,6 +1171,28 @@ module load_store_queue
         end
 
 `ifdef LSQ_MLP2
+        // ---- P3c-2: park a completed load whose owner is NOT the head (younger hit-under-miss) ----
+        // A response that names a younger slot (the L1D op2 hit path, P3c-3) is latched into that
+        // entry's parked_data now; it retires from the park when it becomes head (no live response).
+        // B5.3 gating (reads registered state only -- no wakeup, so no false load_writeback loop):
+        // valid slot, not killed (prior-cycle squash), gen-match (ring-reuse guard), NOT squashed
+        // this cycle (same-cycle abort -> discard, don't park), owner != head (the head is delivered
+        // live above), and not flushing. INERT on the blocking L1D (responses are in order, so a
+        // response always names the head's slot -> owner==head -> this never fires).
+        begin
+            logic [MEM_PTR_W-1:0] resp_owner;
+            resp_owner = inflight_owner_q[dmem_resp_id];
+            if (data_load_valid && (inflight_count_q != '0) &&
+                inflight_valid_q[dmem_resp_id] && !inflight_kill_q[dmem_resp_id] &&
+                (inflight_gen_q[dmem_resp_id] == entries_q[resp_owner].entry.active_id) &&
+                ((entries_q[resp_owner].entry.branch_mask & abort_mask) == '0) &&
+                (resp_owner != head_next_skip) && !flush) begin
+                park_delta_we   = 1'b1;
+                park_delta_idx  = resp_owner;
+                park_delta_data = data_load;   // raw word; formatted at retire-from-park via deliver_word
+            end
+        end
+
         // ---- Track A: issue_ptr issues a 2nd (younger-than-head) plain load ----
         // Lowest port priority (only when the head is not using the data port and no
         // store/AMO/SC commits). Requires: issue_ptr's registered translate resolved
@@ -1147,6 +1217,12 @@ module load_store_queue
                          entries_q[issue_ptr_q].entry.ctrl.memRead &&
                          !entries_q[issue_ptr_q].entry.ctrl.memWrite &&
                          (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_AMO) &&
+                         // P3c-2 (M3): never ip-issue an FP load. A parked FP load would drive the
+                         // FP formatter (RV32 fp_data from RAW data_load, not deliver_word) with a
+                         // stale word -> corruption; excluding FP keeps parked loads integer-only so
+                         // only the single-beat integer formatter needs deliver_word. (RV64/PERF mask
+                         // the RV32 hazard, so this is not caught by the rv64gc/xv6 gates.)
+                         (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_FP) &&
                          !needs_two_beats(entries_q[issue_ptr_q].entry.ctrl,
                                           entries_q[issue_ptr_q].addr);
             // MF2/MF5: in-range via the offset register (no mod-ring compare). Strictly
@@ -1196,6 +1272,7 @@ module load_store_queue
             store_probe_hi_next = 1'b0;
 `ifdef LSQ_MLP2
             ip_issue_fire = 1'b0;    // no new issue under flush (drain only)
+            park_delta_we = 1'b0;    // no park under flush (in-flight responses discarded as stale)
 `endif
             // A load issue suppressed by this flush must not leave a phantom
             // in-flight slot; an already-outstanding load stays outstanding and its
@@ -1341,6 +1418,18 @@ module load_store_queue
         // zeroed entry. ip_delta_idx != head_next_skip (ip_inrange_c) => no head_delta clash.
         if (ip_delta_we_issued)
             entries_premerge[ip_delta_idx].issued_load = 1'b1;
+
+        // P3c-2 (B5.2): park write on its own delta, applied AFTER the squash-zero AND the
+        // ip_delta, re-guarded on !squashed so a same-cycle abort of the owner WINS (the entry
+        // is zeroed, parked_done stays 0 -> the response is correctly dropped). park_delta_idx =
+        // resp_owner is gated owner != head_next_skip (no head_delta clash), and it writes only
+        // parked_data/parked_done -- disjoint from ip_delta's issued_load (and a completing load
+        // has issued_load=1 already, so the ip-issued and completing entries are distinct anyway).
+        if (park_delta_we &&
+            ((entries_q[park_delta_idx].entry.branch_mask & abort_mask) == '0)) begin
+            entries_premerge[park_delta_idx].parked_data = park_delta_data;
+            entries_premerge[park_delta_idx].parked_done = 1'b1;
+        end
 `endif
 
         // Apply the deferred head advance from a retiring head op (fault /
@@ -1526,6 +1615,14 @@ module load_store_queue
                     entries_next[tail_next].issued_load = 1'b0;
                     entries_next[tail_next].load_complete = 1'b0;
                     entries_next[tail_next].double_low_valid = 1'b0;
+`ifdef LSQ_MLP2
+                    // P3c-2 (B5.1): clear the parked latch on a freshly-inserted entry. Block 2
+                    // writes fields individually (no whole-struct reset), so a ring-recycled slot
+                    // could otherwise carry a stale parked_done=1 and retire a fresh load instantly
+                    // with garbage. (Flush + retire-zero + squash-zero also clear them.)
+                    entries_next[tail_next].parked_done = 1'b0;
+                    entries_next[tail_next].parked_data = '0;
+`endif
                     entries_next[tail_next].load_low_word = '0;
                     entries_next[tail_next].store_hi_pa = '0;
                     entries_next[tail_next].store_lo_pa = '0;
@@ -1779,6 +1876,7 @@ module load_store_queue
         ip_want_c = entries_q[issue_ptr_q].entry.valid && entries_q[issue_ptr_q].addr_ready &&
             entries_q[issue_ptr_q].entry.ctrl.memRead && !entries_q[issue_ptr_q].entry.ctrl.memWrite &&
             (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_AMO) &&
+            (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_FP) &&   // P3c-2 (M3): FP head-only
             !entries_q[issue_ptr_q].issued_load && (issue_ptr_q != head_q) &&
             (issue_ptr_q != head_next_skip) &&
             (inflight_count_q < CNT_W'(LSQ_MLP));
@@ -2001,25 +2099,55 @@ module load_store_queue
             end
         end
     end
+
+    // P3c-2 (sim-only, FP-PARK-1): the parked-completion path is load-bearing on the invariant
+    // that a PARKED load is always a PLAIN SINGLE-BEAT INTEGER load -- that is what keeps a
+    // head_park_ready retire on the single-beat integer formatter (deliver_word) and away from
+    // the AMO / two-beat / format_load_wide / RV32 FP formatters (which still read raw data_load).
+    // The invariant holds by construction (park fires only for resp_owner != head, i.e. an
+    // ip-issued slot, and ip_carve_c excludes AMO / two-beat / FP), but it is otherwise UNASSERTED.
+    // Assert it at the park event AND at a head_park_ready retire so a future edit that lets an
+    // FP/AMO/two-beat load reach the park path fails LOUDLY instead of silently corrupting rd.
+    always_ff @(posedge clk) begin
+        if (rst_l) begin
+            if (park_delta_we)
+                assert ((entries_q[park_delta_idx].entry.ctrl.exec_class != EXEC_AMO) &&
+                        (entries_q[park_delta_idx].entry.ctrl.exec_class != EXEC_FP) &&
+                        !needs_two_beats(entries_q[park_delta_idx].entry.ctrl,
+                                         entries_q[park_delta_idx].addr))
+                    else $fatal(1, "LSQ P3c-2 FP-PARK: parked a non-plain-single-beat-integer load idx=%0d",
+                                park_delta_idx);
+            if (head_park_ready)
+                assert ((headq.entry.ctrl.exec_class != EXEC_AMO) &&
+                        (headq.entry.ctrl.exec_class != EXEC_FP) &&
+                        !needs_two_beats(headq.entry.ctrl, headq.addr))
+                    else $fatal(1, "LSQ P3c-2 FP-PARK: head_park_ready on a non-plain-single-beat-integer load");
+        end
+    end
 `endif
 
 `ifdef LSQ_MLP_STAT
     // Instrumented overlap gate (the mandatory P3b-fix PASS criterion): PROVES MLP=2
     // engages. On passthrough+fuzz mlp_stream, ip_fires>0 AND two_out>0 => the 2nd load
     // genuinely issues while the head's is outstanding. Separate macro so PERF stays lean.
-    longint unsigned mlp_ip_fires, mlp_head_fires, mlp_two_out, mlp_steps;
+    longint unsigned mlp_ip_fires, mlp_head_fires, mlp_two_out, mlp_steps, mlp_parks;
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             mlp_ip_fires <= '0; mlp_head_fires <= '0; mlp_two_out <= '0; mlp_steps <= '0;
+            mlp_parks <= '0;
         end else begin
             if (ip_issue_fire)                 mlp_ip_fires   <= mlp_ip_fires + 1;
             if (head_data_load_en && !flush)   mlp_head_fires <= mlp_head_fires + 1;
             if (inflight_count_q == CNT_W'(2)) mlp_two_out    <= mlp_two_out + 1;
             if (ip_step)                       mlp_steps      <= mlp_steps + 1;
+            // P3c-2: park events. MUST be 0 on the blocking L1D / passthrough (in-order responses
+            // => owner==head => no park) -> the P3c-2 "inert" gate. Nonzero only once P3c-3's L1D
+            // op2 hit-under-miss returns a younger response before the older miss.
+            if (park_delta_we)                 mlp_parks      <= mlp_parks + 1;
         end
     end
-    final $display("LSQ-MLP-STAT: ip_fires=%0d head_fires=%0d two_out_cycles=%0d steps=%0d",
-                   mlp_ip_fires, mlp_head_fires, mlp_two_out, mlp_steps);
+    final $display("LSQ-MLP-STAT: ip_fires=%0d head_fires=%0d two_out_cycles=%0d steps=%0d parks=%0d",
+                   mlp_ip_fires, mlp_head_fires, mlp_two_out, mlp_steps, mlp_parks);
 `endif
 
     // P3-M0: categorize why the in-order head is blocked this cycle (display-only;
