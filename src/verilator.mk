@@ -262,6 +262,13 @@ endif
 	VERILATOR_CFLAGS += -DLSQ_MLP2
 endif
 
+# LSQ_MLP_STAT=1: instrumented overlap counters (ip_fires/two_out/steps -> LSQ-MLP-STAT
+# final $display) that PROVE MLP=2 engages. Implies LSQ_MLP2. Diagnostic-only; keep it
+# OUT of PERF so the canonical build stays lean.
+ifeq ($(LSQ_MLP_STAT),1)
+	VERILATOR_CFLAGS += -DLSQ_MLP2 -DLSQ_MLP_STAT
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 
