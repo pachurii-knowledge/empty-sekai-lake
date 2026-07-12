@@ -203,17 +203,24 @@ module load_store_queue
     localparam logic [2:0] DMEM_OP_AMO    = 3'd5;   // M4 #3: agent-authoritative AMO (COP_AMO)
 
 `ifdef LSQ_MLP2
-    // P3b delivers IN ORDER (oldest slot first); the memsys returns responses oldest-
-    // first, so a response's id must be the FIFO oldest slot. Assert it (P3c relaxes to
-    // out-of-order parked completion and makes dmem_resp_id load-bearing). Sink the id
-    // outside the assertion window so there is no UNUSED lint.
-    logic _unused_dmem_resp_id;
-    assign _unused_dmem_resp_id = ^dmem_resp_id;
+    // P3c-1: the inflight FIFO ring becomes a valid-bitmap POOL -- dmem_resp_id is now
+    // load-bearing (the pool frees / delivers / allocs by id), so it needs no _unused sink.
+    // Out-of-order parked completion (P3c-2/3) makes a response name any currently-outstanding
+    // slot, not necessarily the oldest, so the invariant relaxes from the P3b "== oldest slot"
+    // form to "names a VALID slot" (a killed slot stays valid until its own response drains).
+    // NB the old ring's "dmem_resp_id == inflight_head_q" assert cannot be carried into the pool:
+    // the pool allocates the LOWEST-FREE id, so on a single-outstanding (serial) stream it reuses
+    // id 0 while a ring would cycle 0,1,0,1 -- a legitimate, value-identical divergence in the
+    // internal id, not a reorder. Value-identity of the ring->pool refactor is instead proven
+    // directly: the ON overlap-gate + ACT retire stream is bit-identical to committed P3b (the id
+    // round-trips, so the delivered load / issue timing / same-line-guard result are unchanged),
+    // and OFF is byte-identical (all edits `ifdef LSQ_MLP2). This assert only backstops a
+    // free-of-an-unallocated-slot (M5's count-underflow class).
     always_ff @(posedge clk) begin
         if (rst_l && data_load_valid && (inflight_count_q != '0))
-            assert (dmem_resp_id == inflight_head_q)
-                else $fatal(1, "LSQ P3b: out-of-order response id=%0d, expected oldest=%0d",
-                            dmem_resp_id, inflight_head_q);
+            assert (inflight_valid_q[dmem_resp_id])
+                else $fatal(1, "LSQ P3c: response names a free slot id=%0d count=%0d",
+                            dmem_resp_id, inflight_count_q);
     end
 `endif
 
@@ -379,8 +386,8 @@ module load_store_queue
     logic [MEM_PTR_W-1:0]  inflight_owner_q [LSQ_MLP], inflight_owner_next [LSQ_MLP];
     logic                  inflight_kill_q  [LSQ_MLP], inflight_kill_next  [LSQ_MLP];
     active_id_t            inflight_gen_q   [LSQ_MLP], inflight_gen_next   [LSQ_MLP];
-    logic [LSQ_ID_W-1:0]   inflight_head_q, inflight_head_next;   // FIFO read ptr (oldest slot)
-    logic [LSQ_ID_W-1:0]   inflight_tail_q, inflight_tail_next;   // FIFO write ptr (next free slot)
+    // P3c-1: ring pointers deleted (the table is now a valid-bitmap pool: alloc lowest-free,
+    // free by dmem_resp_id). Only the occupancy count survives -- it gates issue (count<LSQ_MLP).
     logic [CNT_W-1:0]      inflight_count_q, inflight_count_next;
     // Registered time-mux translate target: which entry mem_req_vaddr aims at. Driven
     // off a REGISTER so the DTLB index stays register-driven (no FB2b path regression);
@@ -418,6 +425,18 @@ module load_store_queue
     // PA, so the same-line guard must compare physical lines, not virtual entry addrs).
     logic [XLEN-1:ADDR_SHIFT+LINE_OFF_W] inflight_line_q   [LSQ_MLP];
     logic [XLEN-1:ADDR_SHIFT+LINE_OFF_W] inflight_line_next [LSQ_MLP];
+    // P3c-1: the inflight table is a valid-bitmap POOL (out-of-order free breaks the ring):
+    // a load allocates the LOWEST-FREE slot at issue, and a response frees the slot its id
+    // NAMES (dmem_resp_id) rather than the FIFO oldest. inflight_alloc_id = lowest-free scan
+    // of the registered valid bitmap (reverse so the lowest index wins); safe because every
+    // issue is gated inflight_count_q < LSQ_MLP, so a free slot always exists at issue and it
+    // is distinct from any same-cycle free (which clears a currently-VALID slot).
+    logic [LSQ_ID_W-1:0]   inflight_alloc_id;
+    always_comb begin
+        inflight_alloc_id = '0;
+        for (int k = LSQ_MLP-1; k >= 0; k -= 1)
+            if (!inflight_valid_q[k]) inflight_alloc_id = LSQ_ID_W'(k);
+    end
 `endif
     // High while the head store is probing its high-word translation (cross-word
     // store / FP double). Steers mem_req_vaddr up one word so the second page is
@@ -991,13 +1010,17 @@ module load_store_queue
                 headq.issued_load && data_load_valid &&
                 !headq.load_complete &&
 `ifdef LSQ_MLP2
-                // Track A: deliver the OLDEST outstanding slot only when it IS the current
-                // head's load: owner index == the post-skip head (A3, closes active_id-recycle
-                // collision), gen/active_id match (robust to ring reuse), and not killed
-                // (owner squashed => the response is stale => discard, not deliver).
-                (inflight_count_q != '0) && !inflight_kill_q[inflight_head_q] &&
-                (inflight_owner_q[inflight_head_q] == head_next_skip) &&
-                (inflight_gen_q[inflight_head_q] == headq.entry.active_id)
+                // Track A (P3c-1): deliver the response that NAMES its slot (dmem_resp_id, now
+                // load-bearing) when that slot IS the current head's load: valid (not yet drained),
+                // owner index == the post-skip head (A3, closes the active_id-recycle collision),
+                // gen/active_id match (robust to ring reuse), and not killed (owner squashed =>
+                // the response is stale => discard, not deliver). Value-identical to the P3b
+                // oldest-slot form on the in-order L1D (dmem_resp_id == the oldest valid slot);
+                // P3c-2 adds the head_park_ready OR-term for parked out-of-order completion.
+                (inflight_count_q != '0) && inflight_valid_q[dmem_resp_id] &&
+                !inflight_kill_q[dmem_resp_id] &&
+                (inflight_owner_q[dmem_resp_id] == head_next_skip) &&
+                (inflight_gen_q[dmem_resp_id] == headq.entry.active_id)
 `else
                 mem_inflight_q && !mem_inflight_kill_q
 `endif
@@ -1418,8 +1441,8 @@ module load_store_queue
         dmem_req_op = DMEM_OP_LOAD;
         dmem_req_amo = 4'd0;            // M4 #3: only meaningful on the COP_AMO beat
 `ifdef LSQ_MLP2
-        // The issuing load (head OR issue_ptr) is allocated the tail (next-free) slot.
-        dmem_req_id = inflight_tail_q;
+        // P3c-1: the issuing load (head OR issue_ptr) is allocated the LOWEST-FREE pool slot.
+        dmem_req_id = inflight_alloc_id;
 `endif
         if (double_store_pending_q) begin
             data_addr = double_store_addr_q;
@@ -1806,9 +1829,9 @@ module load_store_queue
             issue_ptr_next = head_next + ip_off_next[MEM_PTR_W-1:0];
         end
 
-        // --- inflight FIFO next-state: copy, then kill / free / alloc ---
-        inflight_head_next  = inflight_head_q;
-        inflight_tail_next  = inflight_tail_q;
+        // --- inflight POOL next-state: copy, then kill / free-by-id / alloc lowest-free ---
+        // (P3c-1: was a ring FIFO; now a valid-bitmap pool. The functional free/alloc/deliver
+        //  key on dmem_resp_id / inflight_alloc_id; no head/tail ring pointers remain.)
         inflight_count_next = inflight_count_q;
         for (k = 0; k < LSQ_MLP; k = k + 1) begin
             inflight_valid_next[k] = inflight_valid_q[k];
@@ -1829,26 +1852,30 @@ module load_store_queue
             for (k = 0; k < LSQ_MLP; k = k + 1)
                 if (inflight_valid_q[k]) inflight_kill_next[k] = 1'b1;
         end
-        // (b) free the oldest slot on a response (deliver/discard decided in block HD).
-        if (resp_free && (inflight_count_q != '0)) begin
-            inflight_valid_next[inflight_head_q] = 1'b0;
-            inflight_head_next  = inflight_head_q + LSQ_ID_W'(1);
+        // (b) POOL free: clear the slot the response NAMES (dmem_resp_id). M5: gate BOTH the
+        // valid-clear AND the count-- on inflight_valid_q[dmem_resp_id] so a mis-named /
+        // spurious / masked-then-delivered response is a no-op (no count underflow -> slot
+        // leak). On the in-order L1D dmem_resp_id is exactly the oldest valid slot.
+        if (resp_free && inflight_valid_q[dmem_resp_id]) begin
+            inflight_valid_next[dmem_resp_id] = 1'b0;
             inflight_count_next = inflight_count_next - 1'b1;
         end
-        // (c) allocate the tail slot on an issue (head OR issue_ptr, mutually exclusive).
+        // (c) POOL alloc: the LOWEST-FREE slot on an issue (head OR issue_ptr, mutually
+        // exclusive). Distinct from a same-cycle free (which clears a currently-VALID slot;
+        // inflight_alloc_id scans for an INVALID slot), and a free slot always exists because
+        // issue is gated inflight_count_q < LSQ_MLP.
         // MF6: latch the PHYSICAL line the load was ISSUED at (head: effective PA; ip:
         // registered PA) so the same-line guard compares physical lines (A4 issues at PA).
         if (head_issue || ip_issue) begin
-            inflight_valid_next[inflight_tail_q] = 1'b1;
-            inflight_owner_next[inflight_tail_q] = head_issue ? head_owner : issue_ptr_q;
-            inflight_gen_next[inflight_tail_q]   =
+            inflight_valid_next[inflight_alloc_id] = 1'b1;
+            inflight_owner_next[inflight_alloc_id] = head_issue ? head_owner : issue_ptr_q;
+            inflight_gen_next[inflight_alloc_id]   =
                 entries_q[head_issue ? head_owner : issue_ptr_q].entry.active_id;
-            inflight_kill_next[inflight_tail_q]  =
+            inflight_kill_next[inflight_alloc_id]  =
                 ((entries_q[head_issue ? head_owner : issue_ptr_q].entry.branch_mask & abort_mask) != '0);
-            inflight_line_next[inflight_tail_q]  = head_issue
+            inflight_line_next[inflight_alloc_id]  = head_issue
                 ? xlate_pa_eff[XLEN-1:ADDR_SHIFT+LINE_OFF_W]
                 : xlate_pa_q[XLEN-1:ADDR_SHIFT+LINE_OFF_W];
-            inflight_tail_next  = inflight_tail_q + LSQ_ID_W'(1);
             inflight_count_next = inflight_count_next + 1'b1;
         end
     end
@@ -1881,8 +1908,6 @@ module load_store_queue
 `ifdef LSQ_MLP2
             issue_ptr_q      <= '0;
             ip_off_q         <= '0;
-            inflight_head_q  <= '0;
-            inflight_tail_q  <= '0;
             inflight_count_q <= '0;
             xlate_target_q   <= '0;
             xlate_tgt_q      <= '0;
@@ -1931,8 +1956,6 @@ module load_store_queue
             // which is aimed at xlate_target_q this cycle).
             issue_ptr_q      <= issue_ptr_next;
             ip_off_q         <= ip_off_next;
-            inflight_head_q  <= inflight_head_next;
-            inflight_tail_q  <= inflight_tail_next;
             inflight_count_q <= inflight_count_next;
             xlate_target_q   <= xlate_target_next;
             xlate_tgt_q      <= xlate_target_q;
