@@ -183,6 +183,15 @@ module l1_dcache
     logic [MEMORY_ADDR_WIDTH-1:0] wb_addr_q, wb_addr_n;
     logic [L1_INDEX_BITS-1:0]  flush_set_q, flush_set_n;
     logic [L1_WAY_BITS-1:0]    flush_way_q, flush_way_n;
+`ifdef LSQ_MLP2
+    // P3d-0: the {src,gen} NMI id the in-flight WB / FILL was ISSUED with, latched at the
+    // S_WB_REQ / S_FILL_REQ fire edge (co-located with the gen_q bump below). The WAIT exits
+    // consume nmi_resp ONLY when its id matches -- so once the fabric is multi-outstanding
+    // (P3d-1/P3d-3) a mismatched response can never be mistaken for this MSHR's (silent
+    // corruption). Cycle-identical single-outstanding (the sole in-flight op's id always matches).
+    logic [3:0]  exp_wb_id_q;
+    logic [3:0]  exp_fill_id_q;
+`endif
 
     // ---------------- C4a probe state ----------------
     logic [L1_INDEX_BITS-1:0]  pidx_q, pidx_n;
@@ -484,12 +493,23 @@ module l1_dcache
             end
 
             S_WB_REQ:   if (nmi_req_ready)  state_n = S_WB_WAIT;
+`ifdef LSQ_MLP2
+            // P3d-0: id-matched WAIT consumption. Cycle-identical here (single-outstanding =>
+            // nmi_resp.id always == exp_*), load-bearing once the fabric reorders (P3d-1/3).
+            S_WB_WAIT:  if (nmi_resp.valid && (nmi_resp.id == exp_wb_id_q)) state_n = S_FILL_REQ;
+            S_FILL_REQ: if (nmi_req_ready)  state_n = S_FILL_WAIT;
+            S_FILL_WAIT: if (nmi_resp.valid && (nmi_resp.id == exp_fill_id_q)) begin
+                refill_line_n = nmi_resp.rdata;
+                state_n       = S_INSTALL;
+            end
+`else
             S_WB_WAIT:  if (nmi_resp.valid) state_n = S_FILL_REQ;
             S_FILL_REQ: if (nmi_req_ready)  state_n = S_FILL_WAIT;
             S_FILL_WAIT: if (nmi_resp.valid) begin
                 refill_line_n = nmi_resp.rdata;
                 state_n       = S_INSTALL;
             end
+`endif
 `ifdef LSQ_MLP2
             // P3c-3: drain a parked op2 (promote it to primary) before returning idle. The op2
             // registers into op_*_q on this edge (op-latch below), so S_OP2_PROMOTE presents its
@@ -664,6 +684,8 @@ module l1_dcache
             op2_wdata_q   <= '0;
             op2_wmask_q   <= '0;
             op2_id_q      <= '0;
+            exp_wb_id_q   <= '0;
+            exp_fill_id_q <= '0;
 `endif
             refill_line_q <= '0;
             fill_way_q    <= '0;
@@ -710,6 +732,12 @@ module l1_dcache
             if ((state_q == S_WB_REQ || state_q == S_FILL_REQ ||
                  state_q == S_FLUSH_WB_REQ || state_q == S_PROBE_WB_REQ) && nmi_req_ready)
                 gen_q <= gen_q + 2'd1;
+`ifdef LSQ_MLP2
+            // P3d-0: latch the id each miss leg was issued with (same edge as the gen_q bump, so
+            // it captures the gen_q value the outgoing nmi_req.id used, before the increment).
+            if ((state_q == S_WB_REQ)   && nmi_req_ready) exp_wb_id_q   <= {NMI_SRC_DWB,   gen_q};
+            if ((state_q == S_FILL_REQ) && nmi_req_ready) exp_fill_id_q <= {NMI_SRC_DFILL, gen_q};
+`endif
             for (int s = 0; s < L1_SETS; s += 1) begin
                 valid_q[s] <= valid_n[s];
                 dirty_q[s] <= dirty_n[s];
