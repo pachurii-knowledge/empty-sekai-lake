@@ -272,6 +272,17 @@ ifeq ($(LSQ_MLP_STAT),1)
 	VERILATOR_CFLAGS += -DLSQ_MLP2 -DLSQ_MLP_STAT
 endif
 
+# COMMIT1=1 (-DCOMMIT_1STAGE): revert active_list's commit path from the FB2b 2-stage
+# (registered recovery-root, sliding-window present) to the pre-FB2b 1-stage combinational
+# commit (present-at-head, no register). The 2-stage delays every commit-gated dependency
+# release by a cycle -- and the FP_OOO scoreboard clears fpr_busy at COMMIT, so FP-dense
+# code pays it repeatedly (fpkernel +9.15%, aggregate +1.57% on fuzz-16 L1D). Default OFF
+# is the 2-stage (bit-identical). Functional sim lever like XLATE_BYPASS/LSQ_MLP2 -- it
+# re-opens the FB2b recovery-root cone (WNS +0.99ns), so an FPGA/ASIC build must keep it OFF.
+ifeq ($(COMMIT1),1)
+	VERILATOR_CFLAGS += -DCOMMIT_1STAGE
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 
