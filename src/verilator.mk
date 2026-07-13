@@ -75,8 +75,8 @@ VERILATOR_CFLAGS ?= --sv --timing --binary -Wno-fatal \
 # loads x (latency-1)), which flips window/memory/translate conclusions vs L1D -- e.g. XLATE_BYPASS
 # reads modest on passthrough but +13% mean on L1D. See the P3 mem-lever recon. Expands to RV64GC +
 # L1D + the gated perf levers; each flag still composes individually for A/B isolation. NB: this is a
-# FUNCTIONAL sim perf build -- XLATE_BYPASS carries an Fmax cost, so an FPGA/ASIC build should drop it.
-# Must precede the sub-flag ifeq blocks so they see these vars.
+# FUNCTIONAL sim perf build -- XLATE_BYPASS and LSQ_MLP2 carry an Fmax cost, so an FPGA/ASIC build
+# should drop them. Must precede the sub-flag ifeq blocks so they see these vars.
 ifeq ($(PERF),1)
 	RV64 := 1
 	OOO := 1
@@ -91,6 +91,7 @@ ifeq ($(PERF),1)
 	XLATE_BYPASS := 1
 	FP_OOO := 1
 	ALU4 := 1
+	LSQ_MLP2 := 1
 endif
 
 ifeq ($(SUPERSCALAR),4)
@@ -253,8 +254,10 @@ endif
 # INCOMPATIBLE with CCD: a coherent D-side would pin LSQ_MLP=1 anyway (2 in-flight
 # loads open an RVWMO load-load reorder window with no 9.11 squash), and the CCD
 # agent memsys arm has no id round-trip, so combining them is disallowed outright.
-# Default OFF is bit-identical (all gated by -DLSQ_MLP2). Functional sim lever like
-# XLATE_BYPASS (an FPGA/ASIC build likely drops it).
+# Default OFF is bit-identical (all gated by -DLSQ_MLP2). Folded into PERF; functional sim
+# lever like XLATE_BYPASS (an FPGA/ASIC build likely drops it -- Fmax). The registered-aim
+# per-load issue bubble is fixed (combinational head_owns_port), so it is net-positive:
+# survey ~0, independent-miss streams +~55%, aggregate +6.45% under fuzz-16 L1D.
 ifeq ($(LSQ_MLP2),1)
 ifeq ($(CCD),1)
 $(error LSQ_MLP2=1 is incompatible with CCD=1: the coherent D-side pins LSQ_MLP=1 and the CCD memsys arm carries no dmem txn-id. Use L1D=1 (or PERF=1).)

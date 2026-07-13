@@ -352,8 +352,11 @@ read port on the L1I tag array), and an L1I refill is held until the L1D first w
 any dirty copy of that line (clean-before-refill). This keeps cold code and
 patch-then-call-later sequences (e.g. xv6 `exec`) coherent with no explicit fence; only
 tight in-place patching of an *already-fetched* line still needs `fence.i`. The load/store
-queue allows a single outstanding load and tracks it by an in-flight tag, so cache
-responses need no address matching at any latency.
+queue allows two outstanding loads in the reference `PERF` build (`LSQ_MLP2`, non-blocking
+L1D / memory-level parallelism — a single outstanding load in the base default) and tracks
+each by an in-flight transaction tag, so cache responses need no address matching at any
+latency; two independent load misses overlap, and the head's translate-port aim is
+combinational so a freshly-advanced head issues with no bubble.
 
 ### Multicore cache coherence (CCD)
 
