@@ -512,7 +512,24 @@ module load_store_queue
     // head translate + XLATE_BYPASS are unchanged in the common case. When aimed at
     // issue_ptr it is always a plain single-beat cacheable load (carve-outs), so no
     // store/probe offset applies.
-    wire mlp_xt_head = (xlate_target_q == head_q);
+    // xlate-bubble fix: the head owns the translate port whenever it has a valid,
+    // address-ready, UNISSUED mem-op -- strict head priority, COMBINATIONAL (not the
+    // registered xlate_target_q). A freshly-advanced head thus aims + XLATE_BYPASSes THIS
+    // cycle instead of waiting a cycle for xlate_target_q to catch up (the per-load issue
+    // bubble that regressed independent-load streams: matmul -47%, crc32 -17%, even at
+    // ip_fires=0). !issued_load frees the port to issue_ptr once the head's own load is
+    // outstanding, so the MLP time-mux still engages (mlp_stream two_out stays ~54%).
+    wire head_owns_port = entries_q[head_q].entry.valid && entries_q[head_q].addr_ready &&
+        (entries_q[head_q].entry.ctrl.memRead || entries_q[head_q].entry.ctrl.memWrite) &&
+        !entries_q[head_q].issued_load;
+    wire mlp_xt_head = head_owns_port;
+    // Effective combinational aim: the entry the port translates THIS cycle. mem_req_vaddr
+    // AND the registered tag (xlate_tgt_q / xlate_tgt_aid_q) are BOTH routed from this one
+    // signal so the registered PA and its (index, active_id) tag stay co-derived from a
+    // single entry -- a consumer keying on xlate_tgt_q==X always reads X's PA (closes the
+    // PA-of-one-entry-tagged-as-another hazard). When head_owns_port==0, xlate_aim ==
+    // xlate_target_q, so the issue_ptr time-mux path is bit-identical to before.
+    wire [MEM_PTR_W-1:0] xlate_aim = head_owns_port ? head_q : xlate_target_q;
     // Head's OWN request validity (independent of the time-mux target) -- the head
     // translate-ready + XLATE_BYPASS gates must key on this, not the muxed mem_req_valid
     // (which reflects issue_ptr on its port turns).
@@ -543,7 +560,7 @@ module load_store_queue
     // xlate_target_q==head_q so this is the head's addr (+ the two-beat-store probe
     // offset); when aimed at issue_ptr it is the aimed entry's addr -- NOT issue_ptr_q,
     // which may have since advanced (the wrong-word bug above).
-    assign mem_req_vaddr = entries_q[xlate_target_q].addr +
+    assign mem_req_vaddr = entries_q[xlate_aim].addr +
         ((mlp_xt_head && store_probe_hi_q) ? XLEN'(XLEN_BYTES) : '0);
     assign mem_req_store = mlp_xt_head ? entries_q[head_q].entry.ctrl.memWrite : 1'b0;
 `else
@@ -2074,10 +2091,14 @@ module load_store_queue
             ip_off_q         <= ip_off_next;
             inflight_count_q <= inflight_count_next;
             xlate_target_q   <= xlate_target_next;
-            xlate_tgt_q      <= xlate_target_q;
+            // xlate-bubble fix: tag from the COMBINATIONAL xlate_aim (== xlate_target_q when
+            // the head does not own the port, so bit-identical to before in that case), so the
+            // registered PA (translate of mem_req_vaddr, also aimed via xlate_aim) and its tag
+            // stay co-derived from one entry.
+            xlate_tgt_q      <= xlate_aim;
             // MF3: the active_id of the entry this cycle's translate is aimed at, tagging
             // xlate_pa_q so ip can reject a stale registered PA after a squash+reuse.
-            xlate_tgt_aid_q  <= entries_q[xlate_target_q].entry.active_id;
+            xlate_tgt_aid_q  <= entries_q[xlate_aim].entry.active_id;
             for (int k = 0; k < LSQ_MLP; k += 1) begin
                 inflight_valid_q[k] <= inflight_valid_next[k];
                 inflight_owner_q[k] <= inflight_owner_next[k];
