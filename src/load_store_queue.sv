@@ -1252,12 +1252,15 @@ module load_store_queue
                          entries_q[issue_ptr_q].entry.ctrl.memRead &&
                          !entries_q[issue_ptr_q].entry.ctrl.memWrite &&
                          (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_AMO) &&
-                         // P3c-2 (M3): never ip-issue an FP load. A parked FP load would drive the
-                         // FP formatter (RV32 fp_data from RAW data_load, not deliver_word) with a
-                         // stale word -> corruption; excluding FP keeps parked loads integer-only so
-                         // only the single-beat integer formatter needs deliver_word. (RV64/PERF mask
-                         // the RV32 hazard, so this is not caught by the rv64gc/xv6 gates.)
+`ifndef RV64
+                         // P3c-2 (M3) / P3e: on RV32 keep FP loads head-only -- a parked single-beat
+                         // FLW retires through the RV32 FP formatter which reads RAW data_load (not
+                         // deliver_word), corrupting rd. On RV64 (P3e) admit single-beat FP loads:
+                         // fp_data derives from load_writeback.data = format_load(deliver_word,...),
+                         // so a parked FP load formats from its OWN buffered word; needs_two_beats
+                         // below still excludes misaligned FLD / word-crossing FLW.
                          (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_FP) &&
+`endif
                          !needs_two_beats(entries_q[issue_ptr_q].entry.ctrl,
                                           entries_q[issue_ptr_q].addr);
             // MF2/MF5: in-range via the offset register (no mod-ring compare). Strictly
@@ -1911,7 +1914,9 @@ module load_store_queue
         ip_want_c = entries_q[issue_ptr_q].entry.valid && entries_q[issue_ptr_q].addr_ready &&
             entries_q[issue_ptr_q].entry.ctrl.memRead && !entries_q[issue_ptr_q].entry.ctrl.memWrite &&
             (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_AMO) &&
-            (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_FP) &&   // P3c-2 (M3): FP head-only
+`ifndef RV64
+            (entries_q[issue_ptr_q].entry.ctrl.exec_class != EXEC_FP) &&   // P3c-2 (M3): FP head-only (RV32); P3e admits RV64 FP
+`endif
             !entries_q[issue_ptr_q].issued_load && (issue_ptr_q != head_q) &&
             (issue_ptr_q != head_next_skip) &&
             (inflight_count_q < CNT_W'(LSQ_MLP));
@@ -2139,28 +2144,34 @@ module load_store_queue
         end
     end
 
-    // P3c-2 (sim-only, FP-PARK-1): the parked-completion path is load-bearing on the invariant
-    // that a PARKED load is always a PLAIN SINGLE-BEAT INTEGER load -- that is what keeps a
-    // head_park_ready retire on the single-beat integer formatter (deliver_word) and away from
-    // the AMO / two-beat / format_load_wide / RV32 FP formatters (which still read raw data_load).
-    // The invariant holds by construction (park fires only for resp_owner != head, i.e. an
-    // ip-issued slot, and ip_carve_c excludes AMO / two-beat / FP), but it is otherwise UNASSERTED.
-    // Assert it at the park event AND at a head_park_ready retire so a future edit that lets an
-    // FP/AMO/two-beat load reach the park path fails LOUDLY instead of silently corrupting rd.
+    // P3c-2 / P3e (sim-only, FP-PARK-1): the parked-completion path is load-bearing on the invariant
+    // that a PARKED load is a PLAIN SINGLE-BEAT load that retires through the deliver_word path --
+    // integer on RV32, integer OR FP on RV64 (P3e: RV64 single-beat FP fp_data derives from
+    // load_writeback.data = format_load(deliver_word,...), so it too is deliver_word-safe). It must
+    // stay away from the AMO / two-beat / format_load_wide / RV32-FP formatters (which read raw
+    // data_load). The invariant holds by construction (park fires only for resp_owner != head, i.e.
+    // an ip-issued slot, and ip_carve_c excludes AMO / two-beat, plus FP on RV32), but it is
+    // otherwise UNASSERTED. Assert it at the park event AND at a head_park_ready retire so a future
+    // edit that lets an AMO / two-beat / (RV32) FP load reach the park path fails LOUDLY instead of
+    // silently corrupting rd.
     always_ff @(posedge clk) begin
         if (rst_l) begin
             if (park_delta_we)
                 assert ((entries_q[park_delta_idx].entry.ctrl.exec_class != EXEC_AMO) &&
+`ifndef RV64
                         (entries_q[park_delta_idx].entry.ctrl.exec_class != EXEC_FP) &&
+`endif
                         !needs_two_beats(entries_q[park_delta_idx].entry.ctrl,
                                          entries_q[park_delta_idx].addr))
-                    else $fatal(1, "LSQ P3c-2 FP-PARK: parked a non-plain-single-beat-integer load idx=%0d",
+                    else $fatal(1, "LSQ P3c-2 FP-PARK: parked a non-plain-single-beat load idx=%0d",
                                 park_delta_idx);
             if (head_park_ready)
                 assert ((headq.entry.ctrl.exec_class != EXEC_AMO) &&
+`ifndef RV64
                         (headq.entry.ctrl.exec_class != EXEC_FP) &&
+`endif
                         !needs_two_beats(headq.entry.ctrl, headq.addr))
-                    else $fatal(1, "LSQ P3c-2 FP-PARK: head_park_ready on a non-plain-single-beat-integer load");
+                    else $fatal(1, "LSQ P3c-2 FP-PARK: head_park_ready on a non-plain-single-beat load");
         end
     end
 `endif
