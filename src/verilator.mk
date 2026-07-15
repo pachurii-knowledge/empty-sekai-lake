@@ -265,6 +265,24 @@ ifeq ($(DUAL_BRANCH_COUNT),1)
 	VERILATOR_CFLAGS += -DDUAL_BRANCH_COUNT
 endif
 
+# DFE_STATS=1 (-DDFE_STATS): decoupled-frontend (FTQ) S0 instrumentation. Measures how
+# much of the sync-read predict_stall bubble is actually CONVERTIBLE (predict_stall_sole
+# = the only dispatch inhibitor + backend not full) -- the go/no-go evidence for building
+# the FTQ frontend (plans/decoupled-fetch-ftq.md). No datapath effect. OOO only.
+ifeq ($(DFE_STATS),1)
+	VERILATOR_CFLAGS += -DDFE_STATS
+endif
+
+# DFE_S1=1 (-DDFE_S1): decoupled-frontend (FTQ) Stage 1a -- an INERT fetch-side branch
+# predecode + one-directional equivalence assertion (predecoded branchPC == the dispatch-
+# directed TAGE/ITTAGE lookup PC). Proves fetch-side branch identification is byte-identical
+# to today's dispatch-directed key -- the load-bearing accuracy premise for the FTQ (S2).
+# No consumer, no new flops; OFF is source-unchanged bit-identical. A fired assertion kills
+# the FTQ approach cheaply. See plans/decoupled-fetch-ftq.md. OOO only.
+ifeq ($(DFE_S1),1)
+	VERILATOR_CFLAGS += -DDFE_S1
+endif
+
 # BIG_BSTACK=1 (-DBIG_BSTACK): branch checkpoints 4 -> 8 (plans/ooo-perf.md P7).
 # branch_mask_t (4->8b) and branch_id_t auto-widen through every mask-holding
 # structure; default OFF (the verbatim 4) is bit-identical. Re-applied from the P7

@@ -72,6 +72,16 @@ module rvc_realign
     output logic                             rvc_tail_straddle,   // P2b: drain ended in a tail straddle (case-E recover)
     output logic                             frontend_oldest_valid,
     output logic [XLEN-1:0]                  frontend_oldest_pc
+`ifdef DFE_S1
+    ,
+    // ---- DFE S1a inert taps: live drain start + straddle-completion state so the
+    // core's fetch-side branch predecode scans the SAME window origin the realigner
+    // presents this cycle. Read only by the S1a equivalence assertion (no consumer). ----
+    output logic [2:0]                       dfe_s0,
+    output logic                             dfe_completing,
+    output logic [XLEN-1:0]                  dfe_straddle_pc,
+    output logic [15:0]                      dfe_straddle_half
+`endif
 );
 
     // ---------------- registered drain / straddle state ----------------
@@ -426,6 +436,13 @@ module rvc_realign
     assign frontend_oldest_valid = straddle_valid_q || (fgrp_valid && !fgrp_excpt);
     assign frontend_oldest_pc    = straddle_valid_q ? straddle_pc_q
                                                     : (base + {s0, 1'b0});
+
+`ifdef DFE_S1
+    assign dfe_s0            = s0;
+    assign dfe_completing    = completing;
+    assign dfe_straddle_pc   = straddle_pc_q;
+    assign dfe_straddle_half = straddle_half_q;
+`endif
 
     // ---------------- next state ----------------
     always_comb begin

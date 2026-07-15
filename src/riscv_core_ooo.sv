@@ -762,6 +762,18 @@ module riscv_core_ooo
 `endif
     end
 
+`ifdef DFE_S1
+`ifdef RVC
+    // DFE S1a realigner taps. RVC-only: DFE_S1 is OoO-only and the OoO frontend
+    // requires RVC (a non-RVC OoO build does not elaborate -- pre-existing
+    // is_compressed), and the predecode is RVC-parcel-based.
+    logic [2:0]      dfe_s0;
+    logic            dfe_completing;
+    logic [XLEN-1:0] dfe_straddle_pc;
+    logic [15:0]     dfe_straddle_half;
+`endif
+`endif
+
 `ifdef RVC
     // RV64C: the two-wide expand-before-decode realign stage drains the
     // presented 16-byte group as 2-byte parcels and emits up to two canonical
@@ -821,6 +833,12 @@ module riscv_core_ooo
         .rvc_tail_straddle,
         .frontend_oldest_valid(rvc_oldest_valid),
         .frontend_oldest_pc(rvc_oldest_pc)
+`ifdef DFE_S1
+        , .dfe_s0(dfe_s0)
+        , .dfe_completing(dfe_completing)
+        , .dfe_straddle_pc(dfe_straddle_pc)
+        , .dfe_straddle_half(dfe_straddle_half)
+`endif
     );
 `endif
 
@@ -1939,6 +1957,112 @@ module riscv_core_ooo
             end
         end
     end
+
+`ifdef DFE_S1
+`ifdef RVC
+    // ============ DFE S1a: fetch-side branch predecode (INERT, no consumer) ============
+    // Independent raw-block scan that reproduces WHICH in-block instruction is the first
+    // controlling conditional / first non-return indirect of the drain window the
+    // realigner presents this cycle. Compared one-directionally against the dispatch-
+    // directed lookup PCs by the assertion below. A different traversal of the same bytes
+    // -- reusing rvc_lane_pc would be a tautology. RVC-only (DFE_S1 is OoO-only, OoO
+    // requires RVC).
+    logic            pd_cond_valid;  logic [XLEN-1:0] pd_cond_pc;
+    logic            pd_ind_valid;   logic [XLEN-1:0] pd_ind_pc;
+
+    always_comb begin
+        logic [15:0]     pd_par [8];
+        logic [XLEN-1:0] pd_base, pd_pc;
+        logic [3:0]      pd_cur;
+        logic            pd_stop;
+        logic [15:0]     pd_p, pd_hi;
+        logic [4:0]      pd_rs1, pd_rd;
+        logic            pd_is32, pd_is_cond, pd_is_jalr, pd_is_jal, pd_is_ret;
+
+        for (int k = 0; k < 8; k += 1)
+            pd_par[k] = fgrp_data[k[2]][(k[1:0]) * 16 +: 16];   // == rvc_realign pblock
+        pd_base = {fgrp_pc[XLEN-1:4], 4'b0};
+        pd_cond_valid = 1'b0; pd_cond_pc = '0;
+        pd_ind_valid  = 1'b0; pd_ind_pc  = '0;
+        pd_stop = 1'b0; pd_cur = {1'b0, dfe_s0};
+        pd_pc='0; pd_p='0; pd_hi='0; pd_rs1='0; pd_rd='0;
+        pd_is32=1'b0; pd_is_cond=1'b0; pd_is_jalr=1'b0; pd_is_jal=1'b0; pd_is_ret=1'b0;
+
+        // Straddle completion: the prev block's 32-bit low half is this cycle's lane0.
+        if (dfe_completing) begin
+            if (dfe_straddle_half[6:2] == 5'b11000) begin
+                pd_cond_valid = 1'b1; pd_cond_pc = dfe_straddle_pc;   // 32-bit BRANCH
+            end else if (dfe_straddle_half[6:2] == 5'b11001) begin
+                // 32-bit JALR straddling parcel 7. rs1's upper 4 bits are in the
+                // not-yet-arrived high half, so a return cannot be disambiguated here.
+                // OVER-detect the indirect pick (Finding #1): the assertion is one-
+                // directional and decode excludes ONLY the true return (rs1==1 && rd==0),
+                // whose indirect_lookup_valid is already 0.
+                pd_ind_valid = 1'b1; pd_ind_pc = dfe_straddle_pc;
+                pd_stop = 1'b1;
+            end else if (dfe_straddle_half[6:2] == 5'b11011) begin
+                pd_stop = 1'b1;                                       // 32-bit JAL
+            end
+            pd_cur = 4'd1;                                           // parcel0 high half consumed
+        end
+
+        for (int step = 0; step < 8; step += 1) begin
+            if (!pd_stop && (pd_cur <= 4'd7) && fgrp_valid) begin
+                pd_p   = pd_par[pd_cur[2:0]];
+                pd_hi  = (pd_cur < 4'd7) ? pd_par[pd_cur[2:0] + 3'd1] : 16'h0000;
+                pd_pc  = pd_base + {pd_cur[2:0], 1'b0};
+                pd_is32= (pd_p[1:0] == 2'b11);
+                pd_rd  = pd_p[11:7];
+                pd_rs1 = pd_is32 ? {pd_hi[3:0], pd_p[15]} : pd_p[11:7];
+                pd_is_cond = (pd_is32 && (pd_p[6:2]==5'b11000)) ||
+                             ((pd_p[1:0]==2'b01) && ((pd_p[15:13]==3'b110)||(pd_p[15:13]==3'b111)));
+                pd_is_jal  = (pd_is32 && (pd_p[6:2]==5'b11011)) ||
+                             ((pd_p[1:0]==2'b01) && (pd_p[15:13]==3'b101));
+                pd_is_jalr = (pd_is32 && (pd_p[6:2]==5'b11001)) ||
+                             ((pd_p[1:0]==2'b10) && (pd_p[15:13]==3'b100) &&
+                              (pd_p[6:2]==5'd0) && (pd_p[11:7]!=5'd0));
+                pd_is_ret  = pd_is_jalr &&
+                             ( (pd_is32 && (pd_rs1==5'd1) && (pd_rd==5'd0)) ||
+                               (!pd_is32 && (pd_p[12]==1'b0) && (pd_p[11:7]==5'd1)) );
+
+                if (pd_is32 && (pd_cur == 4'd7)) begin
+                    pd_stop = 1'b1;                    // parcel-7 low half: caught via completing
+                end else if (pd_is_jal || pd_is_ret) begin
+                    pd_stop = 1'b1;                    // squashes younger, not a lookup pick
+                end else if (pd_is_jalr) begin
+                    if (!pd_ind_valid) begin pd_ind_valid=1'b1; pd_ind_pc=pd_pc; end
+                    pd_stop = 1'b1;                    // non-return indirect squashes younger
+                end else if (pd_is_cond) begin
+                    if (!pd_cond_valid) begin pd_cond_valid=1'b1; pd_cond_pc=pd_pc; end
+                    pd_cur = pd_cur + (pd_is32 ? 4'd2 : 4'd1);   // cond does NOT squash younger
+                end else begin
+                    pd_cur = pd_cur + (pd_is32 ? 4'd2 : 4'd1);
+                end
+            end
+        end
+    end
+
+`ifndef SYNTHESIS
+    // #1 KILL SIGNAL: the fetch-side predecode must name the SAME conditional/indirect
+    // branch PC the dispatch-directed TAGE/ITTAGE lookup keys on (identical prediction
+    // input key). One-directional: lookup_valid => predecode names it here. A mismatch
+    // means the FTQ would predict from a different key => accuracy would diverge =>
+    // the universal-no-regression premise is false. Hard stop.
+    always_ff @(posedge clk) begin
+        if (rst_l && fgrp_valid && !halted_q && !fetch_flush) begin
+            if (direct_lookup_valid)
+                assert (pd_cond_valid && (pd_cond_pc == direct_lookup_pc))
+                  else $error("DFE_S1 cond mismatch: pd=%h disp=%h (fgrp_pc=%h s0=%0d compl=%b)",
+                              pd_cond_pc, direct_lookup_pc, fgrp_pc, dfe_s0, dfe_completing);
+            if (indirect_lookup_valid)
+                assert (pd_ind_valid && (pd_ind_pc == indirect_lookup_pc))
+                  else $error("DFE_S1 ind mismatch: pd=%h disp=%h (fgrp_pc=%h s0=%0d compl=%b)",
+                              pd_ind_pc, indirect_lookup_pc, fgrp_pc, dfe_s0, dfe_completing);
+        end
+    end
+`endif
+`endif
+`endif
 
     // ---- Phys-reg read-address fan-out (FB2b false-loop break) ----
     // Extracted from the monolithic dispatch always_comb so that the read of
@@ -3159,6 +3283,17 @@ module riscv_core_ooo
     logic [63:0] perf_dispatch_stall_cycles;  // any-reason dispatch stall
     logic [63:0] perf_bstack_branch_block;    // cycles a branch was blocked by full stack
     logic [63:0] perf_branch_presented;       // cycles a branch was presented at dispatch
+`ifdef DFE_STATS
+    // Decoupled-frontend (FTQ) S0 instrumentation: how much predict_stall is actually
+    // CONVERTIBLE by hiding the sync-read predictor latency. ps_raw = all predict_stall
+    // cycles; ps_sole = cycles where predict_stall is the ONLY dispatch inhibitor AND the
+    // backend is not full (the truly recoverable count -- other suppress/structural terms
+    // would stall anyway); ps_sole_res = ps_sole with a fetched block already buffered
+    // (fbuf_cnt!=0), i.e. run-ahead has work (predictor-latency-bound, not ifetch-bound).
+    logic [63:0] perf_ps_raw;
+    logic [63:0] perf_ps_sole;
+    logic [63:0] perf_ps_sole_res;
+`endif
 `ifdef DUAL_BRANCH_COUNT
     // Upper bound on the dispatch throughput a 2nd-branch-per-group (DUAL_BRANCH) could
     // recover: cycles where a dispatched branch left a VALID younger lane held behind it
@@ -3210,6 +3345,11 @@ module riscv_core_ooo
             perf_dispatch_stall_cycles = 64'b0;
             perf_bstack_branch_block = 64'b0;
             perf_branch_presented = 64'b0;
+`ifdef DFE_STATS
+            perf_ps_raw = 64'b0;
+            perf_ps_sole = 64'b0;
+            perf_ps_sole_res = 64'b0;
+`endif
 `ifdef DUAL_BRANCH_COUNT
             perf_grp_branch_cut = 64'b0;
             perf_grp_2nd_branch = 64'b0;
@@ -3280,6 +3420,21 @@ module riscv_core_ooo
                         perf_bstack_branch_block = perf_bstack_branch_block + 64'd1;
                 end
             end
+`ifdef DFE_STATS
+            if (predict_stall) begin
+                perf_ps_raw = perf_ps_raw + 64'd1;
+                // Sole-cause: predict_stall is the only reason dispatch is held this cycle,
+                // and no backend structure is full -- so hiding it would actually convert.
+                if (!redirect_valid && !terminal_pending_q && !control_pending_q &&
+                    !serial_pending_q && !halted_q && !irq_drain_q && !wfi_wait_q &&
+                    !commit_take_trap && !fencei_block && !fflags_drain_stall &&
+                    !active_full && !int_iq_full && !mem_queue_full && !fetch_xlate_stall) begin
+                    perf_ps_sole = perf_ps_sole + 64'd1;
+                    if (fbuf_cnt_q != 2'd0)
+                        perf_ps_sole_res = perf_ps_sole_res + 64'd1;
+                end
+            end
+`endif
 `ifdef DUAL_BRANCH_COUNT
             // A dispatched branch always terminates its group, so a valid younger lane
             // that did NOT dispatch was cut off by that branch -- the addressable event
@@ -3535,6 +3690,11 @@ module riscv_core_ooo
                 $fdisplay(pfd, "dispatch_stall_cycles=%0d", perf_dispatch_stall_cycles);
                 $fdisplay(pfd, "branch_presented_cycles=%0d", perf_branch_presented);
                 $fdisplay(pfd, "bstack_branch_block_cycles=%0d", perf_bstack_branch_block);
+`ifdef DFE_STATS
+                $fdisplay(pfd, "predict_stall_raw=%0d", perf_ps_raw);
+                $fdisplay(pfd, "predict_stall_sole=%0d", perf_ps_sole);
+                $fdisplay(pfd, "predict_stall_sole_resident=%0d", perf_ps_sole_res);
+`endif
 `ifdef DUAL_BRANCH_COUNT
                 $fdisplay(pfd, "grp_branch_cut_cycles=%0d", perf_grp_branch_cut);
                 $fdisplay(pfd, "grp_2nd_branch_cycles=%0d", perf_grp_2nd_branch);
