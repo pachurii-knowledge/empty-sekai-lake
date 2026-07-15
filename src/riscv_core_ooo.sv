@@ -394,6 +394,9 @@ module riscv_core_ooo
     logic [OOO_WIDTH-1:0] lane_valid;
     logic [OOO_WIDTH-1:0] lane_has_dest;
     logic [OOO_WIDTH-1:0] lane_is_branch;
+`ifdef JAL_NO_CKPT
+    logic [OOO_WIDTH-1:0] lane_needs_ckpt;  // lane_is_branch minus JAL (PC_uncond)
+`endif
     logic [OOO_WIDTH-1:0] lane_is_unpredicted_control;
     logic [OOO_WIDTH-1:0] lane_is_call;
     logic [OOO_WIDTH-1:0] lane_is_return;
@@ -1554,6 +1557,9 @@ module riscv_core_ooo
         .lane_valid,
         .lane_has_dest,
         .lane_is_branch,
+`ifdef JAL_NO_CKPT
+        .lane_needs_ckpt,
+`endif
         .lane_is_memory,
         .lane_is_terminal,
         .lane_is_serializing,
@@ -2031,6 +2037,10 @@ module riscv_core_ooo
                 ((decode_lanes[i].ctrl.pc_source == PC_cond) ||
                  (decode_lanes[i].ctrl.pc_source == PC_uncond) ||
                  (decode_lanes[i].ctrl.pc_source == PC_indirect));
+`ifdef JAL_NO_CKPT
+            lane_needs_ckpt[i] = lane_is_branch[i] &&
+                (decode_lanes[i].ctrl.pc_source != PC_uncond);
+`endif
             lane_is_unpredicted_control[i] = lane_valid[i] &&
                 ((decode_lanes[i].ctrl.pc_source == PC_uncond) ||
                  (decode_lanes[i].ctrl.pc_source == PC_indirect));
@@ -2279,8 +2289,18 @@ module riscv_core_ooo
             rename_packets[i].has_dest = map_has_dest[i];
             rename_packets[i].imm = decode_lanes[i].imm;
             rename_packets[i].branch_mask = dispatch_branch_mask;
+`ifdef JAL_NO_CKPT
+            // JAL (PC_uncond) allocates no checkpoint, so it carries branch_id 0.
+            // Redundant with EDIT 1 (a branch terminates the group => at most one
+            // dispatched branch => a JAL group has branch_allocate==0 => id 0 already),
+            // but makes EDIT 2's safety independent of group-termination.
+            rename_packets[i].branch_id = (lane_is_branch[i] &&
+                (decode_lanes[i].ctrl.pc_source != PC_uncond)) ?
+                branch_allocate_id : '0;
+`else
             rename_packets[i].branch_id = lane_is_branch[i] ?
                 branch_allocate_id : '0;
+`endif
             rename_packets[i].active_id = active_tail +
                 active_id_t'(lane_active_offset[i]);
             rename_packets[i].control_predicted = lane_control_predicted[i];
@@ -2330,7 +2350,16 @@ module riscv_core_ooo
 
             int_insert_valid[i] = dispatch_valid[i] && !lane_is_memory[i];
             mem_insert_valid[i] = dispatch_valid[i] && lane_is_memory[i];
+`ifdef JAL_NO_CKPT
+            // JAL (PC_uncond) is always correctly predicted (predicted_pc==pc+imm==
+            // target), so its checkpoint could never be restored -- do not allocate it.
+            // lane_is_branch stays true for a JAL (dispatch-group termination + the B2
+            // predictor break are unchanged); only the checkpoint allocate is dropped.
+            branch_allocate |= dispatch_valid[i] && lane_is_branch[i] &&
+                (decode_lanes[i].ctrl.pc_source != PC_uncond);
+`else
             branch_allocate |= dispatch_valid[i] && lane_is_branch[i];
+`endif
         end
     end
 
@@ -3130,6 +3159,14 @@ module riscv_core_ooo
     logic [63:0] perf_dispatch_stall_cycles;  // any-reason dispatch stall
     logic [63:0] perf_bstack_branch_block;    // cycles a branch was blocked by full stack
     logic [63:0] perf_branch_presented;       // cycles a branch was presented at dispatch
+`ifdef DUAL_BRANCH_COUNT
+    // Upper bound on the dispatch throughput a 2nd-branch-per-group (DUAL_BRANCH) could
+    // recover: cycles where a dispatched branch left a VALID younger lane held behind it
+    // (grp_branch_cut), and the subset where that held lane was itself a branch
+    // (grp_2nd_branch). Measurement only, no datapath effect.
+    logic [63:0] perf_grp_branch_cut;
+    logic [63:0] perf_grp_2nd_branch;
+`endif
     logic [63:0] perf_commit_starved_be;      // 0-retire w/ non-empty ROB (backend/latency)
     logic [63:0] perf_commit_starved_fe;      // 0-retire w/ empty ROB (frontend)
     logic [63:0] perf_retire_hist [OOO_WIDTH+1];
@@ -3173,6 +3210,10 @@ module riscv_core_ooo
             perf_dispatch_stall_cycles = 64'b0;
             perf_bstack_branch_block = 64'b0;
             perf_branch_presented = 64'b0;
+`ifdef DUAL_BRANCH_COUNT
+            perf_grp_branch_cut = 64'b0;
+            perf_grp_2nd_branch = 64'b0;
+`endif
             perf_commit_starved_be = 64'b0;
             perf_commit_starved_fe = 64'b0;
             perf_compressed_retired = 64'b0;
@@ -3239,6 +3280,27 @@ module riscv_core_ooo
                         perf_bstack_branch_block = perf_bstack_branch_block + 64'd1;
                 end
             end
+`ifdef DUAL_BRANCH_COUNT
+            // A dispatched branch always terminates its group, so a valid younger lane
+            // that did NOT dispatch was cut off by that branch -- the addressable event
+            // for widening the group past the first branch.
+            begin
+                logic cut_c, second_br_c;
+                cut_c = 1'b0; second_br_c = 1'b0;
+                for (int i = 0; i < OOO_WIDTH; i += 1) begin
+                    if (dispatch_valid[i] && lane_is_branch[i]) begin
+                        for (int j = i + 1; j < OOO_WIDTH; j += 1) begin
+                            if (lane_valid[j] && !dispatch_valid[j]) begin
+                                cut_c = 1'b1;
+                                if (lane_is_branch[j]) second_br_c = 1'b1;
+                            end
+                        end
+                    end
+                end
+                if (cut_c)       perf_grp_branch_cut = perf_grp_branch_cut + 64'd1;
+                if (second_br_c) perf_grp_2nd_branch = perf_grp_2nd_branch + 64'd1;
+            end
+`endif
 
             // Commit-bandwidth histogram + starvation decomposition.
             perf_retire_hist[retire_count] = perf_retire_hist[retire_count] + 64'd1;
@@ -3473,6 +3535,10 @@ module riscv_core_ooo
                 $fdisplay(pfd, "dispatch_stall_cycles=%0d", perf_dispatch_stall_cycles);
                 $fdisplay(pfd, "branch_presented_cycles=%0d", perf_branch_presented);
                 $fdisplay(pfd, "bstack_branch_block_cycles=%0d", perf_bstack_branch_block);
+`ifdef DUAL_BRANCH_COUNT
+                $fdisplay(pfd, "grp_branch_cut_cycles=%0d", perf_grp_branch_cut);
+                $fdisplay(pfd, "grp_2nd_branch_cycles=%0d", perf_grp_2nd_branch);
+`endif
                 $fdisplay(pfd, "commit_starved_backend=%0d", perf_commit_starved_be);
                 $fdisplay(pfd, "commit_starved_frontend=%0d", perf_commit_starved_fe);
                 $fdisplay(pfd, "compressed_retired=%0d", perf_compressed_retired);

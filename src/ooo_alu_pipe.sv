@@ -56,9 +56,17 @@ module ooo_alu_pipe
             wb_next.has_dest = issue_entry.has_dest;
             wb_next.data = result_for(issue_entry, rs1_data, rs2_data);
             wb_next.branch_mask = issue_entry.branch_mask;
+`ifdef JAL_NO_CKPT
+            // JAL (PC_uncond) allocates no checkpoint (branch_id stays 0), so it must
+            // NOT drive a branch resolve -- else it would free meta_q[0] spuriously.
+            // A JAL never mispredicts, so it needs no resolve.
+            wb_next.branch_valid = (issue_entry.ctrl.pc_source == PC_cond) ||
+                (issue_entry.ctrl.pc_source == PC_indirect);
+`else
             wb_next.branch_valid = (issue_entry.ctrl.pc_source == PC_cond) ||
                 (issue_entry.ctrl.pc_source == PC_uncond) ||
                 (issue_entry.ctrl.pc_source == PC_indirect);
+`endif
             wb_next.branch_id = issue_entry.branch_id;
             wb_next.branch_mispredict = wb_next.branch_valid &&
                 branch_mispredict_for(issue_entry, rs1_data, rs2_data);

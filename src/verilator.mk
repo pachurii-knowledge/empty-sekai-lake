@@ -243,6 +243,28 @@ ifeq ($(CF_OOO),1)
 	VERILATOR_CFLAGS += -DCF_OOO
 endif
 
+# JAL_NO_CKPT=1 (-DJAL_NO_CKPT): stop allocating a branch checkpoint for JAL
+# (PC_uncond: JAL/c.j/c.jal). A JAL is always correctly predicted (predicted_pc ==
+# pc+imm == target), so its checkpoint is provably never restored -- dead weight that
+# also inserts a branch_mask bit serializing younger branches and, on a full stack,
+# spuriously stalls dispatch. Drops the JAL's checkpoint allocate + branch resolve and
+# lets a JAL dispatch into a full branch stack (a gated lane_needs_ckpt port on
+# ooo_dispatch_control). lane_is_branch stays TRUE for a JAL, so dispatch-group
+# termination and the B2 predictor break are unchanged; RAS/GHR speculative state is
+# captured by the next younger branch's checkpoint, not the JAL's. Default OFF is
+# bit-identical. OOO only; pairs with CF_OOO/BIG_BSTACK (frees the pool they contend for).
+ifeq ($(JAL_NO_CKPT),1)
+	VERILATOR_CFLAGS += -DJAL_NO_CKPT
+endif
+
+# DUAL_BRANCH_COUNT=1 (-DDUAL_BRANCH_COUNT): measurement-only perf counters that
+# upper-bound the dispatch throughput a 2nd-branch-per-group would recover
+# (grp_branch_cut / grp_2nd_branch in perf.txt). No datapath effect; used to make the
+# DUAL_BRANCH go/no-go empirical before writing any datapath RTL. OOO only.
+ifeq ($(DUAL_BRANCH_COUNT),1)
+	VERILATOR_CFLAGS += -DDUAL_BRANCH_COUNT
+endif
+
 # BIG_BSTACK=1 (-DBIG_BSTACK): branch checkpoints 4 -> 8 (plans/ooo-perf.md P7).
 # branch_mask_t (4->8b) and branch_id_t auto-widen through every mask-holding
 # structure; default OFF (the verbatim 4) is bit-identical. Re-applied from the P7

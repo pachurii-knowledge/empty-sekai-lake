@@ -8,6 +8,12 @@ module ooo_dispatch_control
     input wire logic [OOO_WIDTH-1:0] lane_valid,
     input wire logic [OOO_WIDTH-1:0] lane_has_dest,
     input wire logic [OOO_WIDTH-1:0] lane_is_branch,
+`ifdef JAL_NO_CKPT
+    // Lanes that actually allocate a branch checkpoint (= lane_is_branch minus JAL,
+    // which takes no checkpoint under JAL_NO_CKPT). Only these are subject to the
+    // full-branch-stack dispatch stall; a JAL may dispatch into a full stack.
+    input wire logic [OOO_WIDTH-1:0] lane_needs_ckpt,
+`endif
     input wire logic [OOO_WIDTH-1:0] lane_is_memory,
     input wire logic [OOO_WIDTH-1:0] lane_is_terminal,
     input wire logic [OOO_WIDTH-1:0] lane_is_serializing,
@@ -74,7 +80,11 @@ module ooo_dispatch_control
             if (i != 0 && lane_is_serializing[i - 1]) begin
                 stop_prefix = 1'b1;
             end
+`ifdef JAL_NO_CKPT
+            if (lane_needs_ckpt[i] && branch_stack_full) begin
+`else
             if (lane_is_branch[i] && branch_stack_full) begin
+`endif
                 stop_prefix = 1'b1;
                 if (!prefix_dispatched) begin
                     dispatch_stall = 1'b1;
