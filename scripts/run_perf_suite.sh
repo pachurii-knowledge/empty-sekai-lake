@@ -6,8 +6,15 @@
 #   scripts/run_perf_suite.sh <VTOP_BIN> <LABEL> [bench ...]
 #     VTOP_BIN : path to a Vtop built with RV64=1 OOO=1 RVC=1 [L1D=1]
 #     LABEL    : output subdir under output/perf/<LABEL>
-#     bench    : benchmark basenames (default: all in tests/perf/*.c)
+#     bench    : benchmark basenames (default: all tests/perf/*.c + dhrystone)
 # Env: MAXCYC (optional +maxcyc cap for long runs).
+#
+# `dhrystone` is a first-class suite member but is built differently from the
+# single-file microbenchmarks: it is the upstream (riscv-software-src/riscv-tests)
+# benchmark, multi-TU and kept byte-identical for score integrity, so it is
+# delegated to scripts/run_dhrystone.sh. It is skipped (not failed) if the upstream
+# clone is absent. It reports whole-program IPC like the others, plus DMIPS/MHz
+# (which upstream computes from the loop-only rdcycle timer).
 #
 # The benchmarks link .text@0x00400000 / .data@0x10000000 (bench.ld) to match the
 # main_memory segment bases, and MUST be linked with `ld -T` directly — the gcc
@@ -22,9 +29,27 @@ LIBGCC="$($GCC -march=rv64gc -mabi=lp64d -print-libgcc-file-name)"
 
 VTOP="${1:?usage: run_perf_suite.sh VTOP_BIN LABEL [bench ...]}"
 LABEL="${2:?missing LABEL}"; shift 2
-BENCHES=("$@"); [ ${#BENCHES[@]} -eq 0 ] && BENCHES=($(cd "$HERE" && ls *.c | sed 's/\.c$//'))
+BENCHES=("$@")
+[ ${#BENCHES[@]} -eq 0 ] && BENCHES=($(cd "$HERE" && ls *.c | sed 's/\.c$//') dhrystone)
 
 for NAME in "${BENCHES[@]}"; do
+  if [ "$NAME" = "dhrystone" ]; then
+    # Multi-TU upstream benchmark -> dedicated builder (score integrity). Report in
+    # suite format: whole-program IPC (comparable to the others) + DMIPS/MHz + check.
+    if [ ! -d "$ROOT/references/riscv-software-tests/benchmarks/dhrystone" ]; then
+      printf "%-10s SKIP (clone riscv-software-src/riscv-tests -> references/riscv-software-tests)\n" dhrystone
+      continue
+    fi
+    DL=$("$ROOT/scripts/run_dhrystone.sh" "$VTOP" "$LABEL" 2000 2>/dev/null | grep -E '^2000' || true)
+    DP="$ROOT/output/dhrystone/$LABEL/runs2000/perf.txt"
+    CYC=$(grep -oP '^cycles=\K\d+' "$DP" 2>/dev/null || echo 0)
+    RET=$(grep -oP '^retired=\K\d+' "$DP" 2>/dev/null || echo 0)
+    IPC=$(awk "BEGIN{printf \"%.3f\", $CYC? $RET/$CYC : 0}")
+    DMIPS=$(echo "$DL" | awk '{print $4}'); CHK=$(echo "$DL" | awk '{print $6}')
+    printf "%-10s IPC=%-6s cyc=%-10s ret=%-9s DMIPS/MHz=%-6s %s\n" \
+      dhrystone "$IPC" "$CYC" "$RET" "${DMIPS:-?}" "${CHK:-?}"
+    continue
+  fi
   RUN="$ROOT/output/perf/$LABEL/$NAME"; rm -rf "$RUN"; mkdir -p "$RUN"
   $GCC $CF -c "$HERE/start.S"     -o "$RUN/start.o"
   $GCC $CF -c "$HERE/$NAME.c"     -o "$RUN/bench.o"
