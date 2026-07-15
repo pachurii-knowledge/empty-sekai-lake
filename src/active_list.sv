@@ -301,7 +301,7 @@ module active_list
         // Restore distance measured from THIS cycle's head_q, pop subtracted
         // after (R5). active_distance(head_q, restore_tail) excludes the
         // wrong-path tail the misprediction rolls back.
-        count_after_pop = (restore_valid ? active_distance(head_q, restore_tail)
+        count_after_pop = (restore_valid ? restore_count(head_q, restore_tail)
                                          : count_q) - active_count_t'(commit_pop_count);
     end
 
@@ -317,7 +317,7 @@ module active_list
         commit_valid_next = '0;
 `else /* COMMIT_1STAGE */
         head_postskip = head_q;
-        count_postskip = restore_valid ? active_distance(head_q, restore_tail) : count_q;
+        count_postskip = restore_valid ? restore_count(head_q, restore_tail) : count_q;
         commit_valid = '0;
 `endif /* COMMIT_1STAGE */
         commit_count = 0;
@@ -813,6 +813,33 @@ module active_list
         end else begin
             active_distance = active_count_t'(ACTIVE_LIST_SIZE - from_id + to_id);
         end
+    endfunction
+
+    // Occupancy of [head_id, rtail) on a branch-mispredict restore.
+    //
+    // active_distance() is mod-ACTIVE_LIST_SIZE, so it returns 0 -- never SIZE --
+    // when rtail == head_id: a FULL ring aliases onto an EMPTY one. That state is
+    // reachable: `full` (:222) is (count_q > SIZE - OOO_WIDTH), so a 4-wide group may
+    // dispatch at count_q == SIZE-4 and drive count_q to exactly SIZE (head_q ==
+    // tail_q, full); and because a dispatched branch terminates its group
+    // (ooo_dispatch_control.sv:89-92) a branch can be the YOUNGEST ROB entry, whose
+    // checkpoint tail (riscv_core_ooo.sv:2158) is then == head_q. If that branch
+    // mispredicts, recomputing count as active_distance(head_q, head_q) = 0 declares
+    // the ROB empty while every entry is still live -- a silent wipe that orphans the
+    // in-flight physregs/LSQ entries and hangs the machine.
+    //
+    // On a restore the resolving branch's OWN entry is always still in the window (it
+    // is only marked done by this cycle's writeback), so the true distance is >= 1.
+    // rtail == head_id therefore unambiguously means SIZE, not 0.
+    //
+    // Latent on the in-order-CF-issue baseline (the restoring branch must also be the
+    // only unresolved branch), but -DCF_OOO lets any younger branch restore and makes
+    // it reachable in ordinary branch-dense code. Fixed unconditionally: the guarded
+    // case cannot occur today, so this is behaviourally inert on the current baseline.
+    function automatic active_count_t restore_count(input active_id_t head_id,
+            input active_id_t rtail);
+        restore_count = (rtail == head_id) ? active_count_t'(ACTIVE_LIST_SIZE)
+                                           : active_distance(head_id, rtail);
     endfunction
 
     always_ff @(posedge clk or negedge rst_l) begin
