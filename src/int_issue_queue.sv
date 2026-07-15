@@ -58,6 +58,9 @@ module int_issue_queue
     typedef logic [$clog2(INT_IQ_SIZE)-1:0] iq_idx_t;
     logic [INT_IQ_SIZE-1:0] sel_rdy, sel_cf, sel_alu_cand, sel_csr;
     logic [INT_IQ_SIZE-1:0] sel_mul, sel_div, sel_fp;
+`ifdef CF_OOO
+    logic                   cf_head_ready;  // the oldest unresolved branch can issue now
+`endif
     // Generalized ALU N-pick (scales with ALU_ISSUE_PORTS; at ALU_ISSUE_PORTS==2 it
     // is value-identical to the former 2-pick). alu_taken tracks the running union
     // of picked slots (distinctness); cf_prefix latches once any earlier port takes
@@ -144,6 +147,44 @@ module int_issue_queue
         end
 
         // ---- Per-FU-class eligibility (parallel over the post-wakeup entries) ----
+`ifdef CF_OOO
+        // CF_OOO -- out-of-order control-flow issue.
+        //
+        // The baseline lets a CF op issue only once EVERY older branch it is
+        // speculative under has resolved (branch_mask == 0), so only the OLDEST
+        // unresolved branch may ever execute: branch resolve -- and hence branch
+        // checkpoint reclamation -- is fully serialized. That was never a correctness
+        // requirement. It entered as an admitted stop-gap ("conservatively handle
+        // nested branches for now", 7264445, 2026-05-24) bundled with the real bug of
+        // that day (the free_list restore-distance cast), and branch_stack has always
+        // been an order-agnostic POOL whose frees are keyed by resolve_id
+        // (branch_stack.sv:63,85-112,137-154). No recorded bug depends on it.
+        //
+        // CF_OOO demotes the rule from a BAN to a PRIORITY: a younger CF op may take
+        // the (<=1/cycle, cf_prefix) CF issue slot ONLY on a cycle when the oldest
+        // unresolved branch is not itself ready to take it. The oldest branch -- the
+        // one that unblocks the ROB head and drains the checkpoint pool -- is thus
+        // never delayed by a younger one, and younger branches only fill CF slots that
+        // would otherwise idle. A plain ban-removal would NOT be safe here: the ALU
+        // pick is index-priority (lowest_idx, :182), not age-ordered, so it could
+        // starve the oldest branch in a machine that is already commit-starved.
+        //
+        // At most ONE entry can have branch_mask == '0 (any CF dispatched while a
+        // branch is unresolved carries that branch's bit), so cf_head_ready identifies
+        // exactly the oldest unresolved branch. The sel_rdy terms are repeated verbatim
+        // here because sel_rdy[] is only assigned in the loop below.
+        cf_head_ready = 1'b0;
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            if (entries_wake[i].valid &&
+                    entries_wake[i].src1_ready && entries_wake[i].src2_ready &&
+                    ((entries_q[i].branch_mask & abort_mask) == '0) &&
+                    (entries_wake[i].fu_class == FU_ALU) &&
+                    is_control_flow(entries_wake[i]) &&
+                    (entries_wake[i].branch_mask == '0)) begin
+                cf_head_ready = 1'b1;
+            end
+        end
+`endif
         for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
             // FB2b R3 abort gate: exclude wrong-path entries from selection without
             // the deep squash (block A no longer zeroes them). Uses the ORIGINAL
@@ -158,10 +199,19 @@ module int_issue_queue
             // CSR ops read from the priv CSR file's 2 read ports (wired to ALU0/ALU1
             // only), so they must confine to the first CSR_RD_PORTS ALU ports.
             sel_csr[i] = (entries_wake[i].ctrl.exec_class == EXEC_CSR);
+`ifdef CF_OOO
+            // CF_OOO: hold a younger CF op ONLY while the oldest unresolved branch is
+            // itself ready to issue this cycle (see the note above). Otherwise the CF
+            // slot would idle, so let the younger branch resolve early and recycle its
+            // checkpoint.
+            sel_alu_cand[i] = sel_rdy[i] && (entries_wake[i].fu_class == FU_ALU) &&
+                !(sel_cf[i] && (entries_wake[i].branch_mask != '0) && cf_head_ready);
+`else
             // A control-flow op may issue only once every older branch it is
             // speculative under has resolved (branch_mask == 0).
             sel_alu_cand[i] = sel_rdy[i] && (entries_wake[i].fu_class == FU_ALU) &&
                 !(sel_cf[i] && (entries_wake[i].branch_mask != '0));
+`endif
             sel_mul[i] = sel_rdy[i] && (entries_wake[i].fu_class == FU_MUL);
             sel_div[i] = sel_rdy[i] && (entries_wake[i].fu_class == FU_DIV);
             sel_fp[i]  = sel_rdy[i] && (entries_wake[i].fu_class == FU_FP);

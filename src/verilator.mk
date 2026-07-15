@@ -226,6 +226,23 @@ ifeq ($(XLATE_BYPASS),1)
 	VERILATOR_CFLAGS += -DXLATE_BYPASS
 endif
 
+# CF_OOO=1 (-DCF_OOO): out-of-order control-flow issue. The baseline (int_issue_queue.sv)
+# lets a CF op issue only once every older branch has resolved, so only the OLDEST
+# unresolved branch may execute -- branch resolve, and hence branch-checkpoint
+# reclamation, is fully serialized. That gate was an admitted stop-gap ("conservatively
+# handle nested branches for now", 7264445), not a correctness requirement; branch_stack
+# is an order-agnostic pool whose frees are keyed by resolve_id. CF_OOO demotes it from a
+# BAN to a PRIORITY: a younger branch may take the (<=1/cycle) CF issue slot only when the
+# oldest unresolved branch is not ready to use it, so the oldest branch is never delayed.
+# Pairs with BIG_BSTACK (a faster-draining pool wants more slots to run ahead into).
+# Default OFF is bit-identical (the else-arm is the verbatim baseline expression). OOO only.
+# NOTE: requires the active_list restore_count() fix (full/empty ring alias) -- CF_OOO makes
+# that latent ROB-wipe reachable. Costs: bounded wrong-path predictor training (a branch may
+# now execute in a mispredict shadow, which the baseline made impossible).
+ifeq ($(CF_OOO),1)
+	VERILATOR_CFLAGS += -DCF_OOO
+endif
+
 # BIG_BSTACK=1 (-DBIG_BSTACK): branch checkpoints 4 -> 8 (plans/ooo-perf.md P7).
 # branch_mask_t (4->8b) and branch_id_t auto-widen through every mask-holding
 # structure; default OFF (the verbatim 4) is bit-identical. Re-applied from the P7
