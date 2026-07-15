@@ -226,6 +226,18 @@ ifeq ($(XLATE_BYPASS),1)
 	VERILATOR_CFLAGS += -DXLATE_BYPASS
 endif
 
+# BIG_BSTACK=1 (-DBIG_BSTACK): branch checkpoints 4 -> 8 (plans/ooo-perf.md P7).
+# branch_mask_t (4->8b) and branch_id_t auto-widen through every mask-holding
+# structure; default OFF (the verbatim 4) is bit-identical. Re-applied from the P7
+# branch commit d3180c8, whose verdict was NEUTRAL on xv6/fibrec/branchy/qsort --
+# the bstack stall was eliminated but yielded no IPC (a symptom, not the binder).
+# Re-tested here because Dhrystone is far more branch-dense (bstack_full = 37% of
+# cycles vs xv6's 14.5%), which is a regime P7 never measured. Costs a doubled
+# abort_mask broadcast fanout + per-checkpoint rename-map copy (FB2b routed-WNS net).
+ifeq ($(BIG_BSTACK),1)
+	VERILATOR_CFLAGS += -DBIG_BSTACK
+endif
+
 # FP_OOO=1 de-serializes floating-point ops (plans/ooo-perf.md P5b): drops the
 # machine-wide dispatch quiesce every FP op raises today and replaces it with a
 # single-producer arch-FPR scoreboard (one in-flight writer per FPR via a WAW

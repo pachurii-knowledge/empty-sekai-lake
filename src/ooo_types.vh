@@ -66,7 +66,12 @@ package OOO_Types;
 `else
     localparam int MEM_Q_SIZE = 16;
 `endif
+`ifdef BIG_BSTACK
+    localparam int BRANCH_STACK_SIZE = 8;   // P7 branch-checkpoint depth (doubles
+                                            // branch_mask_t + the abort_mask fanout)
+`else
     localparam int BRANCH_STACK_SIZE = 4;
+`endif
 `ifdef ALU4
     // 3rd integer ALU issue port. ISSUE_ALU0/ALU1 stay 0/1; ISSUE_ALU2=2 inserts
     // before MUL/DIV/FP (which shift up), and WB gets a 3rd ALU source. The ALU
