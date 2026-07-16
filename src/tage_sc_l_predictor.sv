@@ -125,6 +125,39 @@ module tage_sc_l_predictor
     logic [SC_INDEX_BITS-1:0] sc_hist_q;
     logic lookup_valid_q;
 
+`ifdef DFE_S2
+    // DFE S2 (decoupled-frontend, functional-sim perf lever): make the read stage
+    // COMBINATIONAL (async) instead of sync. The per-bank reads + carried metadata
+    // are now assigned in an always_comb, so `prediction`/`prediction_info` (Stage-2,
+    // UNCHANGED) are available the SAME cycle as lookup_pc rather than the next cycle.
+    // This lets the core drop the predict_stall hold for conditional branches
+    // (riscv_core_ooo.sv narrows pred_launch to indirect-only under DFE_S2), recovering
+    // the sync-read frontend bubble. VALUE-IDENTICAL to the sync read: the async read at
+    // cycle T reads exactly the array values the sync read would have registered from the
+    // arrays during T and delivered at T+1 (Stage-2 is byte-identical), so the prediction
+    // is the same, just one cycle earlier; predictor state is architecturally inert, so at
+    // worst it reflects one-cycle-fresher tables. Async array reads do NOT infer BRAM, so
+    // this is a FUNCTIONAL-SIM lever (like XLATE_BYPASS/LSQ_MLP2) -- an FPGA/ASIC build must
+    // keep it OFF (the sync-read always_ff below is the synthesizable path). No reset (pure comb).
+    always_comb begin
+        base_rd_q   = base_table[base_index];
+        cnt_rd_q[0] = tage_counter_0[idx[0]];
+        cnt_rd_q[1] = tage_counter_1[idx[1]];
+        cnt_rd_q[2] = tage_counter_2[idx[2]];
+        use_rd_q[0] = tage_useful_0[idx[0]];
+        use_rd_q[1] = tage_useful_1[idx[1]];
+        use_rd_q[2] = tage_useful_2[idx[2]];
+        tag_rd_q[0] = tage_tag_0[idx[0]];
+        tag_rd_q[1] = tage_tag_1[idx[1]];
+        tag_rd_q[2] = tage_tag_2[idx[2]];
+        sc_rd_q     = sc_bias[sc_index];
+        idx_q[0]    = idx[0];  idx_q[1] = idx[1];  idx_q[2] = idx[2];
+        tag_q[0]    = tag[0];  tag_q[1] = tag[1];  tag_q[2] = tag[2];
+        base_index_q   = base_index;
+        sc_hist_q      = history[SC_INDEX_BITS-1:0];
+        lookup_valid_q = lookup_valid;
+    end
+`else
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             base_rd_q      <= '0;
@@ -156,6 +189,7 @@ module tage_sc_l_predictor
             lookup_valid_q <= lookup_valid;
         end
     end
+`endif
 
     // --- Stage 2 (combinational): prediction from the registered reads ---
     always_comb begin

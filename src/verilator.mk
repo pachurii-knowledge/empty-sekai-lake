@@ -92,6 +92,11 @@ ifeq ($(PERF),1)
 	FP_OOO := 1
 	ALU4 := 1
 	LSQ_MLP2 := 1
+	# 2026-07-16 re-baseline: the branch-perf levers, each verified pure-win + gated, folded in.
+	CF_OOO := 1
+	BIG_BSTACK := 1
+	COMMIT1 := 1
+	DFE_S2 := 1
 endif
 
 ifeq ($(SUPERSCALAR),4)
@@ -281,6 +286,21 @@ endif
 # the FTQ approach cheaply. See plans/decoupled-fetch-ftq.md. OOO only.
 ifeq ($(DFE_S1),1)
 	VERILATOR_CFLAGS += -DDFE_S1
+endif
+
+# DFE_S2=1 (-DDFE_S2): decoupled-frontend Stage 2 -- remove the sync-read predict_stall
+# bubble for CONDITIONAL branches by making the TAGE read COMBINATIONAL (async) instead of
+# sync (tage_sc_l_predictor.sv: the read stage always_ff -> always_comb), so the direction
+# prediction is available the same cycle the branch is at the dispatch head. The core then
+# narrows pred_launch to indirect-only (the ITTAGE indirect read stays sync = S2b territory).
+# VALUE-IDENTICAL to the sync read (Stage-2 unchanged; the async read at cycle T returns the
+# same array values the sync read delivered at T+1) -- predictions are architecturally inert,
+# so at worst one-cycle-fresher tables; correctness (ACT/xv6) is unaffected, only cycle counts.
+# The S0 counter measured predict_stall_sole = 14.4% of Dhrystone cycles => ~+11-17% ceiling.
+# Async reads do NOT infer BRAM -> FUNCTIONAL-SIM lever (like XLATE_BYPASS/LSQ_MLP2); an
+# FPGA/ASIC build must keep it OFF. Default OFF is bit-identical (all gated by -DDFE_S2). OOO only.
+ifeq ($(DFE_S2),1)
+	VERILATOR_CFLAGS += -DDFE_S2
 endif
 
 # BIG_BSTACK=1 (-DBIG_BSTACK): branch checkpoints 4 -> 8 (plans/ooo-perf.md P7).

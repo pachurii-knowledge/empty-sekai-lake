@@ -458,8 +458,16 @@ module riscv_core_ooo
     logic [DIRECT_HISTORY_BITS-1:0] pred_key_ghr_q;
     logic pred_launch, prediction_ready, predict_stall;
     // A branch-bearing group is presented and its sync-read lookup is in flight.
+    // DFE_S2: the DIRECT (TAGE, conditional) read is combinational (async) under
+    // -DDFE_S2 (tage_sc_l_predictor.sv), so direct_prediction is available the same
+    // cycle the branch is at the dispatch head -- no hold needed. Only the INDIRECT
+    // (ITTAGE) sync read still holds (S2b territory). Default: both terms (bit-identical).
     assign pred_launch = fgrp_valid && !halted_q &&
+`ifdef DFE_S2
+                         indirect_lookup_valid;
+`else
                          (direct_lookup_valid || indirect_lookup_valid);
+`endif
     // The registered prediction is ready and matches THIS held group's key.
     assign prediction_ready = pred_ready_q && (pred_key_pc_q == fgrp_pc) &&
                               (pred_key_ghr_q == ghr_q);
