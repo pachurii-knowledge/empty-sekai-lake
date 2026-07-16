@@ -3312,6 +3312,13 @@ module riscv_core_ooo
 `endif
     logic [63:0] perf_commit_starved_be;      // 0-retire w/ non-empty ROB (backend/latency)
     logic [63:0] perf_commit_starved_fe;      // 0-retire w/ empty ROB (frontend)
+`ifdef ROBHEAD_STATS
+    // Decompose commit_starved_backend (0-retire, non-empty ROB) by WHY the ROB head is not
+    // retiring -- distinguishes the small-window case from commit-gating / head-op latency.
+    logic [63:0] perf_cs_gated;    // head DONE (commit_valid[0]) but retire blocked (store port / SC-AMO / commit gate)
+    logic [63:0] perf_cs_window;   // head NOT done AND ROB full -> can't dispatch behind it = SMALL WINDOW
+    logic [63:0] perf_cs_latency;  // head NOT done AND ROB has room -> head waiting on its op/deps (ILP / FU latency)
+`endif
     logic [63:0] perf_retire_hist [OOO_WIDTH+1];
     logic [63:0] perf_dispatch_hist [OOO_WIDTH+1];
     logic [63:0] perf_compressed_retired;     // RVC (16-bit) instructions retired
@@ -3364,6 +3371,9 @@ module riscv_core_ooo
 `endif
             perf_commit_starved_be = 64'b0;
             perf_commit_starved_fe = 64'b0;
+`ifdef ROBHEAD_STATS
+            perf_cs_gated = 64'b0; perf_cs_window = 64'b0; perf_cs_latency = 64'b0;
+`endif
             perf_compressed_retired = 64'b0;
             perf_l1i_miss_cnt = 64'b0;
             perf_l1d_miss_cnt = 64'b0;
@@ -3469,7 +3479,15 @@ module riscv_core_ooo
             perf_retire_hist[retire_count] = perf_retire_hist[retire_count] + 64'd1;
             if (retire_count == 3'd0) begin
                 if (active_empty) perf_commit_starved_fe = perf_commit_starved_fe + 64'd1;
-                else              perf_commit_starved_be = perf_commit_starved_be + 64'd1;
+                else begin
+                    perf_commit_starved_be = perf_commit_starved_be + 64'd1;
+`ifdef ROBHEAD_STATS
+                    // WHY the ROB head did not retire this cycle (mutually exclusive):
+                    if (active_commit_valid[0]) perf_cs_gated   = perf_cs_gated   + 64'd1; // head ready, retire gated
+                    else if (active_full)       perf_cs_window  = perf_cs_window  + 64'd1; // head stalled + ROB full
+                    else                        perf_cs_latency = perf_cs_latency + 64'd1; // head stalled, window has room
+`endif
+                end
             end
             begin
                 logic [2:0] dcnt;
@@ -3709,6 +3727,11 @@ module riscv_core_ooo
 `endif
                 $fdisplay(pfd, "commit_starved_backend=%0d", perf_commit_starved_be);
                 $fdisplay(pfd, "commit_starved_frontend=%0d", perf_commit_starved_fe);
+`ifdef ROBHEAD_STATS
+                $fdisplay(pfd, "cs_gated=%0d", perf_cs_gated);
+                $fdisplay(pfd, "cs_window=%0d", perf_cs_window);
+                $fdisplay(pfd, "cs_latency=%0d", perf_cs_latency);
+`endif
                 $fdisplay(pfd, "compressed_retired=%0d", perf_compressed_retired);
                 $fdisplay(pfd, "l1i_miss=%0d", perf_l1i_miss_cnt);
                 $fdisplay(pfd, "l1d_miss=%0d", perf_l1d_miss_cnt);

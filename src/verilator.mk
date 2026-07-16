@@ -278,6 +278,15 @@ ifeq ($(DFE_STATS),1)
 	VERILATOR_CFLAGS += -DDFE_STATS
 endif
 
+# ROBHEAD_STATS=1 (-DROBHEAD_STATS): decompose commit_starved_backend (0-retire, non-empty
+# ROB) into cs_gated (head ready but retire gated -- store port/SC-AMO/commit gate),
+# cs_window (head stalled AND ROB full = small-window bound), cs_latency (head stalled but
+# window has room = ILP/dependency/FU-latency). Diagnostic-only, no datapath effect,
+# sim-only (SIMULATION_18447). OOO only. Answers "is commit-starvation a small-window symptom?"
+ifeq ($(ROBHEAD_STATS),1)
+	VERILATOR_CFLAGS += -DROBHEAD_STATS
+endif
+
 # DFE_S1=1 (-DDFE_S1): decoupled-frontend (FTQ) Stage 1a -- an INERT fetch-side branch
 # predecode + one-directional equivalence assertion (predecoded branchPC == the dispatch-
 # directed TAGE/ITTAGE lookup PC). Proves fetch-side branch identification is byte-identical
