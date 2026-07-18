@@ -16,6 +16,15 @@
   `define NIIGO_DSIDE_WB
 `endif
 
+`ifdef LOAD_SPEC_WAKE
+`ifndef L1D_CACHE
+  // LOAD_SPEC_WAKE requires the L1D's 1-cycle hit latency as its spec-wake
+  // timing anchor (load-spec-wake.md §top): on the passthrough memsys the
+  // fixed D_RESP_DELAY (>1) makes every spec-wake resolve as a miss.
+  `error "LOAD_SPEC_WAKE requires L1D_CACHE (1-cycle hit anchor); use L1D=1 / PERF=1"
+`endif
+`endif
+
 `default_nettype none
 
 module riscv_core_ooo
@@ -410,6 +419,60 @@ module riscv_core_ooo
     logic [OOO_WIDTH-1:0] lane_fp_src_busy;
     logic [OOO_WIDTH-1:0] lane_reads_fflags;
     logic                 fflags_drain_stall;
+`ifdef FUSE_ANY
+    // Macro-op fusion shared detector outputs (plans/dhry-attack-plan/shared-infra.md
+    // §3): lane i is the older op of a fusable ADJACENT pair (i, i+1); lane i+1 is
+    // the folded younger op. Decode-derived ONLY (never dispatch_valid) so no
+    // combinational loop through dispatch_control is introduced.
+    logic [OOO_WIDTH-1:0] fuse_master;
+    logic [OOO_WIDTH-1:0] fuse_slave;
+    logic [OOO_WIDTH-1:0][1:0] fuse_kind_lane;
+`endif
+`ifdef FUSE_LDBR
+    // FUSE_LDBR: lane i is the SLAVE of an LDBR pair — NOT born-done (its ROB
+    // entry retires via the pend_fbr fused-resolve writeback; active_list).
+    logic [OOO_WIDTH-1:0] fuse_slave_ldbr;
+    // pend_fbr: the 1-deep fused-branch-resolve buffer + its LSQ handshake.
+    writeback_packet_t pend_fbr_q, pend_fbr_next;
+    writeback_packet_t fbr_writeback;         // pend_fbr_q, drive-gated
+    logic            pend_fbr_full;           // -> LSQ fused-issue gate
+    logic            pend_fbr_drain_ready;    // WB bus accepted/aborted it
+    logic            fused_resolve_valid;
+    active_id_t      fused_resolve_active_id;
+    branch_id_t      fused_resolve_branch_id;
+    logic [XLEN-1:0] fused_resolve_pc;
+    logic [31:0]     fused_resolve_instr;
+    logic [XLEN-1:0] fused_resolve_redirect_pc;
+    logic            fused_resolve_mispredict;
+    logic            fused_resolve_ctrl_pred;
+    logic [XLEN-1:0] fused_resolve_pred_pc;
+    predictor_info_t fused_resolve_pred_info;
+    branch_mask_t    fused_resolve_branch_mask;
+    logic            fused_resolve_is_comp;
+`endif
+`ifdef FUSE_UADDR
+    // FUSE_UADDR (c) survivor overrides (fuse-uaddr.md §2): the surviving
+    // YOUNGER load keeps its lane but reads x0 for rs1 (map_rs1<-0), takes the
+    // folded hi+off immediate, and selects the LSQ AGU pc-base path. The nulled
+    // OLDER auipc rides the shared fuse_slave[] null path (born-done ROB slot).
+    logic [OOO_WIDTH-1:0]           fu_zero_rs1;
+    logic [OOO_WIDTH-1:0]           fu_imm_ovr;
+    logic [OOO_WIDTH-1:0][XLEN-1:0] fu_imm;
+    logic [OOO_WIDTH-1:0]           fu_pc_base;
+`endif
+`ifdef FUSE_BRANCH
+    // Fuse-master whose folded slave is a branch (drives dispatch_control's
+    // atomic-pair branch-stack stall, shared-infra §4b).
+    logic [OOO_WIDTH-1:0] lane_fuse_pre_branch;
+`endif
+`ifdef FUSE_CMPBR_LI
+    // FUSE_CMPBR Case B (li fusion, fuse-cmpbr.md §7b): lane i is a li master
+    // whose folded branch compares against the branch's OTHER source register
+    // (not x0). fu_caseb_src is that arch register; the master re-reads it via
+    // its (otherwise unused) rs2 rename port (the li reads only x0).
+    logic [OOO_WIDTH-1:0]           fu_caseb;
+    logic [OOO_WIDTH-1:0][4:0]      fu_caseb_src;
+`endif
     logic [OOO_WIDTH-1:0] dispatch_valid;
     logic [OOO_WIDTH-1:0] alloc_req;
     logic [OOO_WIDTH-1:0] map_has_dest;
@@ -532,6 +595,28 @@ module riscv_core_ooo
     issue_entry_t alu_issue_entry_q [ALU_ISSUE_PORTS];
     logic [ALU_ISSUE_PORTS-1:0] spec_wake_valid;
     phys_reg_t spec_wake_prd [ALU_ISSUE_PORTS];
+
+`ifdef LOAD_SPEC_WAKE
+    // LOAD_SPEC_WAKE (plans/dhry-attack-plan/load-spec-wake.md): the LSQ's
+    // hit-predicted load broadcast (wired LSQ -> IQ directly) plus the core's
+    // one-cycle verdict. ld_spec_pending_q tracks a broadcast made last cycle;
+    // a response this cycle is that load's HIT (sole-outstanding at broadcast),
+    // its absence the MISS. Under LSQ_MLP2 the verdict id-matches
+    // dmem_resp_id vs the broadcast's allocated inflight id (adversarial
+    // finding 1: never trust raw dmem_resp_valid). alu_issue_ld_spec_q is the
+    // S2 poison riding alongside alu_issue_valid_q; iq_issue_ld_spec is the
+    // IQ's per-port pick poison.
+    logic       lsq_load_spec_wake_valid;
+    phys_reg_t  lsq_load_spec_wake_prd;
+    logic       ld_spec_pending_q;
+    logic       ld_spec_hit, ld_spec_miss;
+    logic [ALU_ISSUE_PORTS-1:0] iq_issue_ld_spec;
+    logic [ALU_ISSUE_PORTS-1:0] alu_issue_ld_spec_q;
+`ifdef LSQ_MLP2
+    logic [DMEM_ID_W-1:0] lsq_load_spec_wake_id;
+    logic [DMEM_ID_W-1:0] ld_spec_id_q;
+`endif
+`endif
 
     phys_reg_t phys_rs1 [PHYS_READ_PORTS];
     phys_reg_t phys_rs2 [PHYS_READ_PORTS];
@@ -1556,10 +1641,29 @@ module riscv_core_ooo
         .prediction(direct_prediction),
         .prediction_info(direct_prediction_info),
         .update_valid(branch_writeback.valid && branch_writeback.branch_valid &&
+`ifdef FUSE_BRANCH
+            // A fused master resolves the folded slave branch: train with the
+            // SLAVE's identity (the master's .instr is not a branch encoding).
+            ((branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH) ||
+             (branch_writeback.fuse_is_branch &&
+              branch_writeback.fuse_branch_instr[6:0] == RISCV_ISA::OP_BRANCH))),
+`else
             (branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH)),
+`endif
+`ifdef FUSE_BRANCH
+        .update_pc(branch_writeback.fuse_is_branch ?
+            branch_writeback.fuse_branch_pc : branch_writeback.pc),
+        .update_taken(branch_writeback.redirect_pc !=
+            ((branch_writeback.fuse_is_branch ?
+                branch_writeback.fuse_branch_pc : branch_writeback.pc)
+             + `ILEN_INC(branch_writeback.fuse_is_branch ?
+                 branch_writeback.fuse_is_compressed :
+                 branch_writeback.is_compressed))),
+`else
         .update_pc(branch_writeback.pc),
         .update_taken(branch_writeback.redirect_pc !=
             (branch_writeback.pc + `ILEN_INC(branch_writeback.is_compressed))),
+`endif
         .update_info(branch_writeback.predictor_info)
     );
 
@@ -1579,12 +1683,27 @@ module riscv_core_ooo
         .update_info(branch_writeback.predictor_info)
     );
 
+`ifdef FUSE_BRANCH
+    // Fused-pair atomicity (shared-infra §4b): a fuse-master whose folded slave
+    // is a branch (CMPBR/LDBR kinds) must stall WITH the branch-stack-full slave
+    // so the pair dispatches together or not at all. Decode-derived (fuse_master/
+    // fuse_kind_lane read decode_lanes only) — no dispatch_valid feedback loop.
+    for (genvar fuse_gi = 0; fuse_gi < OOO_WIDTH; fuse_gi += 1) begin : gen_fuse_pre_branch
+        assign lane_fuse_pre_branch[fuse_gi] = fuse_master[fuse_gi] &&
+            ((fuse_kind_lane[fuse_gi] == FUSE_K_CMPBR) ||
+             (fuse_kind_lane[fuse_gi] == FUSE_K_LDBR));
+    end
+`endif
+
     ooo_dispatch_control DispatchControl (
         .lane_valid,
         .lane_has_dest,
         .lane_is_branch,
 `ifdef JAL_NO_CKPT
         .lane_needs_ckpt,
+`endif
+`ifdef FUSE_BRANCH
+        .lane_fuse_pre_branch,
 `endif
         .lane_is_memory,
         .lane_is_terminal,
@@ -1655,6 +1774,14 @@ module riscv_core_ooo
         .full(int_iq_full),
         .issue_valid(int_issue_valid),
         .issue_entry(int_issue_entry)
+`ifdef LOAD_SPEC_WAKE
+        ,
+        .load_spec_wake_valid(lsq_load_spec_wake_valid),
+        .load_spec_wake_prd  (lsq_load_spec_wake_prd),
+        .ld_spec_hit,
+        .ld_spec_miss,
+        .issue_ld_spec(iq_issue_ld_spec)
+`endif
     );
 
     // ---- Select -> Execute pipeline register (S2) for the ALU ports ----
@@ -1667,6 +1794,9 @@ module riscv_core_ooo
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             alu_issue_valid_q <= '0;
+`ifdef LOAD_SPEC_WAKE
+            alu_issue_ld_spec_q <= '0;
+`endif
             for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
                 alu_issue_entry_q[p] <= '0;
             end
@@ -1676,9 +1806,15 @@ module riscv_core_ooo
                         ((int_issue_entry[p].branch_mask & abort_mask) == '0)) begin
                     alu_issue_valid_q[p] <= 1'b1;
                     alu_issue_entry_q[p] <= int_issue_entry[p];
+`ifdef LOAD_SPEC_WAKE
+                    alu_issue_ld_spec_q[p] <= iq_issue_ld_spec[p];
+`endif
                 end else begin
                     alu_issue_valid_q[p] <= 1'b0;
                     alu_issue_entry_q[p] <= '0;
+`ifdef LOAD_SPEC_WAKE
+                    alu_issue_ld_spec_q[p] <= 1'b0;
+`endif
                 end
             end
         end
@@ -1689,12 +1825,71 @@ module riscv_core_ooo
     // not wake anyone). has_dest implies prd != 0.
     always_comb begin
         for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+`ifdef LOAD_SPEC_WAKE
+            // LOAD_SPEC_WAKE grandchild suppression: a spec-woken consumer
+            // whose load MISSED must not spec-wake a grandchild off stale data
+            // this cycle -- the cascade is bounded to depth 1 by construction.
+            // On a HIT the consumer spec-wakes normally (ALU chaining kept).
+            spec_wake_valid[p] = alu_issue_valid_q[p] &&
+                alu_issue_entry_q[p].has_dest &&
+                ((alu_issue_entry_q[p].branch_mask & abort_mask) == '0) &&
+                !(alu_issue_ld_spec_q[p] && ld_spec_miss);
+`else
             spec_wake_valid[p] = alu_issue_valid_q[p] &&
                 alu_issue_entry_q[p].has_dest &&
                 ((alu_issue_entry_q[p].branch_mask & abort_mask) == '0);
+`endif
             spec_wake_prd[p] = alu_issue_entry_q[p].prd;
         end
     end
+
+`ifdef LOAD_SPEC_WAKE
+    // LOAD_SPEC_WAKE: 1-deep broadcast tracker + the global hit/miss verdict.
+    // Sole-outstanding at broadcast => a response this cycle is THIS load's
+    // (a hit); its absence is the miss. Under trap_take the whole pipe flushes,
+    // so cancel the pending bit (the S2 consumers are flushed too).
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) begin
+            ld_spec_pending_q <= 1'b0;
+`ifdef LSQ_MLP2
+            ld_spec_id_q <= '0;
+`endif
+        end else begin
+            ld_spec_pending_q <= lsq_load_spec_wake_valid && !trap_take;
+`ifdef LSQ_MLP2
+            if (lsq_load_spec_wake_valid) begin
+                ld_spec_id_q <= lsq_load_spec_wake_id;
+            end
+`endif
+        end
+    end
+`ifdef LSQ_MLP2
+    // Adversarial finding 1: resolve by the id the response NAMES, not raw
+    // dmem_resp_valid -- a response for any other transaction must never read
+    // as this load's hit. (Safe-by-construction today: the broadcast is gated
+    // on inflight_count_q==0 and only one load issues per cycle, so the X+1
+    // response can only be this load's -- the assertion below pins that LSQ
+    // invariant so a future LSQ change cannot silently reintroduce the P3b
+    // stale-data class.)
+    assign ld_spec_hit  = ld_spec_pending_q && dmem_resp_valid &&
+        (dmem_resp_id == ld_spec_id_q);
+    assign ld_spec_miss = ld_spec_pending_q &&
+        !(dmem_resp_valid && (dmem_resp_id == ld_spec_id_q));
+`ifndef SYNTHESIS
+    always_ff @(posedge clk) begin
+        if (rst_l && ld_spec_pending_q && dmem_resp_valid) begin
+            assert (dmem_resp_id == ld_spec_id_q) else
+                $error("LOAD_SPEC_WAKE: dmem_resp_id %0d != spec id %0d (sole-outstanding invariant broken)",
+                    dmem_resp_id, ld_spec_id_q);
+        end
+    end
+`endif
+`else
+    // Base arm (single outstanding via mem_inflight_q): raw dmem_resp_valid.
+    assign ld_spec_hit  = ld_spec_pending_q && dmem_resp_valid;
+    assign ld_spec_miss = ld_spec_pending_q && !dmem_resp_valid;
+`endif
+`endif
 
     phys_reg_file #(.READ_PORTS(PHYS_READ_PORTS)) PhysRegFile (
         .clk,
@@ -1719,6 +1914,9 @@ module riscv_core_ooo
         .csr_illegal(csr_read_illegal[0]),
         .abort_mask,
         .flush(trap_take),
+`ifdef LOAD_SPEC_WAKE
+        .spec_squash(alu_issue_ld_spec_q[0] && ld_spec_miss),
+`endif
         .writeback(alu0_writeback)
     );
 
@@ -1733,6 +1931,9 @@ module riscv_core_ooo
         .csr_illegal(csr_read_illegal[1]),
         .abort_mask,
         .flush(trap_take),
+`ifdef LOAD_SPEC_WAKE
+        .spec_squash(alu_issue_ld_spec_q[1] && ld_spec_miss),
+`endif
         .writeback(alu1_writeback)
     );
 
@@ -1755,6 +1956,9 @@ module riscv_core_ooo
         .csr_illegal(1'b0),
         .abort_mask,
         .flush(trap_take),
+`ifdef LOAD_SPEC_WAKE
+        .spec_squash(alu_issue_ld_spec_q[ISSUE_ALU2] && ld_spec_miss),
+`endif
         .writeback(alu2_writeback)
     );
     assign int_issue_ready[ISSUE_ALU2] = 1'b1;
@@ -1805,6 +2009,78 @@ module riscv_core_ooo
         .writeback(fp_writeback)
     );
 
+`ifdef FUSE_LDBR
+    // ---- FUSE_LDBR: pend_fbr — the 1-deep fused-branch-resolve buffer ----
+    // The LSQ emits fused_resolve_* combinationally in the fused load's
+    // final-beat retire; the fused-issue gate (load_store_queue) guarantees
+    // pend_fbr is EMPTY at that moment, so the capture never clobbers. The
+    // buffered resolve seats onto the writeback bus as the WB_FBR source ONLY
+    // when no ALU branch resolves (branch_stack has ONE resolve port) and a WB
+    // lane is free — completion + resolve + drain are atomic (spec blocker 3).
+    always_comb begin
+        pend_fbr_next = pend_fbr_q;
+        // Spec blocker 1: age the held mask by reset_mask EVERY cycle (the
+        // ooo_mul_unit.sv:86-87 contract) — a missed 1-cycle reset pulse would
+        // leave a stale bit that later false-aborts on a reused checkpoint.
+        pend_fbr_next.branch_mask = pend_fbr_q.branch_mask & ~reset_mask;
+        // Drain: seated+resolved (or abort-dropped) by the WB bus this cycle.
+        if (pend_fbr_drain_ready)
+            pend_fbr_next = '0;
+        // Capture (slot guaranteed free by the LSQ fused-issue gate). The
+        // packet retires the BRANCH's own ROB slot (2-slot model; has_dest=0)
+        // and drives the resolve with the slave's prediction/training identity
+        // (the fuse_* fields, like the FUSE_CMPBR master's writeback).
+        if (fused_resolve_valid) begin
+            pend_fbr_next                  = '0;
+            pend_fbr_next.valid            = 1'b1;
+            pend_fbr_next.active_id        = fused_resolve_active_id;
+            pend_fbr_next.pc               = fused_resolve_pc;
+            pend_fbr_next.instr            = fused_resolve_instr; // OP_BRANCH => trains
+            pend_fbr_next.has_dest         = 1'b0;
+            pend_fbr_next.branch_mask      = fused_resolve_branch_mask & ~reset_mask;
+            pend_fbr_next.branch_valid     = 1'b1;
+            pend_fbr_next.branch_id        = fused_resolve_branch_id;
+            pend_fbr_next.branch_mispredict= fused_resolve_mispredict;
+            pend_fbr_next.redirect_pc      = fused_resolve_redirect_pc;
+            pend_fbr_next.control_predicted= fused_resolve_ctrl_pred;
+            pend_fbr_next.predicted_pc     = fused_resolve_pred_pc;
+            pend_fbr_next.predictor_info   = fused_resolve_pred_info;
+            pend_fbr_next.exception        = 1'b0;
+            pend_fbr_next.fuse_is_branch     = 1'b1;
+            pend_fbr_next.fuse_branch_pc     = fused_resolve_pc;
+            pend_fbr_next.fuse_branch_instr  = fused_resolve_instr;
+            pend_fbr_next.fuse_is_compressed = fused_resolve_is_comp;
+            pend_fbr_next.is_compressed      = fused_resolve_is_comp;
+        end
+        // Spec blocker 3: abort a buffered (or just-captured) resolve whose
+        // older branch mispredicts this cycle (comb abort_mask — the same
+        // contract the mul/div/FP in-flight ops follow).
+        if (pend_fbr_next.valid &&
+                ((pend_fbr_next.branch_mask & abort_mask) != '0))
+            pend_fbr_next = '0;
+        // Spec blocker 2: a precise trap flushes everything (ooo_mul_unit.sv:77
+        // takes flush=trap_take) — a stale resolve would corrupt the trap's
+        // full-pipeline flush.
+        if (trap_take)
+            pend_fbr_next = '0;
+    end
+
+    always_ff @(posedge clk or negedge rst_l) begin
+        if (!rst_l) pend_fbr_q <= '0;
+        else        pend_fbr_q <= pend_fbr_next;
+    end
+
+    assign pend_fbr_full = pend_fbr_q.valid;
+    // Drive gate (mirrors the ALU pipe's internal abort/flush suppression): a
+    // same-cycle-aborted or trap-flushed resolve never seats/resolves; the
+    // next-state logic above drops it.
+    always_comb begin
+        fbr_writeback = pend_fbr_q;
+        if (((pend_fbr_q.branch_mask & abort_mask) != '0) || trap_take)
+            fbr_writeback.valid = 1'b0;
+    end
+`endif
+
     load_store_queue #(.COHERENT(COHERENT)) LoadStoreQueue (
         .clk,
         .rst_l,
@@ -1854,8 +2130,32 @@ module riscv_core_ooo
         .head_load_off(dev_load_off),
         .sc_commit_done(lsq_sc_commit_done),
         .load_writeback,
+`ifdef FUSE_LDBR
+        .pend_fbr_full,
+        .fused_resolve_valid,
+        .fused_resolve_active_id,
+        .fused_resolve_branch_id,
+        .fused_resolve_pc,
+        .fused_resolve_instr,
+        .fused_resolve_redirect_pc,
+        .fused_resolve_mispredict,
+        .fused_resolve_ctrl_pred,
+        .fused_resolve_pred_pc,
+        .fused_resolve_pred_info,
+        .fused_resolve_branch_mask,
+        .fused_resolve_is_comp,
+`endif
         .lsq_head_reason(lsq_head_reason),
         .lsq_fwd_class(lsq_fwd_class)
+`ifdef LOAD_SPEC_WAKE
+        ,
+        .load_spec_wake_valid(lsq_load_spec_wake_valid),
+        .load_spec_wake_prd  (lsq_load_spec_wake_prd)
+`ifdef LSQ_MLP2
+        ,
+        .load_spec_wake_id   (lsq_load_spec_wake_id)
+`endif
+`endif
     );
 
     ooo_writeback_bus WritebackBus (
@@ -1868,10 +2168,16 @@ module riscv_core_ooo
         .mul_writeback,
         .div_writeback,
         .fp_writeback,
+`ifdef FUSE_LDBR
+        .fbr_writeback,
+`endif
         .abort_mask_q,
         .mul_writeback_ready,
         .div_writeback_ready,
         .fp_writeback_ready,
+`ifdef FUSE_LDBR
+        .fbr_writeback_ready(pend_fbr_drain_ready),
+`endif
         .writeback_valid,
         .writeback_active_id,
         .writeback_prd,
@@ -2138,6 +2444,236 @@ module riscv_core_ooo
     // their owning block.
     // ================================================================
 
+`ifdef FUSE_ANY
+    // ---- B0-fuse: intra-group ADJACENT fusion-pair detector (shared-infra §3).
+    // Placed BEFORE B1a: B1a reads fuse_slave[] to force the folded lane's
+    // lane_has_dest=0, and B3 reads fuse_master[] to build the payload. Reads
+    // decode_lanes ONLY (valid, rs1/rs2/rd, ctrl, uses_rs1, uses_rs2, imm, pc,
+    // instr) -- NOT dispatch_valid -- so it introduces no combinational cycle
+    // through dispatch_control (the lane_has_dest -> dispatch_control ->
+    // dispatch_valid loop would corrupt STA; shared-infra §4c/§5). ----
+    always_comb begin
+        fuse_master = '0;
+        fuse_slave  = '0;
+        for (int i = 0; i < OOO_WIDTH; i += 1) fuse_kind_lane[i] = FUSE_K_NONE;
+`ifdef FUSE_LDBR
+        fuse_slave_ldbr = '0;
+`endif
+`ifdef FUSE_UADDR
+        fu_zero_rs1 = '0;
+        fu_imm_ovr  = '0;
+        fu_imm      = '0;
+        fu_pc_base  = '0;
+`endif
+`ifdef FUSE_CMPBR_LI
+        fu_caseb     = '0;
+        fu_caseb_src = '0;
+`endif
+
+        // Left-to-right disjoint pairing: a lane already claimed as a slave cannot
+        // also be a master (no chained triple-fusion). i only ranges 0..OOO_WIDTH-2
+        // (intra-group ADJACENT); cross-group pairs need the carried fusion-prefix
+        // latch (an XL) and are out of scope.
+        for (int i = 0; i < OOO_WIDTH-1; i += 1) begin
+            automatic logic prod_ok, cons_ok, struct_ok;
+`ifdef FUSE_UADDR
+            automatic logic c_pair, first_mem;
+`endif
+`ifdef FUSE_CMPBR_LI
+            automatic logic struct_ok_li, caseb_ok;
+`endif
+            // --- structural (shared) ---
+            struct_ok =
+                decode_lanes[i].valid && !decode_lanes[i].kill &&
+                decode_lanes[i+1].valid && !decode_lanes[i+1].kill &&
+                !fuse_slave[i] &&                                   // i not already a slave
+                decode_lanes[i].ctrl.rfWrite && (decode_lanes[i].rd != 5'd0) && // master rd live
+                // master must not itself terminate/steer the group before the slave:
+                !decode_lanes[i].ctrl.serializing &&
+                !decode_lanes[i].ctrl.syscall && !decode_lanes[i].ctrl.illegal_instr &&
+                (decode_lanes[i].ctrl.pc_source == PC_plus4) &&
+                // slave's SOLE gpr source is the master's rd (adjacency guarantees the
+                // master is the only in-group producer between them):
+                decode_lanes[i+1].uses_rs1 &&
+                (decode_lanes[i+1].rs1 == decode_lanes[i].rd);
+
+            // --- per-lever producer/consumer opcode predicate (hooks; the levers
+            //     refine these — shown here as the reference predicates) ---
+            prod_ok = 1'b0; cons_ok = 1'b0;
+`ifdef FUSE_UADDR
+            c_pair = 1'b0;
+            // LUI/AUIPC  ->  ADDI/ADDIW rd, rd, imm (constant / pc-rel address build).
+            // Slave must NOT use rs2 (I-type), so master.rd is the sole source.
+            // fetch_fault on either lane excludes the pair (nulling a fault
+            // carrier would drop its trap); !illegal_instr on the slave keeps an
+            // RV32 0x1B (OP-IMM-32, reserved at RV32) encoding from being nulled.
+            if ((decode_lanes[i].instr[6:0] == RISCV_ISA::OP_LUI ||
+                 decode_lanes[i].instr[6:0] == RISCV_ISA::OP_AUIPC) &&
+                (decode_lanes[i+1].instr[6:0] == RISCV_ISA::OP_IMM ||
+                 decode_lanes[i+1].instr[6:0] == 7'h1B /*OP-IMM-32*/) &&
+                (decode_lanes[i+1].instr[14:12] == 3'b000) &&   // ADDI/ADDIW funct3
+                !decode_lanes[i+1].uses_rs2 &&
+                (decode_lanes[i+1].rd == decode_lanes[i].rd) &&
+                !decode_lanes[i].ctrl.fetch_fault &&
+                !decode_lanes[i+1].ctrl.fetch_fault &&
+                !decode_lanes[i+1].ctrl.illegal_instr) begin
+                prod_ok = 1'b1; cons_ok = 1'b1;
+                if (struct_ok && !fuse_master[i]) fuse_kind_lane[i] = FUSE_K_UADDR;
+            end
+            // (c) AUIPC -> integer LOAD rd, off(rd) (canonical PIC/GOT idiom):
+            // keep the YOUNGER load, null the OLDER auipc (fuse-uaddr.md §1).
+            // load.rd == auipc.rd makes the auipc's intermediate provably dead;
+            // G1 (first_mem: no older valid mem lane) + G2 (whole-group dests fit
+            // the free list) make the kill-older direction dispatch-atomic — with
+            // them no per-lane stop can land between lanes i and i+1.
+            else if ((decode_lanes[i].instr[6:0] == RISCV_ISA::OP_AUIPC) &&
+                (decode_lanes[i+1].instr[6:0] == RISCV_ISA::OP_LOAD) &&
+                (decode_lanes[i+1].rd == decode_lanes[i].rd) &&   // base provably dead
+                !decode_lanes[i+1].ctrl.illegal_instr &&
+                !decode_lanes[i].ctrl.fetch_fault &&
+                !decode_lanes[i+1].ctrl.fetch_fault) begin
+                // G1: the load is the group's first memory (mirrors
+                // dispatch_control's memory_seen, which folds lane_valid).
+                first_mem = 1'b1;
+                for (int j = 0; j < OOO_WIDTH; j += 1)
+                    if ((j < i) && decode_lanes[j].valid && !decode_lanes[j].kill &&
+                        (decode_lanes[j].ctrl.memRead || decode_lanes[j].ctrl.memWrite))
+                        first_mem = 1'b0;
+                // G2: free-list headroom for the whole group's dests (no
+                // dest-block stop possible at any lane this cycle).
+                if (first_mem &&
+                        (free_count_snapshot >= ($clog2(PHYS_REGS+1))'(OOO_WIDTH))) begin
+                    prod_ok = 1'b1; cons_ok = 1'b1; c_pair = 1'b1;
+                end
+            end
+`endif
+`ifdef FUSE_CMPBR
+            // FUSE_CMPBR Inc 1 — Case A reg-reg (fuse-cmpbr.md §3/§10): a
+            // single-cycle integer ALU producer writing rd, followed by a
+            // conditional branch testing rd against x0 (beqz/bnez/bltz/bgez rd;
+            // rs2==x0 + struct_ok's rs1==rd). branch_cmp(result, '0, op) covers
+            // all six cond ops value-identically, so the consumer alu_op needs
+            // no restriction. Producer exclusions: MEM (loads/stores decode
+            // EXEC_INT too — a load master would route to the LSQ and never
+            // resolve the folded branch), MUL/DIV (long-latency FUs), CSR/FP/
+            // AMO/FENCE (exec_class != EXEC_INT), AUIPC (usePC), immediates
+            // (Inc 1 is reg-reg only; lifted under FUSE_CMPBR_LI = Case A-imm),
+            // and any fetch-fault carrier. struct_ok already enforces rfWrite,
+            // rd!=0, PC_plus4, and non-serializing/syscall/illegal on the
+            // master, plus slave.uses_rs1 && slave.rs1 == master.rd.
+            if ((decode_lanes[i].ctrl.exec_class == EXEC_INT) &&
+                !is_mul_op(decode_lanes[i].ctrl.alu_op) &&
+                !is_div_op(decode_lanes[i].ctrl.alu_op) &&
+                !decode_lanes[i].ctrl.memRead &&
+                !decode_lanes[i].ctrl.memWrite &&
+                !decode_lanes[i].ctrl.usePC &&
+`ifndef FUSE_CMPBR_LI
+                !decode_lanes[i].ctrl.useImm &&   // Inc 1: reg-reg producers only
+`endif
+                !decode_lanes[i].ctrl.fetch_fault &&
+                !decode_lanes[i+1].ctrl.fetch_fault &&
+                (decode_lanes[i+1].ctrl.pc_source == PC_cond) &&
+                (decode_lanes[i+1].rs2 == 5'd0)) begin       // branch vs x0
+                prod_ok = 1'b1; cons_ok = 1'b1;
+                if (struct_ok && !fuse_master[i]) fuse_kind_lane[i] = FUSE_K_CMPBR;
+            end
+`endif
+`ifdef FUSE_CMPBR_LI
+            // FUSE_CMPBR Inc 2 Case B (fuse-cmpbr.md §7b): li rt,imm (single-
+            // instruction OP_IMM ADDI with rs1==x0 — c.li expands to the same
+            // form) followed by beq/bne comparing a register against rt. The
+            // branch's OTHER operand (not the li's rd) is re-read through the
+            // li master's unused rs2 port; BEQ/BNE are commutative so the
+            // operand order is irrelevant. struct_ok_li mirrors struct_ok but
+            // allows the li's rd at EITHER branch source. NB: the
+            // struct_ok-form `li rt; beqz rt` is already claimed by the Inc 1
+            // arm above (useImm is lifted under FUSE_CMPBR_LI); this arm takes
+            // only the pairs struct_ok rejects.
+            struct_ok_li =
+                decode_lanes[i].valid && !decode_lanes[i].kill &&
+                decode_lanes[i+1].valid && !decode_lanes[i+1].kill &&
+                !fuse_slave[i] &&
+                decode_lanes[i].ctrl.rfWrite && (decode_lanes[i].rd != 5'd0) &&
+                !decode_lanes[i].ctrl.serializing &&
+                !decode_lanes[i].ctrl.syscall && !decode_lanes[i].ctrl.illegal_instr &&
+                (decode_lanes[i].ctrl.pc_source == PC_plus4) &&
+                ((decode_lanes[i+1].rs1 == decode_lanes[i].rd) ||
+                 (decode_lanes[i+1].rs2 == decode_lanes[i].rd));
+            caseb_ok =
+                (decode_lanes[i].instr[6:0] == RISCV_ISA::OP_IMM) &&
+                (decode_lanes[i].instr[14:12] == 3'b000) &&   // ADDI
+                (decode_lanes[i].rs1 == 5'd0) &&               // li form
+                decode_lanes[i].ctrl.useImm &&
+                !decode_lanes[i].ctrl.fetch_fault &&
+                !decode_lanes[i+1].ctrl.fetch_fault &&
+                (decode_lanes[i+1].ctrl.pc_source == PC_cond) &&
+                ((decode_lanes[i+1].ctrl.alu_op == ALU_BEQ) ||
+                 (decode_lanes[i+1].ctrl.alu_op == ALU_BNE));
+`endif
+`ifdef FUSE_LDBR
+            // FUSE_LDBR — a plain integer LOAD writing rd, followed by a
+            // conditional branch testing rd against x0 (beqz/bnez/bltz/bgez;
+            // branch_cmp covers all six cond ops value-identically, so the
+            // consumer alu_op is unrestricted). exec_class==EXEC_INT excludes
+            // AMO/LR (EXEC_AMO — a fused LR would lose its reservation
+            // writeback arm and never resolve) and FP loads (EXEC_FP — the
+            // result is an FPR, not a GPR the branch reads); fetch_fault on
+            // either lane excludes the pair (a faulting load takes its trap
+            // before resolving; the folded slave would wait on a resolve that
+            // never comes). struct_ok already enforces rfWrite, rd!=0,
+            // PC_plus4, non-serializing/syscall/illegal on the master, plus
+            // slave.uses_rs1 && slave.rs1 == master.rd. v1 scope: rs2==x0
+            // only — a dynamic 2nd operand (the li;beq enum idiom) is the
+            // fuse_cmp_rs2-style extension, out of scope.
+            if (decode_lanes[i].ctrl.memRead && !decode_lanes[i].ctrl.memWrite &&
+                (decode_lanes[i].ctrl.exec_class == EXEC_INT) &&
+                !decode_lanes[i].ctrl.fetch_fault &&
+                !decode_lanes[i+1].ctrl.fetch_fault &&
+                (decode_lanes[i+1].ctrl.pc_source == PC_cond) &&
+                (decode_lanes[i+1].rs2 == 5'd0)) begin
+                prod_ok = 1'b1; cons_ok = 1'b1;
+                if (struct_ok && !fuse_master[i]) fuse_kind_lane[i] = FUSE_K_LDBR;
+            end
+`endif
+            if (struct_ok && prod_ok && cons_ok && !fuse_master[i]) begin
+`ifdef FUSE_UADDR
+                if (c_pair) begin
+                    // (c) AUIPC+LOAD: null the OLDER auipc (born-done ROB slot);
+                    // the younger load survives with the pc-base AGU override,
+                    // the folded hi+off immediate, and rs1 no longer read. Not
+                    // marked fuse_master/fuse_kind — the load executes no folded
+                    // ALU op (its fold is the AGU base mux in the LSQ).
+                    fuse_slave[i]    = 1'b1;
+                    fu_zero_rs1[i+1] = 1'b1;
+                    fu_imm_ovr[i+1]  = 1'b1;
+                    fu_imm[i+1]      = decode_lanes[i].imm + decode_lanes[i+1].imm;
+                    fu_pc_base[i+1]  = 1'b1;
+                end else
+`endif
+                begin
+                    fuse_master[i]   = 1'b1;
+                    fuse_slave[i+1]  = 1'b1;   // consumed; loop's !fuse_slave[i] blocks i+1 master
+`ifdef FUSE_LDBR
+                    fuse_slave_ldbr[i+1] = (fuse_kind_lane[i] == FUSE_K_LDBR);
+`endif
+                end
+            end
+`ifdef FUSE_CMPBR_LI
+            // Case B claim (struct_ok rejected the pair because the li's rd is
+            // not the branch's rs1): fold the branch into the li master.
+            if (struct_ok_li && caseb_ok && !fuse_master[i]) begin
+                fuse_master[i]   = 1'b1;
+                fuse_slave[i+1]  = 1'b1;
+                fuse_kind_lane[i] = FUSE_K_CMPBR;
+                fu_caseb[i]      = 1'b1;
+                fu_caseb_src[i]  = (decode_lanes[i+1].rs1 == decode_lanes[i].rd) ?
+                    decode_lanes[i+1].rs2 : decode_lanes[i+1].rs1;
+            end
+`endif
+        end
+    end
+`endif
+
     // ---- B1a: lane decode (per-lane attributes + rename source regs + valid
     // count). Reads decode_lanes ONLY -- NOT dispatch_valid -- so lane_valid (and
     // the lane_is_* attrs) no longer whole-block-alias dispatch_valid (the false
@@ -2159,12 +2695,34 @@ module riscv_core_ooo
         valid_count = '0;
 
         for (int i = 0; i < OOO_WIDTH; i += 1) begin
+`ifdef FUSE_UADDR
+            // FUSE_UADDR (c): the surviving load's base is pc_auipc (AGU
+            // pc-base), so it no longer reads rs1 -- map x0 (prs1=0,
+            // busy-ready) instead of the nulled auipc's stale mapping.
+            map_rs1[i] = fu_zero_rs1[i] ? 5'd0 : decode_lanes[i].rs1;
+`else
             map_rs1[i] = decode_lanes[i].rs1;
+`endif
+`ifdef FUSE_CMPBR_LI
+            // FUSE_CMPBR Case B: the li master re-reads the folded branch's
+            // OTHER source register through its unused rs2 port (its own rs2
+            // field is not a source — OP_IMM uses_rs2==0). prs2 and the busy
+            // lookup follow the override automatically (fu_zero_rs1 pattern).
+            map_rs2[i] = fu_caseb[i] ? fu_caseb_src[i] : decode_lanes[i].rs2;
+`else
             map_rs2[i] = decode_lanes[i].rs2;
+`endif
             map_rd[i] = decode_lanes[i].rd;
             lane_valid[i] = decode_lanes[i].valid && !decode_lanes[i].kill;
+`ifdef FUSE_ANY
+            // Folded fusion slave does no arch write (its value folds to
+            // master.prd); transitively kills its free-list allocate.
+            lane_has_dest[i] = lane_valid[i] && decode_lanes[i].ctrl.rfWrite &&
+                (decode_lanes[i].rd != 5'd0) && !fuse_slave[i];
+`else
             lane_has_dest[i] = lane_valid[i] && decode_lanes[i].ctrl.rfWrite &&
                 (decode_lanes[i].rd != 5'd0);
+`endif
             lane_is_branch[i] = lane_valid[i] &&
                 ((decode_lanes[i].ctrl.pc_source == PC_cond) ||
                  (decode_lanes[i].ctrl.pc_source == PC_uncond) ||
@@ -2282,12 +2840,29 @@ module riscv_core_ooo
         // resolving branch was conditional (mirrors the RAS recovery above).
         ghr_next = branch_restore_valid ?
             ghr_checkpoint_q[branch_resolve_id] : ghr_q;
+`ifdef FUSE_BRANCH
+        if (branch_restore_valid && branch_resolve_valid &&
+                ((branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH) ||
+                 (branch_writeback.fuse_is_branch &&
+                  branch_writeback.fuse_branch_instr[6:0] == RISCV_ISA::OP_BRANCH))) begin
+            // Same taken test, on the SLAVE branch's pc when the resolve came
+            // from a fused master.
+            ghr_next = {ghr_next[DIRECT_HISTORY_BITS-2:0],
+                (branch_writeback.redirect_pc !=
+                    (branch_writeback.fuse_is_branch ?
+                        branch_writeback.fuse_branch_pc : branch_writeback.pc) +
+                    `ILEN_INC(branch_writeback.fuse_is_branch ?
+                        branch_writeback.fuse_is_compressed :
+                        branch_writeback.is_compressed))};
+        end
+`else
         if (branch_restore_valid && branch_resolve_valid &&
                 (branch_writeback.instr[6:0] == RISCV_ISA::OP_BRANCH)) begin
             ghr_next = {ghr_next[DIRECT_HISTORY_BITS-2:0],
                 (branch_writeback.redirect_pc !=
                     branch_writeback.pc + `ILEN_INC(branch_writeback.is_compressed))};
         end
+`endif
         ghr_branch_snapshot = ghr_next;
         branch_active_tail_snapshot = active_tail;
         branch_free_head_snapshot = free_head_snapshot;
@@ -2314,7 +2889,11 @@ module riscv_core_ooo
                     predictor_redirect_valid = 1'b1;
                     predictor_redirect_pc = decode_lanes[i].pc + decode_lanes[i].imm;
                     btb_branch_pc   = decode_lanes[i].pc;
+`ifdef RVC
                     btb_branch_is_c = decode_lanes[i].ctrl.is_compressed;
+`else
+                    btb_branch_is_c = 1'b0;
+`endif
                     if (lane_is_call[i] &&
                             (ras_count_next < RAS_COUNT_BITS'(RAS_DEPTH))) begin
                         ras_stack_next[RAS_INDEX_BITS'(ras_count_next)] =
@@ -2340,7 +2919,11 @@ module riscv_core_ooo
                         predictor_redirect_pc = decode_lanes[i].pc +
                             decode_lanes[i].imm;
                         btb_branch_pc   = decode_lanes[i].pc;
+`ifdef RVC
                         btb_branch_is_c = decode_lanes[i].ctrl.is_compressed;
+`else
+                        btb_branch_is_c = 1'b0;
+`endif
                     end
                 end else if ((decode_lanes[i].ctrl.pc_source == PC_indirect) &&
                         !lane_is_return[i]) begin
@@ -2351,7 +2934,11 @@ module riscv_core_ooo
                         predictor_redirect_valid = 1'b1;
                         predictor_redirect_pc = indirect_prediction_target;
                         btb_branch_pc   = decode_lanes[i].pc;
+`ifdef RVC
                         btb_branch_is_c = decode_lanes[i].ctrl.is_compressed;
+`else
+                        btb_branch_is_c = 1'b0;
+`endif
                     end
                 end
                 if (lane_has_dest[i] && free_alloc_valid[i]) begin
@@ -2416,10 +3003,24 @@ module riscv_core_ooo
             rename_packets[i].old_prd = map_old_prd[i];
             rename_packets[i].src1_ready = !decode_lanes[i].uses_rs1 ||
                 busy_src1_ready[i];
+`ifdef FUSE_CMPBR_LI
+            // Case B master's rs2 is the folded branch's other source (a real
+            // read): gate readiness purely on the busy lookup — the li's own
+            // uses_rs2==0 would force src2_ready=1 while rs is still in flight.
+            rename_packets[i].src2_ready = fu_caseb[i] ? busy_src2_ready[i] :
+                (!decode_lanes[i].uses_rs2 || busy_src2_ready[i]);
+`else
             rename_packets[i].src2_ready = !decode_lanes[i].uses_rs2 ||
                 busy_src2_ready[i];
+`endif
             rename_packets[i].has_dest = map_has_dest[i];
+`ifdef FUSE_UADDR
+            // FUSE_UADDR (c): surviving load's offset = folded hi+off
+            // (bit-exact lo<0 borrow fold — IMM_U[11:0]==0, one XLEN add).
+            rename_packets[i].imm = fu_imm_ovr[i] ? fu_imm[i] : decode_lanes[i].imm;
+`else
             rename_packets[i].imm = decode_lanes[i].imm;
+`endif
             rename_packets[i].branch_mask = dispatch_branch_mask;
 `ifdef JAL_NO_CKPT
             // JAL (PC_uncond) allocates no checkpoint, so it carries branch_id 0.
@@ -2447,6 +3048,57 @@ module riscv_core_ooo
             rename_packets[i].fp_src3_data =
                 fp_regs_q[decode_lanes[i].instr[31:27]];
             rename_packets[i].fu_class = fu_class_for(decode_lanes[i].ctrl);
+`ifdef FUSE_ANY
+            // Fusion payload (shared-infra §4a/§5): mark the folded slave
+            // born-done (active_list completes it at allocate; no IQ entry), and
+            // carry the slave's op on the master for its FU to execute folded.
+            rename_packets[i].is_fused    = fuse_master[i];
+            rename_packets[i].fuse_kind   = fuse_kind_lane[i];
+            rename_packets[i].fused_slave = fuse_slave[i];
+`ifdef FUSE_LDBR
+            rename_packets[i].fuse_slave_ldbr = fuse_slave_ldbr[i];
+`endif
+`ifdef FUSE_UADDR
+            // FUSE_UADDR (c): surviving load's LSQ AGU base select.
+            rename_packets[i].use_pc_base = fu_pc_base[i];
+`endif
+`ifdef FUSE_CMPBR_LI
+            // Case B li master: fused branch compares against rs2_data.
+            rename_packets[i].fuse_cmp_rs2 = fu_caseb[i];
+`endif
+            // The slave payload reads lane i+1; a master is never the last lane
+            // (the detector pairs ADJACENT lanes 0..OOO_WIDTH-2), so guard the
+            // index and leave lane OOO_WIDTH-1's payload at the '0 reset above.
+            if (i < OOO_WIDTH-1) begin
+                rename_packets[i].fuse_imm    = decode_lanes[i+1].imm;
+                rename_packets[i].fuse_alu_op = decode_lanes[i+1].ctrl.alu_op;
+`ifdef FUSE_BRANCH
+                // Branch-fusion payload: the master hosts the slave branch's
+                // resolve (checkpoint id X + the slave's prediction/training id).
+                rename_packets[i].fuse_pc_source         = decode_lanes[i+1].ctrl.pc_source; // PC_cond
+                rename_packets[i].fuse_branch_id         = branch_allocate_id; // slave's checkpoint X
+                rename_packets[i].fuse_control_predicted = lane_control_predicted[i+1];
+                rename_packets[i].fuse_predicted_pc      = lane_predicted_pc[i+1];
+                rename_packets[i].fuse_branch_pc         = decode_lanes[i+1].pc;
+                rename_packets[i].fuse_branch_instr      = decode_lanes[i+1].instr;
+                rename_packets[i].fuse_predictor_info    = lane_predictor_info[i+1];
+                // Slave branch's ILEN flag (FUSE_CMPBR: fused fall-through +
+                // training taken-tests need the slave's ILEN, not the master's).
+                rename_packets[i].fuse_is_compressed     =
+                    decode_lanes[i+1].ctrl.is_compressed;
+`endif
+`ifdef FUSE_LDBR
+                // The slave branch's OWN ROB slot (distinct from the load
+                // master's): the fused resolve retires it via pend_fbr.
+                rename_packets[i].fuse_br_active_id =
+                    active_tail + active_id_t'(lane_active_offset[i+1]);
+`endif
+            end
+`endif
+`ifdef FUSE_BRANCH
+            rename_packets[i].fuse_is_branch = fuse_master[i] &&
+                (fuse_kind_lane[i] == FUSE_K_CMPBR || fuse_kind_lane[i] == FUSE_K_LDBR);
+`endif
 
             dispatch_issue_entries[i] = '0;
             dispatch_issue_entries[i].valid = dispatch_valid[i];
@@ -2479,9 +3131,52 @@ module riscv_core_ooo
             dispatch_issue_entries[i].fp_src3_data =
                 rename_packets[i].fp_src3_data;
             dispatch_issue_entries[i].fu_class = rename_packets[i].fu_class;
+`ifdef FUSE_ANY
+            // Mirror the fusion payload into the master's issue entry (its FU
+            // reads the folded op from here).
+            dispatch_issue_entries[i].is_fused    = rename_packets[i].is_fused;
+            dispatch_issue_entries[i].fuse_kind   = rename_packets[i].fuse_kind;
+            dispatch_issue_entries[i].fused_slave = rename_packets[i].fused_slave;
+            dispatch_issue_entries[i].fuse_imm    = rename_packets[i].fuse_imm;
+            dispatch_issue_entries[i].fuse_alu_op = rename_packets[i].fuse_alu_op;
+`endif
+`ifdef FUSE_UADDR
+            dispatch_issue_entries[i].use_pc_base = rename_packets[i].use_pc_base;
+`endif
+`ifdef FUSE_CMPBR_LI
+            dispatch_issue_entries[i].fuse_cmp_rs2 = rename_packets[i].fuse_cmp_rs2;
+`endif
+`ifdef FUSE_BRANCH
+            dispatch_issue_entries[i].fuse_is_branch = rename_packets[i].fuse_is_branch;
+            dispatch_issue_entries[i].fuse_pc_source = rename_packets[i].fuse_pc_source;
+            dispatch_issue_entries[i].fuse_branch_id = rename_packets[i].fuse_branch_id;
+            dispatch_issue_entries[i].fuse_control_predicted =
+                rename_packets[i].fuse_control_predicted;
+            dispatch_issue_entries[i].fuse_predicted_pc =
+                rename_packets[i].fuse_predicted_pc;
+            dispatch_issue_entries[i].fuse_branch_pc = rename_packets[i].fuse_branch_pc;
+            dispatch_issue_entries[i].fuse_branch_instr =
+                rename_packets[i].fuse_branch_instr;
+            dispatch_issue_entries[i].fuse_predictor_info =
+                rename_packets[i].fuse_predictor_info;
+            dispatch_issue_entries[i].fuse_is_compressed =
+                rename_packets[i].fuse_is_compressed;
+`endif
+`ifdef FUSE_LDBR
+            dispatch_issue_entries[i].fuse_br_active_id =
+                rename_packets[i].fuse_br_active_id;
+`endif
 
+`ifdef FUSE_ANY
+            // The folded slave does not execute (no IQ entry; born-done ROB slot).
+            int_insert_valid[i] = dispatch_valid[i] && !lane_is_memory[i] &&
+                !fuse_slave[i];
+            mem_insert_valid[i] = dispatch_valid[i] && lane_is_memory[i] &&
+                !fuse_slave[i];
+`else
             int_insert_valid[i] = dispatch_valid[i] && !lane_is_memory[i];
             mem_insert_valid[i] = dispatch_valid[i] && lane_is_memory[i];
+`endif
 `ifdef JAL_NO_CKPT
             // JAL (PC_uncond) is always correctly predicted (predicted_pc==pc+imm==
             // target), so its checkpoint could never be restored -- do not allocate it.
@@ -3262,6 +3957,33 @@ module riscv_core_ooo
     logic [63:0] perf_alu_instructions;
     logic [63:0] perf_load_instructions;
     logic [63:0] perf_store_instructions;
+`ifdef FUSE_UADDR
+    // FUSE_UADDR engagement counters (fuse-uaddr.md §6): dispatched fused pairs
+    // by class — (a)/(b) master fires, (c) surviving pc-base load fires.
+    logic [63:0] perf_fu_fire_ab;
+    logic [63:0] perf_fu_fire_c;
+`endif
+`ifdef FUSE_CMPBR
+    // FUSE_CMPBR engagement counter (fuse-cmpbr.md §9): dispatched fused
+    // compute+branch pairs (master fires; spec predicts ~8/Dhrystone iter).
+    logic [63:0] perf_fu_fire_cmpbr;
+`endif
+`ifdef FUSE_LDBR
+    // FUSE_LDBR engagement counter (fuse-ldbr.md §10): dispatched fused
+    // load->branch pairs (load master fires; spec predicts ~6-9/Dhrystone iter).
+    logic [63:0] perf_fu_fire_ldbr;
+`endif
+`ifdef LOAD_SPEC_WAKE
+    // LOAD_SPEC_WAKE engagement counters (load-spec-wake.md §8.6): prove the
+    // mechanism fires. broadcast = LSQ spec-wake broadcasts; consumers = IQ
+    // spec-reliant ALU picks; hit/miss = the one-cycle verdicts; squash =
+    // consumer writebacks zeroed by spec_squash on a miss.
+    logic [63:0] perf_ldspec_broadcast;
+    logic [63:0] perf_ldspec_consumers;
+    logic [63:0] perf_ldspec_hit;
+    logic [63:0] perf_ldspec_miss;
+    logic [63:0] perf_ldspec_squash;
+`endif
     logic [63:0] perf_total_data_reads;
     logic [63:0] perf_total_data_writes;
     logic [63:0] perf_stall_instr [PERF_STALL_BUCKETS];
@@ -3340,6 +4062,23 @@ module riscv_core_ooo
             perf_alu_instructions = 64'b0;
             perf_load_instructions = 64'b0;
             perf_store_instructions = 64'b0;
+`ifdef FUSE_UADDR
+            perf_fu_fire_ab = 64'b0;
+            perf_fu_fire_c = 64'b0;
+`endif
+`ifdef FUSE_CMPBR
+            perf_fu_fire_cmpbr = 64'b0;
+`endif
+`ifdef FUSE_LDBR
+            perf_fu_fire_ldbr = 64'b0;
+`endif
+`ifdef LOAD_SPEC_WAKE
+            perf_ldspec_broadcast = 64'b0;
+            perf_ldspec_consumers = 64'b0;
+            perf_ldspec_hit = 64'b0;
+            perf_ldspec_miss = 64'b0;
+            perf_ldspec_squash = 64'b0;
+`endif
             perf_total_data_reads = 64'b0;
             perf_total_data_writes = 64'b0;
             perf_jalr_predicted_correct = 64'b0;
@@ -3512,8 +4251,37 @@ module riscv_core_ooo
                 perf_load_start_cycle = perf_cycle_counter;
             end
 
+`ifdef LOAD_SPEC_WAKE
+            // LOAD_SPEC_WAKE engagement: broadcast / spec-reliant picks / the
+            // one-cycle verdict / miss squashes.
+            if (lsq_load_spec_wake_valid)
+                perf_ldspec_broadcast = perf_ldspec_broadcast + 64'd1;
+            for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+                if (iq_issue_ld_spec[p])
+                    perf_ldspec_consumers = perf_ldspec_consumers + 64'd1;
+                if (alu_issue_ld_spec_q[p] && ld_spec_miss)
+                    perf_ldspec_squash = perf_ldspec_squash + 64'd1;
+            end
+            if (ld_spec_hit)  perf_ldspec_hit  = perf_ldspec_hit  + 64'd1;
+            if (ld_spec_miss) perf_ldspec_miss = perf_ldspec_miss + 64'd1;
+`endif
+
             for (int i = 0; i < OOO_WIDTH; i += 1) begin
                 if (dispatch_valid[i]) begin
+`ifdef FUSE_UADDR
+                    if (fuse_master[i] && (fuse_kind_lane[i] == FUSE_K_UADDR))
+                        perf_fu_fire_ab = perf_fu_fire_ab + 64'd1;
+                    if (fu_pc_base[i])
+                        perf_fu_fire_c = perf_fu_fire_c + 64'd1;
+`endif
+`ifdef FUSE_CMPBR
+                    if (fuse_master[i] && (fuse_kind_lane[i] == FUSE_K_CMPBR))
+                        perf_fu_fire_cmpbr = perf_fu_fire_cmpbr + 64'd1;
+`endif
+`ifdef FUSE_LDBR
+                    if (fuse_master[i] && (fuse_kind_lane[i] == FUSE_K_LDBR))
+                        perf_fu_fire_ldbr = perf_fu_fire_ldbr + 64'd1;
+`endif
                     perf_dispatch_counter = perf_dispatch_counter + 64'd1;
                     if (!perf_first_dispatch) begin
                         perf_stall_cycles_prev = perf_cycle_counter -
@@ -3638,6 +4406,23 @@ module riscv_core_ooo
         $display("  ALU instructions: %0d", perf_alu_instructions);
         $display("  Load instructions: %0d", perf_load_instructions);
         $display("  Store instructions: %0d", perf_store_instructions);
+`ifdef FUSE_UADDR
+        $display("  FUSE_UADDR (a)/(b) pairs fused: %0d", perf_fu_fire_ab);
+        $display("  FUSE_UADDR (c) pc-base loads:   %0d", perf_fu_fire_c);
+`endif
+`ifdef FUSE_CMPBR
+        $display("  FUSE_CMPBR pairs fused:         %0d", perf_fu_fire_cmpbr);
+`endif
+`ifdef FUSE_LDBR
+        $display("  FUSE_LDBR pairs fused:          %0d", perf_fu_fire_ldbr);
+`endif
+`ifdef LOAD_SPEC_WAKE
+        $display("  LDSPEC broadcasts:              %0d", perf_ldspec_broadcast);
+        $display("  LDSPEC spec-woken consumers:    %0d", perf_ldspec_consumers);
+        $display("  LDSPEC hits:                    %0d", perf_ldspec_hit);
+        $display("  LDSPEC misses:                  %0d", perf_ldspec_miss);
+        $display("  LDSPEC squashed writebacks:     %0d", perf_ldspec_squash);
+`endif
         $display("Frontend stall cycles: %0d", perf_frontend_stall_cycles);
         for (int i = 0; i < PERF_STALL_BUCKETS; i += 1) begin
             $display("Dispatched instructions with %0d stalls: %0d", i,
@@ -3696,6 +4481,23 @@ module riscv_core_ooo
                 $fdisplay(pfd, "alu=%0d", perf_alu_instructions);
                 $fdisplay(pfd, "load=%0d", perf_load_instructions);
                 $fdisplay(pfd, "store=%0d", perf_store_instructions);
+`ifdef FUSE_UADDR
+                $fdisplay(pfd, "fu_fire_ab=%0d", perf_fu_fire_ab);
+                $fdisplay(pfd, "fu_fire_c=%0d", perf_fu_fire_c);
+`endif
+`ifdef FUSE_CMPBR
+                $fdisplay(pfd, "fu_fire_cmpbr=%0d", perf_fu_fire_cmpbr);
+`endif
+`ifdef FUSE_LDBR
+                $fdisplay(pfd, "fu_fire_ldbr=%0d", perf_fu_fire_ldbr);
+`endif
+`ifdef LOAD_SPEC_WAKE
+                $fdisplay(pfd, "ldspec_broadcast=%0d", perf_ldspec_broadcast);
+                $fdisplay(pfd, "ldspec_consumers=%0d", perf_ldspec_consumers);
+                $fdisplay(pfd, "ldspec_hit=%0d", perf_ldspec_hit);
+                $fdisplay(pfd, "ldspec_miss=%0d", perf_ldspec_miss);
+                $fdisplay(pfd, "ldspec_squash=%0d", perf_ldspec_squash);
+`endif
                 $fdisplay(pfd, "frontend_stall_cycles=%0d", perf_frontend_stall_cycles);
                 $fdisplay(pfd, "data_reads=%0d", perf_total_data_reads);
                 $fdisplay(pfd, "data_writes=%0d", perf_total_data_writes);

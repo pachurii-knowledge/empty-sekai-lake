@@ -14,6 +14,12 @@ module ooo_dispatch_control
     // full-branch-stack dispatch stall; a JAL may dispatch into a full stack.
     input wire logic [OOO_WIDTH-1:0] lane_needs_ckpt,
 `endif
+`ifdef FUSE_BRANCH
+    // Fuse-master lanes whose folded slave is a branch (shared-infra §4b): the
+    // atomic-pair stall keeps master+branch-slave dispatching together or not
+    // at all (a split pair would double-execute the folded op).
+    input wire logic [OOO_WIDTH-1:0] lane_fuse_pre_branch,
+`endif
     input wire logic [OOO_WIDTH-1:0] lane_is_memory,
     input wire logic [OOO_WIDTH-1:0] lane_is_terminal,
     input wire logic [OOO_WIDTH-1:0] lane_is_serializing,
@@ -93,6 +99,18 @@ module ooo_dispatch_control
             if (lane_is_serializing[i] && prefix_dispatched) begin
                 stop_prefix = 1'b1;
             end
+`ifdef FUSE_BRANCH
+            // Keep the fused pair atomic (shared-infra §4b): if the master's
+            // slave-branch could not get a checkpoint this cycle, stall the
+            // master too (so master+slave dispatch together or not at all).
+            // Mirrors the lane_needs_ckpt branch-stack stall above.
+            if (lane_fuse_pre_branch[i] && branch_stack_full) begin
+                stop_prefix = 1'b1;
+                if (!prefix_dispatched) begin
+                    dispatch_stall = 1'b1;
+                end
+            end
+`endif
 
             dispatch_valid[i] = lane_valid[i] && !dispatch_stall && !stop_prefix;
             prefix_dispatched |= dispatch_valid[i];

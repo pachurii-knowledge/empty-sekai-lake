@@ -27,6 +27,21 @@ module int_issue_queue
     output logic                 full,
     output logic [FU_ISSUE_PORTS-1:0] issue_valid,
     output issue_entry_t         issue_entry [FU_ISSUE_PORTS]
+`ifdef LOAD_SPEC_WAKE
+    ,
+    // LOAD_SPEC_WAKE (plans/dhry-attack-plan/load-spec-wake.md): a hit-predicted
+    // load's dest, broadcast by the LSQ at issue (sole-outstanding, plain
+    // single-beat cacheable INT, non-device). spec_rdy below is a COMBINATIONAL
+    // select-time readiness boost -- never written into entries_q.src_ready --
+    // so a missed consumer re-arms on the refill writeback. ld_spec_hit/miss is
+    // the core's one-cycle verdict for the broadcast; issue_ld_spec poisons the
+    // per-ALU-port pick so the core can squash the consumer's S2 on a miss.
+    input  wire logic            load_spec_wake_valid,
+    input  wire phys_reg_t       load_spec_wake_prd,
+    input  wire logic            ld_spec_hit,
+    input  wire logic            ld_spec_miss,
+    output logic [ALU_ISSUE_PORTS-1:0] issue_ld_spec
+`endif
 );
 
     issue_entry_t entries_q [INT_IQ_SIZE];
@@ -49,6 +64,30 @@ module int_issue_queue
     logic [$clog2(INT_IQ_SIZE+1)-1:0] iss_count;  // entries issued (selected) this cycle
     logic [$clog2(INT_IQ_SIZE+1)-1:0] ins_count;  // entries inserted this cycle
     logic [$clog2(OOO_WIDTH+1)-1:0] insert_count;
+
+`ifdef LOAD_SPEC_WAKE
+    // LOAD_SPEC_WAKE retain-in-IQ state (IQ-local parallel arrays; no
+    // issue_entry_t change, so the OFF packet width is byte-identical):
+    //  - spec_rdy1/2: combinational select-time readiness boost off the
+    //    hit-predicted load broadcast (FU_ALU consumers only, exactly like the
+    //    ALU spec_wake in block A). NEVER persisted into entries_q.src_ready,
+    //    so a not-picked consumer simply loses the boost next cycle, and a
+    //    missed pick re-arms only on the real completion wakeup.
+    //  - spec_issued_q: the entry was picked while spec-reliant and is running
+    //    its speculative S2. It is RETAINED (not freed at select) and excluded
+    //    from re-select until the one-cycle verdict: freed on ld_spec_hit,
+    //    re-armed (bit cleared, committed src_ready still 0) on ld_spec_miss.
+    //  - issued_ld_spec_slot: this cycle's pick is spec-reliant (a source was
+    //    ready ONLY via the boost) -- poisons the S2 op via issue_ld_spec.
+    logic [INT_IQ_SIZE-1:0] spec_issued_q, spec_issued_next;
+    logic [INT_IQ_SIZE-1:0] spec_rdy1, spec_rdy2;
+    logic [INT_IQ_SIZE-1:0] issued_ld_spec_slot;
+    // Occupancy correction: a spec-reliant pick asserts issue_valid but does
+    // NOT free its slot (spec_retain); a hit-verified spec_issued slot is freed
+    // one cycle later (spec_free, disjoint from sq_count via the !squash gate).
+    logic [$clog2(INT_IQ_SIZE+1)-1:0] spec_retain;
+    logic [$clog2(INT_IQ_SIZE+1)-1:0] spec_free;
+`endif
 
     // Parallel per-FU-class issue select (replaces the serial 5-port x 16-entry
     // scan). Each entry belongs to exactly one fu_class, so the port classes never
@@ -79,6 +118,21 @@ module int_issue_queue
     logic [INT_IQ_SIZE-1:0] ins_free_mask;
     iq_idx_t ins_free [OOO_WIDTH];
     logic [$clog2(OOO_WIDTH+1)-1:0] ins_rank [OOO_WIDTH];
+
+`ifdef AGE_ORDER
+    // AGE_ORDER (plans/dhry-direct-attacks.md Stage 4): the NxN relative-age
+    // matrix. age_q[i][j]=1 <=> slot i is OLDER than slot j. Written ONLY at
+    // insert (a full row+col scrub of the target slot) and cleared on flush;
+    // never touched on issue/squash/abort -- a dead slot's stale age bits are
+    // don't-care (validity gates candidacy) and are erased wholesale when the
+    // slot is reused. The "clear on free" therefore keys on the REAL free
+    // (slot reuse at insert), not on raw issue_valid: a future LOAD_SPEC_WAKE
+    // retained pick (ld_spec_hit re-issue of a spec-issued entry) keeps its
+    // age until its slot is genuinely recycled, so a spec-wake replay cannot
+    // corrupt the order. ins_target[lane] is the slot block C writes for lane.
+    logic [INT_IQ_SIZE-1:0][INT_IQ_SIZE-1:0] age_q, age_next;
+    iq_idx_t ins_target [OOO_WIDTH];
+`endif
 
     assign full = (count_q > INT_IQ_SIZE - OOO_WIDTH);
 
@@ -145,6 +199,28 @@ module int_issue_queue
         for (int i = 0; i < FU_ISSUE_PORTS; i += 1) begin
             issue_entry[i] = '0;
         end
+`ifdef LOAD_SPEC_WAKE
+        issue_ld_spec = '0;
+        // Combinational spec-readiness boost (reads entries_wake, FU_ALU-only
+        // exactly like the ALU spec-wake in block A): a load broadcast makes a
+        // dependent ALU consumer SELECTABLE this cycle; the boost is never
+        // written into entries_q (see the decl note). A spec_issued entry is
+        // already running its speculative S2, so it is never re-boosted.
+        spec_rdy1 = '0;
+        spec_rdy2 = '0;
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            spec_rdy1[i] = load_spec_wake_valid && entries_wake[i].valid &&
+                (entries_wake[i].fu_class == FU_ALU) && !spec_issued_q[i] &&
+                (entries_wake[i].prs1 == load_spec_wake_prd);
+            spec_rdy2[i] = load_spec_wake_valid && entries_wake[i].valid &&
+                (entries_wake[i].fu_class == FU_ALU) && !spec_issued_q[i] &&
+                (entries_wake[i].prs2 == load_spec_wake_prd);
+            // A pick is spec-reliant iff a source was ready ONLY via the boost.
+            issued_ld_spec_slot[i] =
+                (spec_rdy1[i] && !entries_wake[i].src1_ready) ||
+                (spec_rdy2[i] && !entries_wake[i].src2_ready);
+        end
+`endif
 
         // ---- Per-FU-class eligibility (parallel over the post-wakeup entries) ----
 `ifdef CF_OOO
@@ -180,6 +256,11 @@ module int_issue_queue
                     ((entries_q[i].branch_mask & abort_mask) == '0) &&
                     (entries_wake[i].fu_class == FU_ALU) &&
                     is_control_flow(entries_wake[i]) &&
+`ifdef LOAD_SPEC_WAKE
+                    // A spec-issued branch is already running its speculative
+                    // S2 -- never mistake it for the oldest-ready branch.
+                    !spec_issued_q[i] &&
+`endif
                     (entries_wake[i].branch_mask == '0)) begin
                 cf_head_ready = 1'b1;
             end
@@ -192,9 +273,22 @@ module int_issue_queue
             // decision exactly -- reset_mask clears the resolved-branch bit, which
             // abort_mask also carries, so a post-reset mask could miss a wrong-path
             // entry whose only abort bit was that branch. ~2 levels, parallel to wakeup.
+`ifdef LOAD_SPEC_WAKE
+            // LOAD_SPEC_WAKE: the hit-predicted load's boost ORs into the
+            // single readiness wire -- FU_ALU-only by construction, so the
+            // MUL/DIV/FP class masks below are unaffected. A spec-issued entry
+            // is running its speculative S2: excluded from re-select (also
+            // from the AGE_ORDER age pick, which ranks this same sel_rdy).
+            sel_rdy[i] = entries_wake[i].valid &&
+                (entries_wake[i].src1_ready || spec_rdy1[i]) &&
+                (entries_wake[i].src2_ready || spec_rdy2[i]) &&
+                ((entries_q[i].branch_mask & abort_mask) == '0) &&
+                !spec_issued_q[i];
+`else
             sel_rdy[i] = entries_wake[i].valid &&
                 entries_wake[i].src1_ready && entries_wake[i].src2_ready &&
                 ((entries_q[i].branch_mask & abort_mask) == '0);
+`endif
             sel_cf[i] = is_control_flow(entries_wake[i]);
             // CSR ops read from the priv CSR file's 2 read ports (wired to ALU0/ALU1
             // only), so they must confine to the first CSR_RD_PORTS ALU ports.
@@ -229,7 +323,15 @@ module int_issue_queue
             alu_cand[p] = sel_alu_cand & ~alu_taken &
                 (cf_prefix ? ~sel_cf : {INT_IQ_SIZE{1'b1}}) &
                 ((p < CSR_RD_PORTS) ? {INT_IQ_SIZE{1'b1}} : ~sel_csr);
+`ifdef AGE_ORDER
+            // AGE_ORDER: oldest-ready instead of index-priority. alu_cand[p]
+            // derives from sel_rdy, the single readiness wire -- Stage 5
+            // (LOAD_SPEC_WAKE) ORs its spec-rdy boost into sel_rdy and is
+            // ranked by the same age matrix with no further change here.
+            alu_idx[p]   = oldest_idx(alu_cand[p]);
+`else
             alu_idx[p]   = lowest_idx(alu_cand[p]);
+`endif
             alu_found[p] = issue_ready[ISSUE_ALU0 + p] && (alu_cand[p] != '0) &&
                 ((p == 0) ? 1'b1 : alu_found[p-1]);
             if (alu_found[p]) begin
@@ -239,9 +341,15 @@ module int_issue_queue
         end
 
         // ---- MUL/DIV/FP single picks (independent; never control flow) ----
+`ifdef AGE_ORDER
+        mul_idx = oldest_idx(sel_mul);
+        div_idx = oldest_idx(sel_div);
+        fp_idx  = oldest_idx(sel_fp);
+`else
         mul_idx = lowest_idx(sel_mul);
         div_idx = lowest_idx(sel_div);
         fp_idx  = lowest_idx(sel_fp);
+`endif
 
         // ---- Apply picks: drive the FU ports, clear the issued entries in the
         // post-select snapshot. The picked indices are distinct (a1 != a0;
@@ -250,7 +358,21 @@ module int_issue_queue
             if (alu_found[p]) begin
                 issue_valid[ISSUE_ALU0 + p] = 1'b1;
                 issue_entry[ISSUE_ALU0 + p] = entries_wake[alu_idx[p]];
+`ifdef LOAD_SPEC_WAKE
+                // LOAD_SPEC_WAKE: poison the per-port S2 op, and RETAIN a
+                // spec-reliant pick (do not free the slot); spec_issued_next is
+                // set in block C, and the slot is freed on ld_spec_hit
+                // (free-on-verify, block C) or re-armed on ld_spec_miss.
+                // alu_idx[p] is whichever slot the pick selected (lowest_idx,
+                // or the AGE_ORDER oldest_idx under that flag) -- the
+                // retain-vs-free gate applies to the same index either way.
+                issue_ld_spec[p] = issued_ld_spec_slot[alu_idx[p]];
+                if (!issued_ld_spec_slot[alu_idx[p]]) begin
+                    entries_sel[alu_idx[p]] = '0;   // normal free
+                end
+`else
                 entries_sel[alu_idx[p]] = '0;
+`endif
             end
         end
         if (issue_ready[ISSUE_MUL] && (sel_mul != '0)) begin
@@ -281,6 +403,38 @@ module int_issue_queue
     always_comb begin
         entries_next = entries_sel;
 
+`ifdef LOAD_SPEC_WAKE
+        // LOAD_SPEC_WAKE spec_issued next-state. Set: this cycle's spec-reliant
+        // ALU picks (disjoint from the resolve below -- a spec_issued_q entry is
+        // excluded from select, so no slot is set and cleared in one cycle).
+        // Resolve: ONE global verdict (ld_spec_hit/miss) covers every entry
+        // spec-issued last cycle -- at most one load broadcasts per cycle and
+        // its resolution window is exactly one cycle.
+        spec_issued_next = spec_issued_q;
+        for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+            if (alu_found[p] && issued_ld_spec_slot[alu_idx[p]]) begin
+                spec_issued_next[alu_idx[p]] = 1'b1;
+            end
+        end
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            if (spec_issued_q[i]) begin
+                if ((entries_q[i].branch_mask & abort_mask) != '0) begin
+                    spec_issued_next[i] = 1'b0;   // squashed anyway (zeroed below)
+                end else if (ld_spec_hit) begin
+                    spec_issued_next[i] = 1'b0;   // verified; entry freed below
+                end else if (ld_spec_miss) begin
+                    // Re-arm: keep the entry, drop the bit. Its committed
+                    // src_ready still has the spec source = 0 (the boost was
+                    // never persisted), so it re-selects only when the real
+                    // load completion wakeup arrives.
+                    spec_issued_next[i] = 1'b0;
+                end
+            end
+        end
+        if (flush) begin
+            spec_issued_next = '0;
+        end
+`endif
         // FB2b R3: apply the deferred branch squash here (moved from block A), BEFORE
         // the free-slot insert -- so a wrong-path slot reads free for ins_free exactly
         // as when the squash ran in block A. entries_sel already has the issued slots
@@ -339,6 +493,25 @@ module int_issue_queue
             end
         end
 
+`ifdef LOAD_SPEC_WAKE
+        // LOAD_SPEC_WAKE free-on-verify (folded into block C AFTER the abort
+        // squash + insert, per the adversarial hardening): a spec-issued entry
+        // verified by ld_spec_hit retires from the IQ now (its S2 result
+        // registers at X+2; the slot is released one cycle after a normal
+        // issue). Gated on !abort-squashed so it is disjoint from the squash
+        // above (no double-free in the occupancy count). Placed after insert
+        // so ins_free (registered occupancy) can never have targeted the slot
+        // this cycle, and so the AGE_ORDER Phase-1 column read of
+        // entries_next.valid below sees the slot already free. On ld_spec_miss
+        // the entry is UNTOUCHED here (re-arm, see spec_issued_next above).
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            if (spec_issued_q[i] && ld_spec_hit &&
+                    ((entries_q[i].branch_mask & abort_mask) == '0)) begin
+                entries_next[i] = '0;
+            end
+        end
+`endif
+
         if (flush) begin
             for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
                 entries_next[i] = '0;
@@ -371,13 +544,97 @@ module int_issue_queue
                 ins_count += insert_valid[lane];
             end
         end
+`ifdef LOAD_SPEC_WAKE
+        // LOAD_SPEC_WAKE occupancy correction: a spec-reliant pick asserts
+        // issue_valid (counted in iss_count) but RETAINS its slot, so back it
+        // out (spec_retain <= iss_count, no underflow); a hit-verified
+        // spec_issued slot frees HERE (spec_free), one cycle after its pick.
+        // spec_free is gated on !abort-squashed so it is disjoint from
+        // sq_count, and a spec_issued slot is a valid occupied entry so
+        // spec_free <= count_q - sq_count. On a miss nothing frees (re-arm).
+        spec_retain = '0;
+        for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+            if (alu_found[p] && issued_ld_spec_slot[alu_idx[p]]) begin
+                spec_retain += 1'b1;
+            end
+        end
+        spec_free = '0;
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            if (spec_issued_q[i] && ld_spec_hit &&
+                    ((entries_q[i].branch_mask & abort_mask) == '0)) begin
+                spec_free += 1'b1;
+            end
+        end
+        count_next = flush ? '0 :
+            (count_q - sq_count - (iss_count - spec_retain) - spec_free + ins_count);
+`else
         count_next = flush ? '0 : (count_q - sq_count - iss_count + ins_count);
+`endif
+
+`ifdef AGE_ORDER
+        // ---- AGE matrix maintenance (AGE_ORDER) ----
+        // Carry by default; insert is the ONLY writer. Phase 1: an inserted op
+        // lands younger than every entry that survives the cycle -- a full
+        // row+col scrub of its target slot, which also erases the stale bits
+        // of the slot's previous occupant wholesale (the real "clear on free":
+        // keyed on slot reuse, NOT on issue_valid, so a Stage-5 spec-woken
+        // retained pick keeps its age until the slot is genuinely recycled).
+        // The column reads entries_next.valid (post squash/select/insert), so
+        // co-inserted slots see each other as valid. Phase 2 (AFTER Phase 1,
+        // blocking) then orders same-cycle co-inserts by lane (= program)
+        // order, overwriting Phase 1's both-directions bits between their
+        // targets. ins_free reads REGISTERED occupancy (R2'), so a this-cycle-
+        // freed slot is not a target and its scrub cannot race a live entry.
+        // Issue/squash/abort never write age: validity gates candidacy, and
+        // the diagonal stays 0 (row scrub covers j==target, col skips it).
+        // flush -> empty queue, no order.
+        for (int lane = 0; lane < OOO_WIDTH; lane += 1) begin
+            ins_target[lane] = ins_free[ins_rank[lane]];
+        end
+        age_next = age_q;
+        if (!full) begin
+            for (int lane = 0; lane < OOO_WIDTH; lane += 1) begin
+                if (insert_valid[lane]) begin
+                    for (int j = 0; j < INT_IQ_SIZE; j += 1) begin
+                        age_next[ins_target[lane]][j] = 1'b0;
+                        age_next[j][ins_target[lane]] =
+                            entries_next[j].valid && (j != ins_target[lane]);
+                    end
+                end
+            end
+            for (int l1 = 0; l1 < OOO_WIDTH; l1 += 1) begin
+                for (int l2 = l1 + 1; l2 < OOO_WIDTH; l2 += 1) begin
+                    if (insert_valid[l1] && insert_valid[l2]) begin
+                        age_next[ins_target[l1]][ins_target[l2]] = 1'b1;
+                        age_next[ins_target[l2]][ins_target[l1]] = 1'b0;
+                    end
+                end
+            end
+        end
+        if (flush) begin
+            age_next = '0;
+        end
+`endif
     end
 
     function automatic logic is_control_flow(issue_entry_t entry);
         is_control_flow = (entry.ctrl.pc_source == PC_cond) ||
             (entry.ctrl.pc_source == PC_uncond) ||
+`ifdef FUSE_BRANCH
+            // A fused branch-fusion master (FUSE_CMPBR) RESOLVES a branch on
+            // its ALU writeback, so it must join the CF issue discipline: the
+            // <=1-CF-issue/cycle cf_prefix exclusion (the writeback bus's
+            // branch_writeback carries only ONE resolve per cycle — a 2nd
+            // same-cycle resolve would be silently dropped, checkpoint and
+            // mispredict redirect lost) and the CF_OOO oldest-branch priority
+            // hold (it is a branch resolve for pool-drain purposes; on a
+            // non-CF_OOO build this is the conservative hard ban — correct,
+            // just less speculative). It is NOT held by its own folded slave's
+            // checkpoint: its branch_mask predates the slave's allocation.
+            ((entry.ctrl.pc_source == PC_indirect) || entry.fuse_is_branch);
+`else
             (entry.ctrl.pc_source == PC_indirect);
+`endif
     endfunction
 
     // Lowest set index in a per-entry mask (a priority encoder over the 16 IQ
@@ -390,9 +647,38 @@ module int_issue_queue
         end
     endfunction
 
+`ifdef AGE_ORDER
+    // Oldest set index in a mask (AGE_ORDER): the candidate no OTHER candidate
+    // is older than. age_q[j][i]=1 <=> j older than i; the mask[j] term on the
+    // suppressor is load-bearing -- a non-candidate (not-ready / wrong-path /
+    // already-taken slot) must never suppress. Seeded with lowest_idx so that
+    // if totality ever breaks the pick degrades to a real in-mask candidate
+    // instead of silently firing slot 0 (invalid / wrong-path). With the
+    // insert maintenance above the live entries form a strict total order, so
+    // exactly one candidate has no older rival and the result is one-hot-safe.
+    // Reads only the REGISTERED age_q: no new combinational loop into block B.
+    function automatic iq_idx_t oldest_idx(input logic [INT_IQ_SIZE-1:0] mask);
+        oldest_idx = lowest_idx(mask);
+        for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+            logic any_older;
+            any_older = 1'b0;
+            for (int j = 0; j < INT_IQ_SIZE; j += 1) begin
+                if ((j != i) && mask[j] && age_q[j][i]) any_older = 1'b1;
+            end
+            if (mask[i] && !any_older) oldest_idx = iq_idx_t'(i);
+        end
+    endfunction
+`endif
+
     always_ff @(posedge clk or negedge rst_l) begin
         if (!rst_l) begin
             count_q <= '0;
+`ifdef AGE_ORDER
+            age_q <= '0;
+`endif
+`ifdef LOAD_SPEC_WAKE
+            spec_issued_q <= '0;
+`endif
             for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
                 entries_q[i] <= '0;
             end
@@ -404,6 +690,14 @@ module int_issue_queue
             for (int i = 0; i < INT_IQ_SIZE; i += 1)
                 entries_q[i] <= entries_next[i];
             count_q <= count_next;
+`ifdef AGE_ORDER
+            // age_q is a packed NxN vector (not an unpacked array), so a
+            // whole-vector NBA is safe from the V3Delayed issue above.
+            age_q <= age_next;
+`endif
+`ifdef LOAD_SPEC_WAKE
+            spec_issued_q <= spec_issued_next;
+`endif
         end
     end
 

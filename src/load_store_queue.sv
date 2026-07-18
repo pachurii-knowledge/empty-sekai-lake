@@ -106,6 +106,28 @@ module load_store_queue
     // until this fires, then retires it. Constant 0 when COHERENT=0.
     output logic                 sc_commit_done,
     output writeback_packet_t    load_writeback,
+`ifdef FUSE_LDBR
+    // FUSE_LDBR: the fused load->branch resolve, emitted combinationally in the
+    // fused load's FINAL-BEAT retire and captured by the core's 1-deep pend_fbr
+    // buffer. pend_fbr_full (registered in the core) gates the fused load's
+    // FIRST issue, which guarantees a free capture slot at retire (head-only
+    // fused issue -> no other fused capture can land during its outstanding
+    // window), so the retire itself is never backpressured and no response
+    // pulse can be lost.
+    input wire logic             pend_fbr_full,
+    output logic                 fused_resolve_valid,
+    output active_id_t           fused_resolve_active_id,
+    output branch_id_t           fused_resolve_branch_id,
+    output logic [XLEN-1:0]      fused_resolve_pc,
+    output logic [31:0]          fused_resolve_instr,
+    output logic [XLEN-1:0]      fused_resolve_redirect_pc,
+    output logic                 fused_resolve_mispredict,
+    output logic                 fused_resolve_ctrl_pred,
+    output logic [XLEN-1:0]      fused_resolve_pred_pc,
+    output predictor_info_t      fused_resolve_pred_info,
+    output branch_mask_t         fused_resolve_branch_mask,
+    output logic                 fused_resolve_is_comp,
+`endif
     // P3-M0 (display-only, MLP diagnosis): categorizes why the in-order head is
     // blocked this cycle (see the LSQ_HR_* codes). Pure combinational hint off the
     // head state -- feeds only the SIMULATION perf counters, never functional logic;
@@ -117,6 +139,22 @@ module load_store_queue
     // no-intervening-store, byte full-cover) so FWD_FULL is not over-counted. Pure
     // combinational; feeds only the SIM perf counters. See plans/ooo-perf.md P3 lever 2.
     output logic [2:0]           lsq_fwd_class
+`ifdef LOAD_SPEC_WAKE
+    ,
+    // LOAD_SPEC_WAKE (plans/dhry-attack-plan/load-spec-wake.md): broadcast the
+    // issuing head load's dest one cycle early, so a dependent FU_ALU consumer's
+    // S2 lands on the X+1 L1D hit response. Pulsed in block HD with the load
+    // issue, restricted to a plain single-beat cacheable INT load with a GPR
+    // dest, sole-outstanding, non-device. Under LSQ_MLP2 the allocated inflight
+    // id rides along so the core resolves hit/miss by an id match, not raw
+    // dmem_resp_valid (adversarial finding 1).
+    output logic                 load_spec_wake_valid,
+    output phys_reg_t            load_spec_wake_prd
+`ifdef LSQ_MLP2
+    ,
+    output logic [LSQ_ID_W-1:0]  load_spec_wake_id
+`endif
+`endif
 );
     // P3-M0 head-blocking-reason codes.
     localparam logic [2:0] LSQ_HR_EMPTY     = 3'd0; // no valid entry at head (idle)
@@ -464,6 +502,14 @@ module load_store_queue
             if (!inflight_valid_q[k]) inflight_alloc_id = LSQ_ID_W'(k);
     end
 `endif
+`ifdef LOAD_SPEC_WAKE
+`ifndef LSQ_MLP2
+    // LOAD_SPEC_WAKE base arm (no LSQ_MLP2): device-ness of the head load's
+    // issued PA, computed in block HD from xlate_pa_eff (the B3 head_dev_load
+    // decode exists only under LSQ_MLP2).
+    logic        ldspec_head_dev;
+`endif
+`endif
     // High while the head store is probing its high-word translation (cross-word
     // store / FP double). Steers mem_req_vaddr up one word so the second page is
     // translated and verified before either word is written (store atomicity).
@@ -591,10 +637,33 @@ module load_store_queue
     // loop. The merge block (M) layers head_delta onto entries_wake.
     always_comb begin
         load_writeback = '0;
+`ifdef FUSE_LDBR
+        fused_resolve_valid       = 1'b0;
+        fused_resolve_active_id   = '0;
+        fused_resolve_branch_id   = '0;
+        fused_resolve_pc          = '0;
+        fused_resolve_instr       = '0;
+        fused_resolve_redirect_pc = '0;
+        fused_resolve_mispredict  = 1'b0;
+        fused_resolve_ctrl_pred   = 1'b0;
+        fused_resolve_pred_pc     = '0;
+        fused_resolve_pred_info   = '0;
+        fused_resolve_branch_mask = '0;
+        fused_resolve_is_comp     = 1'b0;
+`endif
         head_delta = '0;
         head_data_load_en = 1'b0;
         load_data_addr = '0;
         head_load_op = DMEM_OP_LOAD;
+`ifdef LOAD_SPEC_WAKE
+        load_spec_wake_valid = 1'b0;
+        load_spec_wake_prd   = '0;
+`ifdef LSQ_MLP2
+        load_spec_wake_id    = '0;
+`else
+        ldspec_head_dev      = 1'b0;   // recomputed from xlate_pa_eff below
+`endif
+`endif
 `ifdef LSQ_MLP2
         head_load_pa_direct = 1'b0;   // MF1: default live-translate path
         ip_delta_we_issued = 1'b0;     // A3: no issued_load write unless ip issues
@@ -761,6 +830,18 @@ module load_store_queue
             ((xlate_pa_eff >= XLEN'('h0200_0000)) && (xlate_pa_eff < XLEN'('h0201_0000))) ||
             ((xlate_pa_eff >= XLEN'('h0C00_0000)) && (xlate_pa_eff < XLEN'('h1000_0000))) ||
             ((xlate_pa_eff >= XLEN'('h0D00_0000)) && (xlate_pa_eff < XLEN'('h0D00_1000)));
+`endif
+`ifdef LOAD_SPEC_WAKE
+`ifndef LSQ_MLP2
+        // LOAD_SPEC_WAKE base arm: same device-hole decode on the head load's
+        // issued PA -- device head loads are excluded from the spec-wake
+        // broadcast (adversarial finding 4: a device read never returns at X+1
+        // and its snoop side effect must not be speculated).
+        ldspec_head_dev =
+            ((xlate_pa_eff >= XLEN'('h0200_0000)) && (xlate_pa_eff < XLEN'('h0201_0000))) ||
+            ((xlate_pa_eff >= XLEN'('h0C00_0000)) && (xlate_pa_eff < XLEN'('h1000_0000))) ||
+            ((xlate_pa_eff >= XLEN'('h0D00_0000)) && (xlate_pa_eff < XLEN'('h0D00_1000)));
+`endif
 `endif
 
         // The per-op head blocks below write the single head entry via head_delta
@@ -964,6 +1045,22 @@ module load_store_queue
             head_delta.issued_load = 1'b1;
         end
 
+`ifdef FUSE_LDBR
+        // FUSE_LDBR fused-issue gate: a fused load holds at the head (no issue)
+        // while the core's 1-deep pend_fbr is occupied. With head-only fused
+        // issue (the ip carve below) the fused load is the LSQ head for its
+        // whole outstanding window, and only the head retires, so no OTHER
+        // fused capture can land while it is outstanding — gating its FIRST
+        // issue on an empty pend_fbr guarantees a free capture slot at its
+        // retire (asserted below). A two-beat re-issue (double_low_valid) is
+        // past the only capture that could fill pend_fbr during its window, so
+        // it is never gated. Claiming head_done stalls all head progress this
+        // cycle (the same idiom as the store probe-hold arm).
+        if (headq.entry.valid && headq.entry.fuse_is_branch &&
+                !headq.issued_load && !headq.double_low_valid && pend_fbr_full)
+            head_done = 1'b1;
+`endif
+
         // Load issue: reads/conditions from the REGISTERED head snapshot (headq)
         // so load_data_addr is a shallow registered mux, not the deep AGU chain.
         // A load issues one cycle after its address operand registers; the LSQ
@@ -1015,6 +1112,34 @@ module load_store_queue
             head_delta.we_issued_load = 1'b1;
             head_delta.issued_load = 1'b1;
             mem_inflight_next = 1'b1;
+`ifdef LOAD_SPEC_WAKE
+            // LOAD_SPEC_WAKE: broadcast the loaded dest one cycle early so a
+            // dependent FU_ALU consumer's S2 lands on the X+1 hit response.
+            // Plain single-beat cacheable INT load (exec_class==EXEC_INT
+            // excludes AMO=EXEC_AMO and FP loads=EXEC_FP -- the FP-load wake
+            // path is fpr_busy/FP_OOO, not this GPR prd broadcast), has a GPR
+            // dest, NON-DEVICE (finding 4), and SOLE-OUTSTANDING so the X+1
+            // response is unambiguously this load's (under LSQ_MLP2 the core
+            // still id-matches dmem_resp_id vs load_spec_wake_id, finding 1).
+            if (headq.entry.has_dest &&
+                !headq.entry.ctrl.memWrite &&
+                (headq.entry.ctrl.exec_class == EXEC_INT) &&
+                !needs_two_beats(headq.entry.ctrl, headq.addr)
+`ifdef LSQ_MLP2
+                && !head_dev_load && (inflight_count_q == '0)
+`else
+                // The enclosing issue gate already requires !mem_inflight_q
+                // (sole outstanding); only the device exclusion is added here.
+                && !ldspec_head_dev
+`endif
+                ) begin
+                load_spec_wake_valid = 1'b1;
+                load_spec_wake_prd   = headq.entry.prd;   // has_dest => prd != 0
+`ifdef LSQ_MLP2
+                load_spec_wake_id    = inflight_alloc_id; // the id its response names
+`endif
+            end
+`endif
         end
 
         // Pure-store completion / cross-word probe. A single-word store marks
@@ -1199,6 +1324,55 @@ module load_store_queue
 `endif
                     load_writeback.has_dest = 1'b0;
                     end
+`ifdef FUSE_LDBR
+                    // FUSE_LDBR: resolve the folded slave branch off the
+                    // just-formatted load value. FINAL-BEAT arm only — the
+                    // two-beat first beat re-issues (load_writeback='0 above,
+                    // never reaching here), the AMO arm is a separate branch
+                    // of this if, and a faulting load takes the exception arm
+                    // (belt-and-braces: also gate on !exception), so the
+                    // resolve fires exactly once, off the value the unfused
+                    // branch would have read. fbr_cmp + the target/mispredict
+                    // formulas are byte-copies of ooo_alu_pipe's fused resolve
+                    // (value-identical). FUSE_LDBR implies RVC (IALIGN=16), so
+                    // the taken target is always 2-aligned and the ALU path's
+                    // misaligned-target exception is provably unreachable.
+                    // The pend_fbr capture slot is guaranteed free by the
+                    // fused-issue gate (asserted below).
+                    if (headq.entry.fuse_is_branch &&
+                            !load_writeback.exception) begin
+                        automatic logic fb_taken;
+                        fb_taken = fbr_cmp(load_writeback.data, '0,
+                            headq.entry.fuse_alu_op);
+                        fused_resolve_valid       = 1'b1;
+                        fused_resolve_active_id   =
+                            headq.entry.fuse_br_active_id;
+                        fused_resolve_branch_id   = headq.entry.fuse_branch_id;
+                        fused_resolve_pc          = headq.entry.fuse_branch_pc;
+                        fused_resolve_instr       =
+                            headq.entry.fuse_branch_instr;
+                        fused_resolve_redirect_pc = fb_taken ?
+                            (headq.entry.fuse_branch_pc + headq.entry.fuse_imm) :
+                            (headq.entry.fuse_branch_pc +
+                             `ILEN_INC(headq.entry.fuse_is_compressed));
+                        fused_resolve_mispredict  =
+                            headq.entry.fuse_control_predicted ?
+                            (fused_resolve_redirect_pc !=
+                             headq.entry.fuse_predicted_pc) :
+                            (fused_resolve_redirect_pc !=
+                             (headq.entry.fuse_branch_pc +
+                              `ILEN_INC(headq.entry.fuse_is_compressed)));
+                        fused_resolve_ctrl_pred   =
+                            headq.entry.fuse_control_predicted;
+                        fused_resolve_pred_pc     =
+                            headq.entry.fuse_predicted_pc;
+                        fused_resolve_pred_info   =
+                            headq.entry.fuse_predictor_info;
+                        fused_resolve_branch_mask = headq.entry.branch_mask;
+                        fused_resolve_is_comp     =
+                            headq.entry.fuse_is_compressed;
+                    end
+`endif
                     head_delta.zero = 1'b1;
                     head_retire = 1'b1;
                 end
@@ -1263,6 +1437,14 @@ module load_store_queue
 `endif
                          !needs_two_beats(entries_q[issue_ptr_q].entry.ctrl,
                                           entries_q[issue_ptr_q].addr);
+`ifdef FUSE_LDBR
+            // FUSE_LDBR: fused loads issue HEAD-ONLY — the pend_fbr capture-slot
+            // invariant (fused-issue gate above) needs a fused load to be the
+            // LSQ head for its whole outstanding window, so it may never take
+            // the out-of-order ip issue path.
+            ip_carve_c = ip_carve_c &&
+                !entries_q[issue_ptr_q].entry.fuse_is_branch;
+`endif
             // MF2/MF5: in-range via the offset register (no mod-ring compare). Strictly
             // younger than head_q (ip_off!=0) AND within the valid region (ip_off<count).
             // MF4: never the post-skip head entry -- the head path owns it (makes the
@@ -1306,8 +1488,14 @@ module load_store_queue
         // 2 zero the whole queue.
         if (flush) begin
             load_writeback = '0;
+`ifdef FUSE_LDBR
+            fused_resolve_valid = 1'b0;   // a suppressed retire emits nothing
+`endif
             head_data_load_en = 1'b0;
             store_probe_hi_next = 1'b0;
+`ifdef LOAD_SPEC_WAKE
+            load_spec_wake_valid = 1'b0;   // a suppressed issue broadcasts nothing
+`endif
 `ifdef LSQ_MLP2
             ip_issue_fire = 1'b0;    // no new issue under flush (drain only)
             park_delta_we = 1'b0;    // no park under flush (in-flight responses discarded as stale)
@@ -1340,9 +1528,23 @@ module load_store_queue
                         if (entries_wake[i].entry.prs1 == wakeup_prd[w]) begin
                             entries_wake[i].entry.src1_ready = 1'b1;
                             entries_wake[i].addr_ready = 1'b1;
+`ifdef FUSE_UADDR
+                            // FUSE_UADDR (c): a use_pc_base entry's prs1 is
+                            // phys-0 (never a wakeup target), so this arm is
+                            // unreachable for it; guard anyway so it can
+                            // never take the rs1+imm form (fuse-uaddr.md §4b).
+                            entries_wake[i].addr =
+                                entries_wake[i].entry.use_pc_base ?
+                                    (entries_wake[i].entry.pc - XLEN'(4)) +
+                                    entries_wake[i].entry.imm :
+                                wakeup_data[w] +
+                                ((entries_wake[i].entry.ctrl.exec_class == EXEC_AMO) ?
+                                 '0 : entries_wake[i].entry.imm);
+`else
                             entries_wake[i].addr = wakeup_data[w] +
                                 ((entries_wake[i].entry.ctrl.exec_class == EXEC_AMO) ?
                                  '0 : entries_wake[i].entry.imm);
+`endif
                         end
                         if ((entries_wake[i].entry.prs2 == wakeup_prd[w]) &&
                                 !((entries_wake[i].entry.ctrl.exec_class == EXEC_FP) &&
@@ -1675,6 +1877,17 @@ module load_store_queue
 `endif
                             : insert_rs2_data[lane];
                     if (insert_entry[lane].src1_ready) begin
+`ifdef FUSE_UADDR
+                        if (insert_entry[lane].use_pc_base) begin
+                            // FUSE_UADDR (c): base = pc_auipc = load.pc - 4
+                            // (auipc has no compressed form, so the older lane
+                            // is always exactly 4 bytes back); offset = folded
+                            // hi+off already in .imm. rs1 is never read.
+                            entries_next[tail_next].addr =
+                                (insert_entry[lane].pc - XLEN'(4)) +
+                                insert_entry[lane].imm;
+                        end else
+`endif
                         entries_next[tail_next].addr = insert_rs1_data[lane] +
                             ((insert_entry[lane].ctrl.exec_class == EXEC_AMO) ?
                              '0 : insert_entry[lane].imm);
@@ -1775,6 +1988,31 @@ module load_store_queue
     // A memory op needs a second word beat when it is an FP double (FSD/FLD) or
     // an integer access that crosses a word boundary. AMO/LR/SC never split
     // (a misaligned atomic raises an access fault instead).
+`ifdef FUSE_LDBR
+    // Byte-copy of ooo_alu_pipe's branch_cmp (branch ops only — the fused
+    // resolve must be value-identical to the ALU-pipe resolve it replaces).
+    function automatic logic fbr_cmp(logic [XLEN-1:0] a, logic [XLEN-1:0] b,
+            alu_op_t op);
+        unique case (op)
+            ALU_BEQ: fbr_cmp = (a == b);
+            ALU_BNE: fbr_cmp = (a != b);
+            ALU_BLT: fbr_cmp = signed'(a) < signed'(b);
+            ALU_BGE: fbr_cmp = signed'(a) >= signed'(b);
+            ALU_BLTU: fbr_cmp = a < b;
+            ALU_BGEU: fbr_cmp = a >= b;
+            default: fbr_cmp = 1'b0;
+        endcase
+    endfunction
+
+    // Fused-issue-gate invariant: the pend_fbr capture slot is ALWAYS free when
+    // a fused resolve emits (else the just-captured entry would be clobbered).
+    always_ff @(posedge clk) begin
+        if (rst_l && fused_resolve_valid)
+            assert (!pend_fbr_full)
+            else $fatal(1, "FUSE_LDBR: fused resolve emitted with pend_fbr occupied");
+    end
+`endif
+
     function automatic logic needs_two_beats(input ctrl_signals_t ctrl,
             input logic [XLEN-1:0] addr);
         // An 8-byte FP double (FLD/FSD) crosses the memory word whenever the

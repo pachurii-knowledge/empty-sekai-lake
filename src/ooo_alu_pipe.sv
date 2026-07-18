@@ -22,6 +22,16 @@ module ooo_alu_pipe
     // trap-redirected, now M-mode) frontend to its wrong-path target. Mirrors the
     // flush the MUL/DIV/FP units already take.
     input wire logic             flush,
+`ifdef LOAD_SPEC_WAKE
+    // LOAD_SPEC_WAKE: this S2 op was woken by a hit-predicted load whose line
+    // MISSED (the core's one-cycle verdict, available this cycle). Zero its
+    // writeback COMBINATIONALLY -- one full cycle before the writeback flop
+    // below would register it -- so neither the rd write, the branch resolve /
+    // redirect, the CSR/FP write, nor the halt survives. The consumer
+    // re-executes on the real completion wakeup (its IQ entry was retained and
+    // re-armed). Mirrors the abort gate.
+    input wire logic         spec_squash,
+`endif
     output writeback_packet_t writeback
 );
 
@@ -42,7 +52,12 @@ module ooo_alu_pipe
 
     always_comb begin
         wb_next = '0;
+`ifdef LOAD_SPEC_WAKE
+        if (issue_valid && ((issue_entry.branch_mask & abort_mask) == '0) &&
+                !spec_squash) begin
+`else
         if (issue_valid && ((issue_entry.branch_mask & abort_mask) == '0)) begin
+`endif
             wb_next.valid = 1'b1;
             wb_next.active_id = issue_entry.active_id;
             wb_next.pc = issue_entry.pc;
@@ -74,6 +89,50 @@ module ooo_alu_pipe
             wb_next.control_predicted = issue_entry.control_predicted;
             wb_next.predicted_pc = issue_entry.predicted_pc;
             wb_next.predictor_info = issue_entry.predictor_info;
+`ifdef FUSE_BRANCH
+            // Fused branch-fusion master (FUSE_CMPBR, fuse-cmpbr.md §7a): this
+            // ALU op also resolves the folded slave conditional branch. The
+            // slave compares the master's RESULT (== the unfused rd value)
+            // against x0 — branch_cmp(result, '0, slave_op) is exactly the
+            // compare the unfused branch would do on the same operands, so
+            // direction/target/mispredict are VALUE-IDENTICAL; the resolve is
+            // just one execute earlier. wb_next.data already holds the compute
+            // result (line above; the misaligned/fetch-fault overrides below
+            // cannot fire for a fused master — PC_plus4 + detector excludes
+            // fetch_fault). The training identity rides the SLAVE's snapshot
+            // (fuse_predictor_info/fuse_control_predicted/fuse_predicted_pc).
+            wb_next.fuse_is_branch     = issue_entry.fuse_is_branch;
+            wb_next.fuse_branch_pc     = issue_entry.fuse_branch_pc;
+            wb_next.fuse_branch_instr  = issue_entry.fuse_branch_instr;
+            wb_next.fuse_is_compressed = issue_entry.fuse_is_compressed;
+            if (issue_entry.fuse_is_branch) begin
+                automatic logic fused_taken;
+`ifdef FUSE_CMPBR_LI
+                // Case B (li fusion): the branch's 2nd operand is the OTHER
+                // source register, carried on the master's rs2 port. Case A
+                // (and the struct_ok-form li;beqz) compares against x0.
+                fused_taken = branch_cmp(wb_next.data,
+                    issue_entry.fuse_cmp_rs2 ? rs2_data : '0,
+                    issue_entry.fuse_alu_op);
+`else
+                fused_taken = branch_cmp(wb_next.data, '0,
+                    issue_entry.fuse_alu_op);
+`endif
+                wb_next.branch_valid = 1'b1;
+                wb_next.branch_id    = issue_entry.fuse_branch_id;
+                wb_next.redirect_pc  = fused_taken ?
+                    (issue_entry.fuse_branch_pc + issue_entry.fuse_imm) :
+                    (issue_entry.fuse_branch_pc +
+                     `ILEN_INC(issue_entry.fuse_is_compressed));
+                wb_next.branch_mispredict = issue_entry.fuse_control_predicted ?
+                    (wb_next.redirect_pc != issue_entry.fuse_predicted_pc) :
+                    (wb_next.redirect_pc != (issue_entry.fuse_branch_pc +
+                        `ILEN_INC(issue_entry.fuse_is_compressed)));
+                wb_next.control_predicted = issue_entry.fuse_control_predicted;
+                wb_next.predicted_pc      = issue_entry.fuse_predicted_pc;
+                wb_next.predictor_info    = issue_entry.fuse_predictor_info;
+            end
+`endif
             wb_next.csr_write = issue_entry.ctrl.csr_write;
             wb_next.csr_addr = issue_entry.instr[31:20];
             wb_next.csr_wdata = csr_write_data_for(issue_entry, rs1_data,
@@ -166,6 +225,18 @@ module ooo_alu_pipe
                 end
             end
         endcase
+`ifdef FUSE_UADDR
+        // FUSE_UADDR (a)/(b): fold the nulled slave's ADDI/ADDIW onto the
+        // master's own result in the same pass (fuse-uaddr.md §4). LUI lands
+        // here via RD_IMM (base = imm), AUIPC via the default arm (base =
+        // pc+imm); fuse_alu_op is ALU_ADD (ADDI slave) or ALU_ADDW (ADDIW
+        // slave — alu_result's sext32 gives the exact W-form semantics, e.g.
+        // the canonical RV64 `lui;addiw` constant materialisation).
+        if (entry.is_fused && (entry.fuse_kind == FUSE_K_UADDR)) begin
+            result_for = alu_result(result_for, entry.fuse_imm,
+                entry.fuse_alu_op);
+        end
+`endif
     endfunction
 
     // FP via a `real` behavioral model. VERIFIED DEAD for FP: every FP op is

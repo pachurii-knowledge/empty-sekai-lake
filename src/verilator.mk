@@ -381,6 +381,113 @@ ifeq ($(COMMIT1),1)
 	VERILATOR_CFLAGS += -DCOMMIT_1STAGE
 endif
 
+# FUSE_ANY=1 / FUSE_BRANCH=1 (plans/dhry-direct-attacks.md Stage 1; full spec
+# plans/dhry-attack-plan/shared-infra.md): the shared macro-op fusion infra --
+# combinational intra-group adjacent-pair detector + null-slave + born-done ROB
+# slot + atomic-pair dispatch stall + (FUSE_BRANCH) predictor rewiring. With no
+# per-lever -D (FUSE_UADDR/FUSE_CMPBR/FUSE_LDBR land in later stages) the
+# detector never fires: fully inert. FUSE_BRANCH is RVC-gated in RTL (ooo_types.vh
+# strips it on non-RVC builds -- the "folded branch never faults" argument needs
+# IALIGN=16). Not folded into PERF until each lever is A/B-verified. Default OFF
+# is bit-identical (all gated by -DFUSE_ANY/-DFUSE_BRANCH). OOO only.
+ifeq ($(FUSE_ANY),1)
+	VERILATOR_CFLAGS += -DFUSE_ANY
+endif
+
+# FUSE_UADDR=1 (plans/dhry-attack-plan/fuse-uaddr.md; Stage 2 of
+# plans/dhry-direct-attacks.md): the first real consumer of the FUSE_ANY
+# scaffolding. (a) lui+addi/addiw -> const and (b) auipc+addi -> pc+imm
+# kill-younger fusions (ALU-side fold of the slave's ADD/ADDW onto the master's
+# result — bit-exact lo<0 borrow via alu_result), plus (c) auipc+load ->
+# LSQ-AGU pc-base fold (use_pc_base; kill-older with the G1 first-memory + G2
+# free-headroom atomicity guards, load.rd==auipc.rd, fetch_fault/illegal/x0
+# exclusions). Default OFF is bit-identical (all edits `ifdef FUSE_UADDR /
+# fu_*-muxed with the OFF arm verbatim). Composes with the whole PERF umbrella;
+# Fmax-costly (decode-cone imm+imm add + AGU pc mux), so an FPGA/ASIC build
+# should drop it. OOO only.
+ifeq ($(FUSE_UADDR),1)
+	VERILATOR_CFLAGS += -DFUSE_UADDR
+endif
+
+ifeq ($(FUSE_BRANCH),1)
+	VERILATOR_CFLAGS += -DFUSE_BRANCH
+endif
+
+# FUSE_CMPBR=1 (plans/dhry-attack-plan/fuse-cmpbr.md; Stage 3 of
+# plans/dhry-direct-attacks.md): the first FUSE_BRANCH consumer — fused
+# compare+branch. Inc 1 (Case A, reg-reg, VALUE-IDENTICAL): a single-cycle
+# integer ALU producer writing rd + an adjacent beqz/bnez/bltz/... rd (branch
+# vs x0) fuse into the master's one ALU pass (computes rd AND resolves the
+# branch off branch_cmp(result, '0, slave_op) — same operands the unfused
+# branch would read). The slave branch rides the shared born-done/null-slave
+# path (keeps its ROB slot + checkpoint, so minstret and the frontend parcel
+# accounting are automatic); the master carries the FUSE_BRANCH payload and
+# its writeback trains TAGE/GHR with the slave's identity (incl. the slave's
+# is_compressed via fuse_is_compressed). Exactly 1 physreg + 1 checkpoint per
+# pair. FUSE_CMPBR_LI=1 adds Inc 2 (Case A-imm + li;beq/bne fusion).
+# Default OFF is bit-identical (all edits `ifdef FUSE_CMPBR/FUSE_BRANCH).
+# Fmax-costly (decode-cone pair detect + writeback compare mux), so an
+# FPGA/ASIC build should drop it. OOO only.
+ifeq ($(FUSE_CMPBR),1)
+	VERILATOR_CFLAGS += -DFUSE_CMPBR
+endif
+ifeq ($(FUSE_CMPBR_LI),1)
+	VERILATOR_CFLAGS += -DFUSE_CMPBR_LI
+endif
+
+# FUSE_LDBR=1 (-DFUSE_LDBR; plans/dhry-attack-plan/fuse-ldbr.md; Stage 6 of
+# plans/dhry-direct-attacks.md): fused load->branch resolve — an adjacent
+# {plain integer load rd} + {conditional branch testing rd vs x0} pair resolves
+# the branch in the LSQ load-writeback path the cycle the loaded value returns,
+# instead of waking the branch through the IQ + an ALU pipe. 2-slot ROB model:
+# the load retires its own ROB entry; the branch's ROB entry (NOT born-done)
+# retires via the core's 1-deep pend_fbr buffer seated as the new lowest-
+# priority WB_FBR writeback source, atomically with its branch_writeback
+# resolve (branch_stack has one resolve port). Requires RVC (the FUSE_BRANCH
+# payload; stripped with it on non-RVC builds) and CF_OOO (the resolve lands
+# out of program order vs older IQ branches — PERF has it). Default OFF is
+# bit-identical (all edits `ifdef FUSE_LDBR). Fmax-costly (a comb resolve off
+# the load-writeback cone), so an FPGA/ASIC build should drop it. OOO only.
+ifeq ($(FUSE_LDBR),1)
+	VERILATOR_CFLAGS += -DFUSE_LDBR
+endif
+
+# AGE_ORDER=1 (-DAGE_ORDER): age-ordered IQ select (plans/dhry-direct-attacks.md
+# Stage 4; full design in the age-ordered-iq-plan memory). An NxN age matrix in
+# int_issue_queue.sv tracks relative entry age; the four SELECT picks
+# (ALU N-pick, MUL, DIV, FP) take OLDEST-ready instead of lowest-index, so the
+# ROB head's producer can no longer be starved by index-priority (the same
+# starvation the CF_OOO cf_head_ready guard patches). Insert/free-slot order is
+# unchanged (still lowest_idx). Functional-sim lever (a deeper select cone ->
+# Fmax cost), so an FPGA/ASIC build should drop it; NOT folded into PERF until
+# its marginal A/B on PERF is measured. Default OFF is bit-identical (all edits
+# `ifdef AGE_ORDER). OOO only.
+ifeq ($(AGE_ORDER),1)
+	VERILATOR_CFLAGS += -DAGE_ORDER
+endif
+
+# LOAD_SPEC_WAKE=1 (-DLOAD_SPEC_WAKE): hit-predicted load speculative wakeup
+# (plans/dhry-direct-attacks.md Stage 5; full spec
+# plans/dhry-attack-plan/load-spec-wake.md). A plain single-beat cacheable INT
+# head load broadcasts its prd at issue (sole-outstanding, non-device), so a
+# dependent FU_ALU consumer's S2 lands on the X+1 L1D hit response (parity with
+# the ALU spec_wake, which today excludes loads). IQ-local spec_rdy/spec_issued
+# parallel arrays (no issue_entry_t change): spec_rdy is a non-persisted
+# select-time boost, so a missed consumer re-arms on the refill writeback; a
+# spec-reliant pick is retained (not freed) until the one-cycle hit/miss verdict
+# (LSQ_MLP2: dmem_resp_id match vs the captured inflight id), then freed
+# (hit) or re-armed (miss). On a miss spec_squash zeros the consumer's ALU
+# wb_next combinationally at X+1 (a full cycle before the X+2 writeback flop)
+# and the consumer's own spec_wake is suppressed (grandchild cascade depth = 1).
+# REQUIRES L1D=1 (the 1-cycle L1D hit is the timing anchor; the RTL $fatals
+# without -DL1D_CACHE). Functional-sim lever (tag-compare -> miss-squash cone,
+# XLATE_BYPASS-class Fmax cost); an FPGA/ASIC build should drop it. NOT folded
+# into PERF until its marginal A/B on PERF is measured. Default OFF is
+# bit-identical (all edits `ifdef LOAD_SPEC_WAKE). OOO only.
+ifeq ($(LOAD_SPEC_WAKE),1)
+	VERILATOR_CFLAGS += -DLOAD_SPEC_WAKE
+endif
+
 .PHONY: verilator-build verilator-sim verilator-verify verilator-clean \
 		verilator-check-compiler
 

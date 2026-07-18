@@ -700,7 +700,21 @@ module active_list
             if (allocate_valid_q[i] &&
                     ((allocate_packet_q[i].branch_mask & abort_mask) == '0)) begin
                 entries_next[allocate_packet_q[i].active_id].valid = 1'b1;
+`ifdef FUSE_ANY
+                // Born-done fusion slave (shared-infra §4a): the folded op keeps a
+                // ROB slot but retires in order with no writeback.
+                entries_next[allocate_packet_q[i].active_id].done =
+                    allocate_packet_q[i].fused_slave ? 1'b1 : 1'b0;
+`ifdef FUSE_LDBR
+                // FUSE_LDBR's slave is the exception: NOT born-done — its ROB
+                // entry waits for the fused-resolve (pend_fbr) writeback so it
+                // can never commit ahead of its checkpoint resolve.
+                if (allocate_packet_q[i].fuse_slave_ldbr)
+                    entries_next[allocate_packet_q[i].active_id].done = 1'b0;
+`endif
+`else
                 entries_next[allocate_packet_q[i].active_id].done = 1'b0;
+`endif
                 entries_next[allocate_packet_q[i].active_id].exception = 1'b0;
                 entries_next[allocate_packet_q[i].active_id].exc_cause = 5'd0;
                 entries_next[allocate_packet_q[i].active_id].halted = 1'b0;

@@ -16,6 +16,43 @@
   `define RVC_NLANES 2
 `endif
 
+// ---- Macro-op fusion umbrella (plans/dhry-direct-attacks.md Stage 1; full spec
+// plans/dhry-attack-plan/shared-infra.md). Each lever is independently -D-gated +
+// composable for A/B; FUSE_ANY = "any fusion compiled in" (shared detector +
+// null-slave + born-done), FUSE_BRANCH = "a fused op resolves a branch" (master
+// carries branch_id + predictor rewiring). Default unset => bit-identical.
+`ifdef FUSE_UADDR
+  `define FUSE_ANY
+`endif
+`ifdef FUSE_CMPBR
+  `define FUSE_ANY
+  `define FUSE_BRANCH
+`endif
+`ifdef FUSE_LDBR
+  `define FUSE_ANY
+  `define FUSE_BRANCH
+`endif
+// The branch fusions REQUIRE RVC (IALIGN=16 => the fused conditional branch's
+// always-even target can never raise the misaligned-target fault, so the folded
+// "second sub-op never faults" -- shared-infra §7). On a non-RVC build the
+// FUSE_BRANCH payload/logic is compiled OUT (inert): strip the umbrella here so
+// every downstream `ifdef FUSE_BRANCH site (all consumers include this header
+// first; single-unit preprocessing) sees it undefined.
+`ifndef RVC
+`ifdef FUSE_BRANCH
+  `undef FUSE_BRANCH
+`endif
+`endif
+// FUSE_LDBR rides the FUSE_BRANCH payload (the slave branch's resolve/training
+// identity), so on a non-RVC build (FUSE_BRANCH just stripped) the lever is
+// fully inert: strip it too and every downstream `ifdef FUSE_LDBR site (all
+// consumers include this header first) compiles out.
+`ifndef FUSE_BRANCH
+`ifdef FUSE_LDBR
+  `undef FUSE_LDBR
+`endif
+`endif
+
 package OOO_Types;
 
     // Pull in the shared control/ALU types from their package (not $unit) so the
@@ -79,7 +116,13 @@ package OOO_Types;
     // this). WB_SOURCES 6->7 (3 ALU + load + MUL + DIV + FP). OFF keeps 2/5/6.
     localparam int ALU_ISSUE_PORTS = 3;
     localparam int FU_ISSUE_PORTS = 6;
+`ifdef FUSE_LDBR
+    // FUSE_LDBR: +1 WB-only source (the pend_fbr fused-branch resolve — WB_FBR
+    // in ooo_writeback_bus, lowest priority, backpressurable, no issue port).
+    localparam int WB_SOURCES = 8;
+`else
     localparam int WB_SOURCES = 7;
+`endif
     localparam int ISSUE_ALU0 = 0;
     localparam int ISSUE_ALU1 = 1;
     localparam int ISSUE_ALU2 = 2;
@@ -89,7 +132,11 @@ package OOO_Types;
 `else
     localparam int ALU_ISSUE_PORTS = 2;
     localparam int FU_ISSUE_PORTS = 5;
+`ifdef FUSE_LDBR
+    localparam int WB_SOURCES = 7;
+`else
     localparam int WB_SOURCES = 6;
+`endif
     localparam int ISSUE_ALU0 = 0;
     localparam int ISSUE_ALU1 = 1;
     localparam int ISSUE_MUL = 2;
@@ -101,6 +148,15 @@ package OOO_Types;
     localparam int PHYS_REG_BITS = $clog2(PHYS_REGS);
     localparam int ACTIVE_ID_BITS = $clog2(ACTIVE_LIST_SIZE);
     localparam int BRANCH_ID_BITS = $clog2(BRANCH_STACK_SIZE);
+
+`ifdef FUSE_ANY
+    // Fusion-kind encoding for a detected pair (shared-infra §1); the master's
+    // fuse_kind tells its FU which folded second op to execute.
+    localparam logic [1:0] FUSE_K_NONE  = 2'd0;
+    localparam logic [1:0] FUSE_K_UADDR = 2'd1;
+    localparam logic [1:0] FUSE_K_CMPBR = 2'd2;
+    localparam logic [1:0] FUSE_K_LDBR  = 2'd3;
+`endif
 
     typedef logic [ARCH_REG_BITS-1:0] arch_reg_t;
     typedef logic [PHYS_REG_BITS-1:0] phys_reg_t;
@@ -179,6 +235,52 @@ package OOO_Types;
         fp_reg_data_t   fp_src2_data;
         fp_reg_data_t   fp_src3_data;
         fu_class_t      fu_class;
+`ifdef FUSE_ANY
+        // Macro-op fusion payload (shared-infra §2). Master: this op executes a
+        // folded second op; slave: born-done ROB NOP (no FU, no arch write).
+        logic          is_fused;
+        logic [1:0]    fuse_kind;     // FUSE_K_*
+        logic          fused_slave;
+        logic [XLEN-1:0] fuse_imm;    // slave imm: ADDI imm (UADDR) / SB target imm (CMP/LDBR)
+        alu_op_t       fuse_alu_op;   // slave op: ADD/ADDW (UADDR) / branch cmp (CMP/LDBR)
+`endif
+`ifdef FUSE_UADDR
+        // FUSE_UADDR (c): surviving load's AGU base is pc_auipc (= pc-4), not
+        // rs1_data; its imm carries the folded hi+off (fuse-uaddr.md §3c/§4).
+        logic          use_pc_base;
+`endif
+`ifdef FUSE_BRANCH
+        // Branch-fusion payload: the master hosts the slave branch's resolve, so
+        // it carries the slave's checkpoint id + prediction/training identity.
+        logic          fuse_is_branch;      // master hosts a fused conditional-branch resolve
+        logic [1:0]    fuse_pc_source;      // slave pc_source (always PC_cond for these levers)
+        branch_id_t    fuse_branch_id;      // = slave's branch_allocate_id (checkpoint X)
+        logic          fuse_control_predicted;
+        logic [XLEN-1:0] fuse_predicted_pc; // slave's predicted target (mispredict compare)
+        logic [XLEN-1:0] fuse_branch_pc;    // slave.pc — TAGE/BTB training + GHR "taken" test
+        logic [31:0]   fuse_branch_instr;   // slave.instr — training keys on [6:0]==OP_BRANCH
+        predictor_info_t fuse_predictor_info;
+        // Slave branch's instruction length (FUSE_BRANCH implies RVC): the fused
+        // fall-through + training "taken" tests need the SLAVE's ILEN, not the
+        // master's (fuse-cmpbr.md §7a).
+        logic          fuse_is_compressed;
+`endif
+`ifdef FUSE_CMPBR_LI
+        // FUSE_CMPBR Case B (li fusion): the fused branch's 2nd compare operand
+        // rides the master's (otherwise unused) rs2 port — the branch's OTHER
+        // source register — instead of x0 (fuse-cmpbr.md §7b).
+        logic          fuse_cmp_rs2;
+`endif
+`ifdef FUSE_LDBR
+        // FUSE_LDBR: the slave branch's OWN ROB slot (distinct from the load
+        // master's active_id) — the fused resolve retires it via the pend_fbr
+        // writeback (fuse-ldbr.md §HP4; 2-slot model, instret untouched).
+        active_id_t    fuse_br_active_id;
+        // Set on the LDBR SLAVE lane: this folded slave is NOT born-done (its
+        // ROB entry waits for the fused-resolve writeback so it can never
+        // commit ahead of its checkpoint resolve — consumed in active_list).
+        logic          fuse_slave_ldbr;
+`endif
     } rename_packet_t;
 
     typedef struct packed {
@@ -207,6 +309,37 @@ package OOO_Types;
         fp_reg_data_t   fp_src2_data;
         fp_reg_data_t   fp_src3_data;
         fu_class_t      fu_class;
+`ifdef FUSE_ANY
+        // Macro-op fusion payload, mirrored from rename_packet_t (shared-infra §2).
+        logic          is_fused;
+        logic [1:0]    fuse_kind;
+        logic          fused_slave;
+        logic [XLEN-1:0] fuse_imm;
+        alu_op_t       fuse_alu_op;
+`endif
+`ifdef FUSE_UADDR
+        // Mirrored from rename_packet_t (FUSE_UADDR (c) LSQ AGU pc-base select).
+        logic          use_pc_base;
+`endif
+`ifdef FUSE_BRANCH
+        logic          fuse_is_branch;
+        logic [1:0]    fuse_pc_source;
+        branch_id_t    fuse_branch_id;
+        logic          fuse_control_predicted;
+        logic [XLEN-1:0] fuse_predicted_pc;
+        logic [XLEN-1:0] fuse_branch_pc;
+        logic [31:0]   fuse_branch_instr;
+        predictor_info_t fuse_predictor_info;
+        logic          fuse_is_compressed;  // slave branch's ILEN flag (RVC)
+`endif
+`ifdef FUSE_CMPBR_LI
+        logic          fuse_cmp_rs2;        // Case B: compare vs rs2_data, not x0
+`endif
+`ifdef FUSE_LDBR
+        // Mirrored from rename_packet_t: the slave branch's own ROB slot (the
+        // LSQ's fused-resolve emission hands it to pend_fbr).
+        active_id_t    fuse_br_active_id;
+`endif
     } issue_entry_t;
 
     typedef struct packed {
@@ -236,6 +369,15 @@ package OOO_Types;
         logic          exception;
         logic [4:0]    exc_cause;
         logic          halted;
+`ifdef FUSE_BRANCH
+        // Branch-fusion identity (shared-infra §2): when the master resolves a
+        // fused branch its writeback drives the branch-resolve + predictor-train
+        // paths with the SLAVE's identity, not the master's.
+        logic          fuse_is_branch;
+        logic [XLEN-1:0] fuse_branch_pc;
+        logic [31:0]   fuse_branch_instr;
+        logic          fuse_is_compressed;  // slave branch's ILEN flag (RVC)
+`endif
 `ifdef RVC
         // RV64C: instruction length flag for branch-predictor training (the
         // "taken" test compares redirect_pc against pc + ILEN, not pc + 4).

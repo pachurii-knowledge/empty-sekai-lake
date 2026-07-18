@@ -14,10 +14,16 @@ module ooo_writeback_bus
     input wire writeback_packet_t mul_writeback,
     input wire writeback_packet_t div_writeback,
     input wire writeback_packet_t fp_writeback,
+`ifdef FUSE_LDBR
+    input wire writeback_packet_t fbr_writeback,
+`endif
     input wire branch_mask_t      abort_mask_q,
     output logic              mul_writeback_ready,
     output logic              div_writeback_ready,
     output logic              fp_writeback_ready,
+`ifdef FUSE_LDBR
+    output logic              fbr_writeback_ready,
+`endif
     output logic [OOO_WIDTH-1:0] writeback_valid,
     output active_id_t           writeback_active_id [OOO_WIDTH],
     output phys_reg_t            writeback_prd [OOO_WIDTH],
@@ -51,6 +57,19 @@ module ooo_writeback_bus
 `else
     localparam int WB_LOAD = 2, WB_MUL = 3, WB_DIV = 4, WB_FP = 5;
 `endif
+`ifdef FUSE_LDBR
+    // FUSE_LDBR: the pend_fbr fused-branch-resolve source — WB-only (no issue
+    // port), LOWEST arbitration priority (it is backpressurable, unlike the
+    // load; the hold is bounded — the unretired slave branch caps the ROB,
+    // which drains every competing source). The pre-existing index lines above
+    // stay untouched so OFF is byte-identical.
+    localparam int WB_FBR = WB_SOURCES - 1;
+    // branch_stack has ONE resolve port, so the fused resolve may seat only
+    // when no ALU pipe resolves a branch this cycle (spec blocker 3: the WB
+    // seating and the branch_writeback drive must be the same cycle). ALU
+    // writebacks are flops, so this is loop-free.
+    logic any_alu_branch_resolving;
+`endif
 
     always_comb begin
         packets[0] = alu0_writeback;
@@ -62,6 +81,9 @@ module ooo_writeback_bus
         packets[WB_MUL]  = mul_writeback;
         packets[WB_DIV]  = div_writeback;
         packets[WB_FP]   = fp_writeback;
+`ifdef FUSE_LDBR
+        packets[WB_FBR]  = fbr_writeback;
+`endif
         source_valid = '0;
         source_accepted = '0;
 
@@ -88,6 +110,12 @@ module ooo_writeback_bus
             source_valid[source] = packets[source].valid &&
                 ((packets[source].branch_mask & abort_mask_q) == '0);
         end
+`ifdef FUSE_LDBR
+        // Blocker 3 (atomic completion+resolve+drain): the fused resolve seats
+        // only in a cycle the branch-resolve port is free, so its WB seating
+        // and its branch_writeback drive below are always the same cycle.
+        source_valid[WB_FBR] = source_valid[WB_FBR] && !any_alu_branch_resolving;
+`endif
 
         for (int lane = 0; lane < OOO_WIDTH; lane += 1) begin
             for (int source = 0; source < WB_SOURCES; source += 1) begin
@@ -121,6 +149,12 @@ module ooo_writeback_bus
             ((div_writeback.branch_mask & abort_mask_q) != '0);
         fp_writeback_ready = !fp_writeback.valid || source_accepted[WB_FP] ||
             ((fp_writeback.branch_mask & abort_mask_q) != '0);
+`ifdef FUSE_LDBR
+        // Seated (implies the branch port was free) or aborted: the core may
+        // drop pend_fbr. Otherwise it holds and retries — never dropped.
+        fbr_writeback_ready = !fbr_writeback.valid || source_accepted[WB_FBR] ||
+            ((fbr_writeback.branch_mask & abort_mask_q) != '0);
+`endif
     end
 
     // ---- branch_writeback (split out to break the false load_writeback ->
@@ -134,6 +168,19 @@ module ooo_writeback_bus
     // aliases load_writeback. Value-identical.
     always_comb begin
         branch_writeback = '0;
+`ifdef FUSE_LDBR
+        any_alu_branch_resolving =
+            (alu0_writeback.valid && alu0_writeback.branch_valid &&
+                ((alu0_writeback.branch_mask & abort_mask_q) == '0)) ||
+            (alu1_writeback.valid && alu1_writeback.branch_valid &&
+                ((alu1_writeback.branch_mask & abort_mask_q) == '0))
+`ifdef ALU4
+            ||
+            (alu2_writeback.valid && alu2_writeback.branch_valid &&
+                ((alu2_writeback.branch_mask & abort_mask_q) == '0))
+`endif
+            ;
+`endif
         if (alu0_writeback.valid && alu0_writeback.branch_valid &&
                 ((alu0_writeback.branch_mask & abort_mask_q) == '0)) begin
             branch_writeback = alu0_writeback;
@@ -146,6 +193,18 @@ module ooo_writeback_bus
         if (alu2_writeback.valid && alu2_writeback.branch_valid &&
                 ((alu2_writeback.branch_mask & abort_mask_q) == '0)) begin
             branch_writeback = alu2_writeback;
+        end
+`endif
+`ifdef FUSE_LDBR
+        // Fused load->branch resolve (pend_fbr): drives the port ONLY in a
+        // cycle it actually seats on the bus (source_accepted implies the port
+        // is free via the source_valid gate above — completion+resolve+drain
+        // atomic), so it can never collide with an ALU branch resolve on
+        // branch_stack's single resolve port, and never double-resolves.
+        if (fbr_writeback.valid && fbr_writeback.branch_valid &&
+                ((fbr_writeback.branch_mask & abort_mask_q) == '0) &&
+                source_accepted[WB_FBR]) begin
+            branch_writeback = fbr_writeback;
         end
 `endif
     end

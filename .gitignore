@@ -16,6 +16,7 @@ vivado.xpr.bak.bak
 vivado.xpr.bak.bak.bak
 vivado.xpr.bak.bak.bak.bak
 vivado.xpr.bak.bak.bak.bak.bak
+.kimi-code/
 # Vivado OOC synth scratch (fpga/synth/*.sh write under output/synth)
 .Xil/
 vivado*.log
