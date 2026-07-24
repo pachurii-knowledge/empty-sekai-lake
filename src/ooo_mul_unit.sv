@@ -24,6 +24,13 @@ module ooo_mul_unit
     // targets may be reused by a younger instruction next cycle).
     input wire logic              flush,
     input wire logic              writeback_ready,
+`ifdef CSWHY
+    // CSWHY FU probe (instrumentation only).
+    input  wire logic             cswhy_probe_valid,
+    input  wire active_id_t       cswhy_probe_id,
+    output logic                  cswhy_fu_busy,
+    output logic                  cswhy_fu_wb,
+`endif
     output writeback_packet_t writeback
 );
 
@@ -168,5 +175,24 @@ module ooo_mul_unit
             default:  mul_select = product[2*XLEN-1:XLEN];   // MULH/MULHSU/MULHU
         endcase
     endfunction
+
+`ifdef CSWHY
+    // busy = the id is in a NON-final pipe stage; wb = it is at the output and the
+    // writeback bus has not accepted it.
+    always_comb begin
+        cswhy_fu_busy = 1'b0;
+        cswhy_fu_wb   = 1'b0;
+        if (cswhy_probe_valid) begin
+            for (int k = 0; k < MUL_LATENCY; k += 1) begin
+                if (valid_q[k] && (pipe_q[k].active_id == cswhy_probe_id)) begin
+                    if (k == MUL_LATENCY-1) begin
+                        if (!writeback_ready) cswhy_fu_wb = 1'b1;
+                        else                  cswhy_fu_busy = 1'b1;
+                    end else cswhy_fu_busy = 1'b1;
+                end
+            end
+        end
+    end
+`endif
 
 endmodule: ooo_mul_unit

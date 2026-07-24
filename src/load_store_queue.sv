@@ -155,6 +155,14 @@ module load_store_queue
     output logic [LSQ_ID_W-1:0]  load_spec_wake_id
 `endif
 `endif
+`ifdef CSWHY
+    ,
+    // CSWHY LSQ probe: the memory-side reason for the LSQ head, plus its identity so
+    // the core can admit these states ONLY when the LSQ head IS the ROB head.
+    output active_id_t            cswhy_lsq_head_id,
+    output logic                  cswhy_lsq_head_valid,
+    output logic [5:0]            cswhy_lsq_reason
+`endif
 );
     // P3-M0 head-blocking-reason codes.
     localparam logic [2:0] LSQ_HR_EMPTY     = 3'd0; // no valid entry at head (idle)
@@ -2473,9 +2481,22 @@ module load_store_queue
     // P3 L2a (MEASURE-FIRST, display-only): on a store-park cycle, would a younger
     // load forward from the parked HEAD store? Reads registered entries_q only (the
     // FB2b torn-read rule) and models the L2b stalls so FWD_FULL is not over-counted:
-    // device-PA (the store's captured store_lo_pa in the device hole < 0x8000_0000),
-    // single-word store/load, no intervening store between head and the load, and
-    // byte full-cover. Purely combinational -> optimized away in synthesis.
+    // device-PA (the store's captured store_lo_pa in the device hole), single-word
+    // store/load, no intervening store between head and the load, and byte
+    // full-cover. Purely combinational -> optimized away in synthesis.
+    //
+    // The device test is the SAME 3-range hole the core decodes everywhere else
+    // (cf. head_dev_load, xlate_ip_is_device, head_is_device). It previously read
+    // `store_lo_pa >= 0x8000_0000` ("RAM, not device"), which is NOT the device
+    // decode: tests/perf/bench.ld links .data at USER_DATA_START = 0x1000_0000
+    // (memory_segments.vh:49), so every RAM store in a perf/Embench/Dhrystone
+    // binary failed that gate and was demoted FULL -> PARTIAL. FWD_FULL was
+    // therefore zero BY CONSTRUCTION on every bench.ld-linked binary, and the
+    // "forwarding EV ~ 0" reading taken from it was a measurement artifact.
+    wire fwd_store_is_device =
+        ((headq.store_lo_pa >= XLEN'('h0200_0000)) && (headq.store_lo_pa < XLEN'('h0201_0000))) ||
+        ((headq.store_lo_pa >= XLEN'('h0C00_0000)) && (headq.store_lo_pa < XLEN'('h1000_0000))) ||
+        ((headq.store_lo_pa >= XLEN'('h0D00_0000)) && (headq.store_lo_pa < XLEN'('h0D00_1000)));
     logic                          fwd_found_load, fwd_intervening_store;
     logic [$clog2(MEM_Q_SIZE)-1:0] fwd_load_idx;
     logic [XLEN_BYTES-1:0]         fwd_load_full, fwd_load_mask;
@@ -2522,7 +2543,7 @@ module load_store_queue
                         ((fwd_load_mask & headq.store_mask) == '0)) begin
                     lsq_fwd_class = LSQ_FWD_NOMATCH;   // no byte overlap w/ head store
                 end else if (((fwd_load_mask & ~headq.store_mask) == '0) &&  // full-cover
-                        (headq.store_lo_pa >= XLEN'(64'h8000_0000)) &&        // RAM, not device
+                        !fwd_store_is_device &&                               // RAM, not device
                         (headq.store_mask_hi == '0) &&                        // store single-word
                         !needs_two_beats(entries_q[fwd_load_idx].entry.ctrl,
                                          entries_q[fwd_load_idx].addr) &&      // load single-word
@@ -2534,5 +2555,86 @@ module load_store_queue
             end
         end
     end
+
+
+`ifdef CSWHY
+    // ---- CSWHY memory-state ladder. A SEPARATE always_comb beside the existing
+    // lsq_head_reason ladder, reading the same head state. Differences from that
+    // ladder are deliberate and are the point of this instrument:
+    //   * M_SKEW is arm #1 -- on a skew cycle every downstream signal aims at head_q
+    //     while headq = entries_q[head_next_skip], so the reason would otherwise
+    //     describe a DIFFERENT instruction.
+    //   * M_ADDRWAIT / M_STDATA are split OUT of XLATE/OTHER: head_xlate_ok contains
+    //     xlate_ready_eff which contains mem_req_valid which contains addr_ready, so
+    //     operand wait is reported as "XLATE" today -- a dependence stall in a memory
+    //     costume.
+    //   * LOADWAIT is split into the head's OWN outstanding load vs someone else's
+    //     (M_MLPWAIT) -- the A5 contamination the existing ladder folds together.
+    assign cswhy_lsq_head_id    = headq.entry.active_id;
+    assign cswhy_lsq_head_valid = (count_q != '0) && headq.entry.valid;
+
+    always_comb begin
+        logic own_inflight, any_inflight;
+        own_inflight = 1'b0;
+`ifdef LSQ_MLP2
+        // Head-OWN predicate, verbatim from the issue-side head-own test: same slot,
+        // same generation. Do NOT guard on head_owns_port -- it contains !issued_load
+        // and so excludes exactly the head's own outstanding window.
+        for (int sl = 0; sl < LSQ_MLP; sl += 1) begin
+            if (inflight_valid_q[sl] && !inflight_kill_q[sl] &&
+                    (inflight_owner_q[sl] == head_next_skip) &&
+                    (inflight_gen_q[sl] == headq.entry.active_id)) own_inflight = 1'b1;
+        end
+        any_inflight = (inflight_count_q != '0);
+`else
+        own_inflight = mem_inflight_q;
+        any_inflight = mem_inflight_q;
+`endif
+        if (!cswhy_lsq_head_valid)                       cswhy_lsq_reason = M_MEMOTHER;
+        else if (!head_match)                            cswhy_lsq_reason = M_SKEW;
+        else if (head_retire)                            cswhy_lsq_reason = M_RETIRING;
+        else if (own_inflight)                           cswhy_lsq_reason = M_LOADWAIT;
+        else if (headq.entry.ctrl.memWrite && headq.issued_load)
+                                                         cswhy_lsq_reason = M_PARK;
+        else if ((headq.entry.ctrl.memRead || headq.entry.ctrl.memWrite) &&
+                 !headq.entry.src1_ready)                cswhy_lsq_reason = M_ADDRWAIT;
+        else if (headq.entry.ctrl.memWrite && !headq.entry.src2_ready)
+                                                         cswhy_lsq_reason = M_STDATA;
+        else if (head_xlate_flt)                         cswhy_lsq_reason = M_XFAULT;
+        else if (!head_xlate_ok && xlate_stall_eff)      cswhy_lsq_reason = M_XLATE_WALK;
+        else if (!head_xlate_ok)                         cswhy_lsq_reason = M_XLATE_REG;
+        else if (!dmem_req_ready)                        cswhy_lsq_reason = M_PORT;
+        else if (any_inflight)                           cswhy_lsq_reason = M_MLPWAIT;
+        // ---- M_MEMOTHER split. Everything past here is a head that is READY by every
+        // gate above (matched, not retiring, not inflight, not parked, operands ready,
+        // translated, no fault, port-ready) yet cswhy_head_done (the REGISTERED ROB done
+        // bit) is still 0. head_done here is the LSQ's COMBINATIONAL this-cycle verdict,
+        // which leads the registered ROB bit by one cycle -- so M_COMPLETING is the pure
+        // writeback->done register skew, the "done but not yet visible at commit" tax.
+        // GENUINE writeback->done skew: head_done AND a real completion witness
+        // (load_writeback.valid) -- the op produces its ROB writeback THIS cycle, so
+        // the registered done bit lands next cycle. Covers a load's response-complete,
+        // a store-complete probe, an SC resolve, and a two-beat store's high beat.
+        // The bare head_done at the load-ISSUE site (:1092) sets NO writeback (the load
+        // then round-trips ~8 cyc), so gating on load_writeback.valid is what keeps this
+        // bucket the 1-cycle skew it claims to be, instead of a load-launch bucket.
+        else if (head_done && load_writeback.valid)      cswhy_lsq_reason = M_COMPLETING;
+        // Load request-issue cycle: head fired (head_data_load_en) with no writeback --
+        // this is cycle 0 of the load's own memory wait (next cycle it is own_inflight
+        // -> M_LOADWAIT). Its own bucket so it never pollutes M_COMPLETING.
+        else if (head_data_load_en)                      cswhy_lsq_reason = M_LOADFIRE;
+        else if (double_store_pending_q)                 cswhy_lsq_reason = M_TWOBEAT;
+        // A store ready but NOT completing this cycle -> awaiting the in-order ROB
+        // commit handshake. (Expected small: a ready store usually completes its probe
+        // the same cycle -> M_COMPLETING -> next-cycle S_DONE. A near-zero here is a
+        // finding, not a bug -- the residual/reachable buckets report the truth.)
+        else if (headq.entry.ctrl.memWrite)              cswhy_lsq_reason = M_STWAIT;
+        // A load ready + port-free that did NOT fire (head_data_load_en already caught
+        // the firing case above) -- throttled by mlp_xt_head / registered head-translate
+        // consume / the LSQ_MLP count gate.
+        else if (headq.entry.ctrl.memRead)               cswhy_lsq_reason = M_LOADBLK;
+        else                                             cswhy_lsq_reason = M_MEMOTHER;
+    end
+`endif
 
 endmodule: load_store_queue

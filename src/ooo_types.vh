@@ -103,7 +103,15 @@ package OOO_Types;
 `else
     localparam int MEM_Q_SIZE = 16;
 `endif
-`ifdef BIG_BSTACK
+`ifdef BSTACK_SIZE
+    // Explicit checkpoint-depth override (-DBSTACK_SIZE=N, via make BSTACK=N). Takes
+    // precedence over BIG_BSTACK. Intended for the capacity-ceiling sweep: N=32 is the
+    // "effectively infinite" pool that bounds the whole checkpoint-capacity /
+    // stall-on-full lever class in one run. branch_mask_t and branch_id_t auto-widen
+    // from this, as do the per-checkpoint rename-map/RAS/GHR copies -- so a large N is
+    // functional-sim only (the abort_mask fanout + map-copy area scale with it).
+    localparam int BRANCH_STACK_SIZE = `BSTACK_SIZE;
+`elsif BIG_BSTACK
     localparam int BRANCH_STACK_SIZE = 8;   // P7 branch-checkpoint depth (doubles
                                             // branch_mask_t + the abort_mask fanout)
 `else
@@ -148,6 +156,182 @@ package OOO_Types;
     localparam int PHYS_REG_BITS = $clog2(PHYS_REGS);
     localparam int ACTIVE_ID_BITS = $clog2(ACTIVE_LIST_SIZE);
     localparam int BRANCH_ID_BITS = $clog2(BRANCH_STACK_SIZE);
+
+`ifdef DISPATCH_STATS
+    // Dispatch-stall / group-truncation reason codes (instrumentation only; no
+    // datapath effect). ooo_dispatch_control emits these at the exact point its
+    // combinational ladder fires, so they cannot drift from the logic the way a
+    // re-derived classifier in the core would.
+    //
+    // DCUT_*: why stop_prefix first went 0->1 this cycle, i.e. why the dispatch
+    // group was cut. Mirrors the ladder in ooo_dispatch_control.sv in order.
+    localparam logic [3:0] DCUT_BR_TERM   = 4'd0;  // a DISPATCHED branch ends the group
+    localparam logic [3:0] DCUT_2ND_BR    = 4'd1;  // 2nd branch in the group
+    localparam logic [3:0] DCUT_2ND_MEM   = 4'd2;  // 2nd memory op
+    localparam logic [3:0] DCUT_2ND_FP    = 4'd3;  // 2nd FP op
+    localparam logic [3:0] DCUT_FP_BUSY   = 4'd4;  // FP source/WAW FPR still busy
+    localparam logic [3:0] DCUT_FREELIST  = 4'd5;  // dest_seen >= free_list_available
+    localparam logic [3:0] DCUT_TERM_PREV = 4'd6;  // previous lane is terminal
+    localparam logic [3:0] DCUT_TERM_CUR  = 4'd7;  // this lane terminal, prefix dispatched
+    localparam logic [3:0] DCUT_SER_PREV  = 4'd8;  // previous lane serializing
+    localparam logic [3:0] DCUT_SER_CUR   = 4'd9;  // this lane serializing, prefix dispatched
+    localparam logic [3:0] DCUT_BSTACK    = 4'd10; // branch + branch stack full
+    localparam logic [3:0] DCUT_FUSE_BST  = 4'd11; // fused pre-branch + branch stack full
+    localparam logic [3:0] DCUT_NONE      = 4'd15;
+
+    // FF_*: which redirect arm won pc_next on a fetch_flush cycle. The redirect
+    // always_comb is a SEQUENTIAL-OVERRIDE chain (the commit-scan / trap / fence.i-hold
+    // arms overwrite the main ladder), so the LAST writer wins -- ff_src is assigned
+    // beside every `fetch_flush = 1'b1` and its final value is the arm that actually
+    // determined pc_next. Listed low->high priority.
+    localparam logic [3:0] FF_NONE        = 4'd0;
+    localparam logic [3:0] FF_REDIRECT    = 4'd1;  // branch recovery (mispredict/abort)
+    localparam logic [3:0] FF_RAS         = 4'd2;  // return-address-stack redirect
+    localparam logic [3:0] FF_PRED        = 4'd3;  // predictor-taken (TAGE/JAL) redirect
+    localparam logic [3:0] FF_UNPRED      = 4'd4;  // unpredicted JAL/JALR dispatched
+    localparam logic [3:0] FF_BTBMIS      = 4'd5;  // BTB steered wrong
+    localparam logic [3:0] FF_PARTIAL     = 4'd6;  // non-RVC partial-dispatch refetch
+    localparam logic [3:0] FF_FENCEI      = 4'd7;  // fence.i redirect
+    localparam logic [3:0] FF_SFENCE      = 4'd8;  // sfence.vma
+    localparam logic [3:0] FF_SATP        = 4'd9;  // satp write
+    localparam logic [3:0] FF_TRAP        = 4'd10; // trap / interrupt / mret / sret
+    localparam logic [3:0] FF_FENCEI_HOLD = 4'd11; // fence.i L1D-writeback hold
+    localparam logic [3:0] FF_OTHER       = 4'd15; // UNCLASSIFIED -- must stay 0
+
+
+    // DSTL_*: which structural term asserted dispatch_stall (the whole-group stall).
+    // DSTL_SUPPRESS is decomposed further by the core, which owns those 11 signals.
+    localparam logic [3:0] DSTL_SUPPRESS  = 4'd0;
+    localparam logic [3:0] DSTL_ROB_FULL  = 4'd1;
+    localparam logic [3:0] DSTL_IQ_FULL   = 4'd2;
+    localparam logic [3:0] DSTL_MEMQ_FULL = 4'd3;
+    localparam logic [3:0] DSTL_BSTACK    = 4'd4;  // branch + stack full (any lane, first cut)
+    localparam logic [3:0] DSTL_NONE      = 4'd15;
+`endif
+
+`ifdef CSWHY
+    // ================= CSWHY: why is the ROB head not retiring? =================
+    // Two-axis (CLASS x STATE) decomposition of commit_starved_backend, binned per
+    // existing cs arm. Every code is emitted by the module that OWNS the fact (the
+    // DSTAT_CUT / ff_src rule) -- the core performs zero classification.
+    // spec: plans/cslat-decomposition-spec.md
+    localparam int CSWHY_NCLASS = 17;
+    localparam int CSWHY_NSTATE = 34;
+
+    // ---- CLASS axis. State classes FIRST: C_UNWRITTEN reads instr==0, so decoding
+    // before the state test would mis-bill it.
+    localparam logic [5:0] C_NOHEAD    = 6'd0;  // no live head entry
+    localparam logic [5:0] C_UNWRITTEN = 6'd1;  // slot reserved, payload write deferred D->Q
+    localparam logic [5:0] C_ABORTED   = 6'd2;  // valid but squashed this cycle (zeroing deferred)
+    localparam logic [5:0] C_ZERO      = 6'd3;  // live head with instr==0 -- ALARM, predicted 0
+    localparam logic [5:0] C_LOAD      = 6'd4;
+    localparam logic [5:0] C_FLOAD     = 6'd5;
+    localparam logic [5:0] C_STORE     = 6'd6;
+    localparam logic [5:0] C_FSTORE    = 6'd7;
+    localparam logic [5:0] C_ATOMIC    = 6'd8;
+    localparam logic [5:0] C_BRANCH    = 6'd9;
+    localparam logic [5:0] C_JUMP      = 6'd10;
+    localparam logic [5:0] C_MUL       = 6'd11;
+    localparam logic [5:0] C_DIV       = 6'd12;
+    localparam logic [5:0] C_FP        = 6'd13;
+    localparam logic [5:0] C_SER       = 6'd14; // SYSTEM / MISC-MEM
+    localparam logic [5:0] C_ALU       = 6'd15;
+    localparam logic [5:0] C_UNKNOWN   = 6'd16; // REACHABLE catch-all; nonzero is a finding
+
+    // ---- STATE axis, non-memory. S_SELECT MUST outrank the IQ arms: the IQ clears a
+    // slot only in entries_sel, so entries_wake still claims it on the select cycle.
+    localparam logic [5:0] S_NA        = 6'd0;  // class in {NOHEAD,UNWRITTEN,ABORTED}
+    localparam logic [5:0] S_DONE      = 6'd1;  // done, awaiting the present/commit stage
+    localparam logic [5:0] S_SELECT    = 6'd2;  // picked by the IQ this cycle
+    localparam logic [5:0] S_ALU_EXEC  = 6'd3;
+    localparam logic [5:0] S_MUL_EXEC  = 6'd4;
+    localparam logic [5:0] S_DIV_EXEC  = 6'd5;
+    localparam logic [5:0] S_FP_EXEC   = 6'd6;
+    localparam logic [5:0] S_FU_WB     = 6'd7;  // result at an FU output, WB bus not accepting
+    localparam logic [5:0] S_IQ_PICK   = 6'd8;  // in IQ, READY, not picked = issue contention
+    localparam logic [5:0] S_IQ_OPWAIT = 6'd9;  // in IQ, NOT ready = TRUE operand wait
+    // The ALU REGISTERS its writeback (ooo_alu_pipe.sv:196-203) unlike mul/div, so the
+    // cycle its WB flop drives the bus has no other claimant -- the ALU-side analogue of
+    // M_DRAINED. Without this it falls to S_NOWHERE (measured 38% of qsort).
+    localparam logic [5:0] S_ALU_WB    = 6'd10;
+    localparam logic [5:0] S_NOWHERE   = 6'd11; // REACHABLE catch-all
+    // ---- STATE axis, memory. Admitted ONLY when the LSQ head IS the ROB head.
+    localparam logic [5:0] M_SKEW      = 6'd16; // arm #1: headq aims at a different entry
+    localparam logic [5:0] M_RETIRING  = 6'd17;
+    localparam logic [5:0] M_ADDRWAIT  = 6'd18; // NOT memory -- operand wait in a memory costume
+    localparam logic [5:0] M_STDATA    = 6'd19; // NOT memory -- store-data operand wait
+    localparam logic [5:0] M_PARK      = 6'd20; // completed store parked (expect ~0 at the ROB head)
+    localparam logic [5:0] M_LOADWAIT  = 6'd21; // head's OWN outstanding load
+    localparam logic [5:0] M_MLPWAIT   = 6'd22; // someone ELSE's outstanding load (the A5 contamination)
+    localparam logic [5:0] M_XLATE_WALK= 6'd23; // PTW (provably 0 in bare mode)
+    localparam logic [5:0] M_XLATE_REG = 6'd24; // the FB2b registered-translate stage
+    localparam logic [5:0] M_PORT      = 6'd25; // L1D accept port busy
+    localparam logic [5:0] M_XFAULT    = 6'd26;
+    localparam logic [5:0] M_MEMOTHER  = 6'd27; // REACHABLE catch-all (now residual after the split)
+    localparam logic [5:0] M_DRAINED   = 6'd28; // memory class but already popped the LSQ (legal)
+    // M_MEMOTHER split (2026-07-23): the head is ready by every gate but the REGISTERED
+    // ROB done bit is 0. These distinguish the causes that were lumped as MEMOTHER (29%).
+    localparam logic [5:0] M_COMPLETING= 6'd29; // LSQ head_done=1 THIS cycle: writeback->done register skew
+    localparam logic [5:0] M_STWAIT    = 6'd30; // store ready, awaiting the in-order ROB commit handshake
+    localparam logic [5:0] M_LOADBLK   = 6'd31; // load ready + port-free but did not fire (MLP/translate throttle)
+    localparam logic [5:0] M_TWOBEAT   = 6'd32; // 2nd beat of a two-beat store in flight
+    localparam logic [5:0] M_LOADFIRE  = 6'd33; // load request-issue cycle (cycle 0 of its memory wait)
+
+    // ---- ARM: which existing cs bucket. The existing 3-way ladder is FOLLOWED, not
+    // modified. NOTE the ARM_LAT guard contains !active_full, which is CAUSED by the
+    // stalls being measured, so cycles migrate LAT->WINDOW: ALWAYS report the
+    // arm-summed cell, never ARM_LAT alone.
+    localparam logic [1:0] ARM_GATED  = 2'd0;
+    localparam logic [1:0] ARM_WINDOW = 2'd1;
+    localparam logic [1:0] ARM_LAT    = 2'd2;
+
+    // ONE pure opcode decoder, so a head-side and any future retire-side histogram can
+    // never disagree. Decodes the architectural 32-bit word the ROB stored.
+    function automatic logic [4:0] cswhy_class_for(input logic [31:0] instr);
+        logic [6:0] op; logic [6:0] f7; logic [2:0] f3;
+        op = instr[6:0]; f7 = instr[31:25]; f3 = instr[14:12];
+        // Opcode BEFORE is_store: is_store = ctrl.memWrite, which SC and RMW AMO both
+        // set and LR sets neither -- keying on it mis-bills every atomic.
+        case (op)
+            7'h03: cswhy_class_for = C_LOAD;
+            7'h07: cswhy_class_for = C_FLOAD;
+            7'h23: cswhy_class_for = C_STORE;
+            7'h27: cswhy_class_for = C_FSTORE;
+            7'h2F: cswhy_class_for = C_ATOMIC;
+            7'h63: cswhy_class_for = C_BRANCH;
+            7'h67, 7'h6F: cswhy_class_for = C_JUMP;
+            7'h33, 7'h3B: cswhy_class_for = (f7 == 7'd1) ? (f3[2] ? C_DIV : C_MUL) : C_ALU;
+            7'h53, 7'h43, 7'h47, 7'h4B, 7'h4F: cswhy_class_for = C_FP;
+            7'h73, 7'h0F: cswhy_class_for = C_SER;
+            7'h13, 7'h1B, 7'h37, 7'h17: cswhy_class_for = C_ALU;
+            default: cswhy_class_for = C_UNKNOWN;
+        endcase
+    endfunction
+
+    // XC-CLASS side B: does rename's ROUTING verdict (captured at dispatch) agree with
+    // the architectural opcode the ROB stored? Different decoder, different time,
+    // different path -- so this is NOT a tautology. Returns 1 when consistent.
+    // NOTE exec_class is EXEC_INT for ALU *and* MUL/DIV, so this checks the
+    // mem / cf / fp / amo / ser boundaries, not the mul-vs-div split.
+    function automatic logic cswhy_xclass_ok(
+            input logic [4:0] cls, input logic is_mem_r, input logic is_mem_w,
+            input logic [2:0] xclass, input logic [2:0] pcsrc);
+        case (cls)
+            C_LOAD, C_FLOAD:   cswhy_xclass_ok = is_mem_r;
+            C_STORE, C_FSTORE: cswhy_xclass_ok = is_mem_w;
+            C_ATOMIC:          cswhy_xclass_ok = (xclass == 3'(EXEC_AMO));
+            C_BRANCH:          cswhy_xclass_ok = (pcsrc == 3'(PC_cond));
+            C_JUMP:            cswhy_xclass_ok = (pcsrc == 3'(PC_uncond)) ||
+                                                 (pcsrc == 3'(PC_indirect));
+            C_FP:              cswhy_xclass_ok = (xclass == 3'(EXEC_FP));
+            C_SER:             cswhy_xclass_ok = (xclass == 3'(EXEC_CSR)) ||
+                                                 (xclass == 3'(EXEC_FENCE));
+            C_ALU, C_MUL, C_DIV: cswhy_xclass_ok = !is_mem_r && !is_mem_w &&
+                                                 (pcsrc != 3'(PC_cond));
+            default:           cswhy_xclass_ok = 1'b1;   // state classes: not checkable
+        endcase
+    endfunction
+`endif
 
 `ifdef FUSE_ANY
     // Fusion-kind encoding for a detected pair (shared-infra §1); the master's

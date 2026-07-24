@@ -55,6 +55,17 @@ module active_list
     output logic [OOO_WIDTH-1:0]  commit_valid,
     output commit_packet_t        commit_packet [OOO_WIDTH],
     output logic [OOO_WIDTH-1:0]  free_valid,
+`ifdef CSWHY
+    // CSWHY head probe (instrumentation only; combinational reads of registered state,
+    // writes only these debug outputs => structurally acyclic, no datapath fan-in).
+    output active_id_t            cswhy_head_id,
+    output logic                  cswhy_head_present,
+    output logic [5:0]            cswhy_head_class,
+    output logic                  cswhy_head_done,
+    output logic                  cswhy_head_pending,
+    output logic                  cswhy_head_xclass_ok,
+    output logic [$clog2(ACTIVE_LIST_SIZE+1)-1:0] cswhy_head_count,
+`endif
     output phys_reg_t             free_prd [OOO_WIDTH]
 );
 
@@ -120,6 +131,12 @@ module active_list
         logic is_sc;          // M4-S5b: store-conditional (memWrite + EXEC_AMO + AMO_SC)
         logic is_amo;         // M4 #3: RMW atomic (EXEC_AMO, amo_op not LR/SC)
         branch_mask_t branch_mask;
+`ifdef CSWHY
+        logic       cswhy_mem_r;    // ctrl.memRead   captured at dispatch (XC-CLASS side B)
+        logic       cswhy_mem_w;    // ctrl.memWrite
+        logic [2:0] cswhy_xclass;   // ctrl.exec_class
+        logic [2:0] cswhy_pcsrc;    // ctrl.pc_source
+`endif
     } active_entry_t;
 
     typedef logic [$clog2(ACTIVE_LIST_SIZE+1)-1:0] active_count_t;
@@ -700,6 +717,18 @@ module active_list
             if (allocate_valid_q[i] &&
                     ((allocate_packet_q[i].branch_mask & abort_mask) == '0)) begin
                 entries_next[allocate_packet_q[i].active_id].valid = 1'b1;
+`ifdef CSWHY
+                // XC-CLASS side B: rename's ROUTING verdict, captured at dispatch.
+                // Gated => the OFF-build packet/entry width is byte-identical.
+                entries_next[allocate_packet_q[i].active_id].cswhy_mem_r =
+                    allocate_packet_q[i].ctrl.memRead;
+                entries_next[allocate_packet_q[i].active_id].cswhy_mem_w =
+                    allocate_packet_q[i].ctrl.memWrite;
+                entries_next[allocate_packet_q[i].active_id].cswhy_xclass =
+                    3'(allocate_packet_q[i].ctrl.exec_class);
+                entries_next[allocate_packet_q[i].active_id].cswhy_pcsrc =
+                    3'(allocate_packet_q[i].ctrl.pc_source);
+`endif
 `ifdef FUSE_ANY
                 // Born-done fusion slave (shared-infra §4a): the folded op keeps a
                 // ROB slot but retires in order with no writeback.
@@ -940,5 +969,47 @@ module active_list
     end
 `endif
 `endif /* COMMIT_1STAGE */
+
+`ifdef CSWHY
+    // ---- CSWHY head probe. A SEPARATE always_comb (do NOT extend block C1 / the
+    // SKIP+PRESENT block -- that split exists to break false UNOPTFLAT loops). Reads
+    // only registered state + the already-computed sq_valid/inflight_mask; writes only
+    // debug outputs, so it adds no datapath fan-in.
+    always_comb begin
+        active_id_t    hidx;
+        active_count_t hcnt;
+`ifdef COMMIT_1STAGE
+        // The index the present ladder itself uses.
+        hidx = head_postskip;
+        hcnt = count_postskip;
+`else
+        // R2: commit_valid_q(N) describes head_q(N), and count_next = count_after_skip
+        // so count_q is ALREADY post-skip. head_postskip/count_postskip do not even
+        // exist in this build (declared inside `ifdef COMMIT_1STAGE), and base_head is
+        // head_NEXT -- using it would describe the wrong instruction.
+        hidx = head_q;
+        hcnt = count_q;
+`endif
+        cswhy_head_id      = hidx;
+        cswhy_head_count   = hcnt;
+        cswhy_head_present = (hcnt != '0);
+        cswhy_head_done    = cswhy_head_present && sq_valid[hidx] && entries_q[hidx].done;
+        cswhy_head_pending = cswhy_head_present && sq_valid[hidx] && !entries_q[hidx].done;
+
+        // State classes BEFORE the opcode decode: C_UNWRITTEN reads instr==0 because
+        // its payload write is deferred D->Q, so decoding first would mis-bill it.
+        if (!cswhy_head_present)                          cswhy_head_class = C_NOHEAD;
+        else if (!sq_valid[hidx] && inflight_mask[hidx])  cswhy_head_class = C_UNWRITTEN;
+        else if (!sq_valid[hidx])                         cswhy_head_class = C_ABORTED;
+        else if (entries_q[hidx].instr == 32'd0)          cswhy_head_class = C_ZERO;
+        else cswhy_head_class = cswhy_class_for(entries_q[hidx].instr);
+
+        // XC-CLASS: fresh opcode decode vs rename's dispatch-time routing verdict.
+        cswhy_head_xclass_ok = !cswhy_head_present || !sq_valid[hidx] ||
+            cswhy_xclass_ok(cswhy_head_class,
+                            entries_q[hidx].cswhy_mem_r, entries_q[hidx].cswhy_mem_w,
+                            entries_q[hidx].cswhy_xclass, entries_q[hidx].cswhy_pcsrc);
+    end
+`endif
 
 endmodule: active_list

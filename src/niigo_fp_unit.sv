@@ -28,6 +28,12 @@ module niigo_fp_unit
     // active-list id after the pipeline is reset.
     input wire logic              flush,
     input wire logic              writeback_ready,
+`ifdef CSWHY
+    input  wire logic             cswhy_probe_valid,
+    input  wire active_id_t       cswhy_probe_id,
+    output logic                  cswhy_fu_busy,
+    output logic                  cswhy_fu_wb,
+`endif
     output writeback_packet_t writeback
 );
 
@@ -454,5 +460,19 @@ module niigo_fp_unit
         packet.fp_fflags = {status.NV, status.DZ, status.OF, status.UF, status.NX};
         return packet;
     endfunction
+
+`ifdef CSWHY
+    // MANDATORY: gate on req_valid_q. req_entry_q is NEVER cleared (only req_valid_q
+    // is), so an ungated probe aliases a recycled active_id.
+    always_comb begin
+        cswhy_fu_busy = 1'b0;
+        cswhy_fu_wb   = 1'b0;
+        if (cswhy_probe_valid && req_valid_q &&
+                (req_entry_q.active_id == cswhy_probe_id)) cswhy_fu_busy = 1'b1;
+        if (cswhy_probe_valid && fpnew_buffer_valid_q &&
+                (fpnew_buffer_tag_q.active_id == cswhy_probe_id) && !writeback_ready)
+            cswhy_fu_wb = 1'b1;
+    end
+`endif
 
 endmodule: niigo_fp_unit

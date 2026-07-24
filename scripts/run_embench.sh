@@ -90,6 +90,10 @@ for NAME in "${BENCHES[@]}"; do
     "$RUN/$NAME.elf" "$RUN/mem.data.bin" 2>/dev/null || : > "$RUN/mem.data.bin"
   : > "$RUN/mem.ktext.bin"; : > "$RUN/mem.kdata.bin"
   ARGS=(+perf_out=perf.txt); [ -n "${MAXCYC:-}" ] && ARGS+=(+maxcyc="$MAXCYC")
+  # PLUSARGS: extra whitespace-separated Vtop plusargs, e.g.
+  #   PLUSARGS='+mem_fuzz +mem_min=16 +mem_max=16'   (honest-miss backing-memory model)
+  # Keep it IDENTICAL across the two labels of an A/B or the comparison is meaningless.
+  [ -n "${PLUSARGS:-}" ] && ARGS+=(${PLUSARGS})
   ( cd "$RUN" && "$VTOP" "${ARGS[@]}" ) > "$RUN/sim.log" 2>&1 || echo "  ($NAME Vtop exit $?)"
 
   VER=$(grep -oP 'EMBENCH-VERIFY: \K\w+'  "$RUN/sim.log" 2>/dev/null || echo "NONE")

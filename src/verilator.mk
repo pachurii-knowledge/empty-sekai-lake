@@ -283,6 +283,27 @@ endif
 # cs_window (head stalled AND ROB full = small-window bound), cs_latency (head stalled but
 # window has room = ILP/dependency/FU-latency). Diagnostic-only, no datapath effect,
 # sim-only (SIMULATION_18447). OOO only. Answers "is commit-starvation a small-window symptom?"
+# DISPATCH_STATS=1 (-DDISPATCH_STATS): decompose dispatch_hist[0] (zero-dispatch cycles)
+# into mutually exclusive reasons, and measure group truncation (partial dispatch groups).
+# Today `dispatch_stall` is ONE bit ORing ~15 causes and `stop_prefix` truncation is
+# uncounted, so 44.2% of Dhrystone cycles dispatch nothing with no attribution. The reason
+# codes are emitted BY ooo_dispatch_control at the point its ladder fires (not re-derived
+# in the core), and perf_out carries a dstat_zero_residual self-check that must be 0.
+# Counters only -- no datapath effect; default OFF is bit-identical. OOO only.
+ifeq ($(DISPATCH_STATS),1)
+	VERILATOR_CFLAGS += -DDISPATCH_STATS
+endif
+
+# CSWHY=1 (-DCSWHY): two-axis (class x state) decomposition of commit_starved_backend --
+# WHY the ROB head is not retiring. cs_latency is 51.2% of Dhrystone cycles and is one
+# undifferentiated bucket today. Every reason code is emitted by the module that owns the
+# fact (active_list / int_issue_queue / mul / div / fp / LSQ); the core classifies nothing.
+# Counters only, no datapath effect; OFF is bit-identical. Implies ROBHEAD_STATS.
+# spec: plans/cslat-decomposition-spec.md
+ifeq ($(CSWHY),1)
+	VERILATOR_CFLAGS += -DCSWHY -DROBHEAD_STATS
+endif
+
 ifeq ($(ROBHEAD_STATS),1)
 	VERILATOR_CFLAGS += -DROBHEAD_STATS
 endif
@@ -322,6 +343,16 @@ endif
 # abort_mask broadcast fanout + per-checkpoint rename-map copy (FB2b routed-WNS net).
 ifeq ($(BIG_BSTACK),1)
 	VERILATOR_CFLAGS += -DBIG_BSTACK
+endif
+
+# BSTACK=<N> (-DBSTACK_SIZE=N): explicit branch-checkpoint depth, overriding BIG_BSTACK.
+# For the capacity-ceiling sweep -- BSTACK=32 is the "effectively infinite" pool that
+# bounds the whole checkpoint-capacity + stall-on-full lever class in a single run
+# (plans/branch-frontend-research-2026-07.md). Unset = the BIG_BSTACK/default path,
+# bit-identical. Large N is functional-sim only: the abort_mask broadcast fanout and the
+# per-checkpoint rename-map/RAS/GHR copies both scale linearly with N.
+ifneq ($(BSTACK),)
+	VERILATOR_CFLAGS += -DBSTACK_SIZE=$(BSTACK)
 endif
 
 # FP_OOO=1 de-serializes floating-point ops (plans/ooo-perf.md P5b): drops the

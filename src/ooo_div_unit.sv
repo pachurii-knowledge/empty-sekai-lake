@@ -27,6 +27,12 @@ module ooo_div_unit
     // writeback lands on a reused active-list id after the pipeline is reset.
     input wire logic              flush,
     input wire logic              writeback_ready,
+`ifdef CSWHY
+    input  wire logic             cswhy_probe_valid,
+    input  wire active_id_t       cswhy_probe_id,
+    output logic                  cswhy_fu_busy,
+    output logic                  cswhy_fu_wb,
+`endif
     output writeback_packet_t writeback
 );
 
@@ -288,5 +294,19 @@ module ooo_div_unit
             (~remainder[XLEN-1:0] + 1'b1) : remainder[XLEN-1:0];
         final_result = is_rem_op(op) ? signed_remainder : signed_quotient;
     endfunction
+
+`ifdef CSWHY
+    always_comb begin
+        cswhy_fu_busy = 1'b0;
+        cswhy_fu_wb   = 1'b0;
+        if (cswhy_probe_valid && packet_q.valid &&
+                (packet_q.active_id == cswhy_probe_id)) begin
+            if (state_q == DIV_DONE) begin
+                if (!writeback_ready) cswhy_fu_wb = 1'b1;
+                else                  cswhy_fu_busy = 1'b1;
+            end else if (state_q != DIV_IDLE) cswhy_fu_busy = 1'b1;
+        end
+    end
+`endif
 
 endmodule: ooo_div_unit

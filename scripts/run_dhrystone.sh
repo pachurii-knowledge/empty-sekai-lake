@@ -93,7 +93,9 @@ for RUNS in "${RUNS_LIST[@]}"; do
     "$RUN/dhrystone.elf" "$RUN/mem.data.bin" 2>/dev/null || : > "$RUN/mem.data.bin"
   : > "$RUN/mem.ktext.bin"; : > "$RUN/mem.kdata.bin"
 
-  ( cd "$RUN" && "$VTOP" +perf_out=perf.txt ) > "$RUN/sim.log" 2>&1 \
+  # PLUSARGS: extra whitespace-separated Vtop plusargs (e.g. '+mem_fuzz +mem_min=16 +mem_max=16').
+  # Must be IDENTICAL across both labels of an A/B.
+  ( cd "$RUN" && "$VTOP" +perf_out=perf.txt ${PLUSARGS:-} ) > "$RUN/sim.log" 2>&1 \
     || echo "  (Vtop exit $?)"
 
   CHECK=$(grep -oP 'DHRY-CHECK: \K\w+'          "$RUN/sim.log" 2>/dev/null || echo "NONE")

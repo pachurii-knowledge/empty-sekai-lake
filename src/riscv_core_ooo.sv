@@ -241,6 +241,9 @@ module riscv_core_ooo
     logic [4:0]   fgrp_fault_cause;
     // Control strobes computed in the main combinational block.
     logic         fetch_flush;     // kill all outstanding + buffered fetches
+`ifdef DISPATCH_STATS
+    logic [3:0]   ff_src;          // stats only: which redirect arm won this flush
+`endif
     logic         fetch_consume;   // pop the presented group
     logic         fetch_issue;     // issue a fetch for pc_q this cycle
     logic         fresp_take;      // a response arrives (pops metadata)
@@ -477,6 +480,12 @@ module riscv_core_ooo
     logic [OOO_WIDTH-1:0] alloc_req;
     logic [OOO_WIDTH-1:0] map_has_dest;
     logic dispatch_stall;
+`ifdef DISPATCH_STATS
+    logic       dstat_cut_valid;
+    logic [3:0] dstat_cut_reason;
+    logic [$clog2(OOO_WIDTH+1)-1:0] dstat_cut_idx;
+    logic [3:0] dstat_stall_reason;
+`endif
     logic [2:0] dispatch_count;
     logic [2:0] valid_count;
     logic [2:0] lane_active_offset [OOO_WIDTH];
@@ -1721,10 +1730,21 @@ module riscv_core_ooo
             wfi_wait_q || commit_take_trap || fencei_block || predict_stall ||
             fflags_drain_stall),
         .dispatch_valid,
+`ifdef DISPATCH_STATS
+        .dstat_cut_valid,
+        .dstat_cut_reason,
+        .dstat_cut_idx,
+        .dstat_stall_reason,
+`endif
         .dispatch_stall
     );
 
     active_list ActiveList (
+`ifdef CSWHY
+        .cswhy_head_id, .cswhy_head_present, .cswhy_head_class,
+        .cswhy_head_done, .cswhy_head_pending, .cswhy_head_xclass_ok,
+        .cswhy_head_count,
+`endif
         .clk,
         .rst_l,
         .restore_valid(branch_restore_valid),
@@ -1759,6 +1779,10 @@ module riscv_core_ooo
     );
 
     int_issue_queue IntIssueQueue (
+`ifdef CSWHY
+        .cswhy_probe_valid, .cswhy_probe_id(cswhy_head_id),
+        .cswhy_iq_present, .cswhy_iq_ready, .cswhy_iq_picked, .cswhy_iq_multi,
+`endif
         .clk,
         .rst_l,
         .insert_valid(int_insert_valid),
@@ -1965,6 +1989,10 @@ module riscv_core_ooo
 `endif
 
     ooo_mul_unit MulUnit (
+`ifdef CSWHY
+        .cswhy_probe_valid, .cswhy_probe_id(cswhy_head_id),
+        .cswhy_fu_busy(cswhy_mul_busy), .cswhy_fu_wb(cswhy_mul_wb),
+`endif
         .clk,
         .rst_l,
         .issue_valid(int_issue_valid[ISSUE_MUL]),
@@ -1980,6 +2008,10 @@ module riscv_core_ooo
     );
 
     ooo_div_unit DivUnit (
+`ifdef CSWHY
+        .cswhy_probe_valid, .cswhy_probe_id(cswhy_head_id),
+        .cswhy_fu_busy(cswhy_div_busy), .cswhy_fu_wb(cswhy_div_wb),
+`endif
         .clk,
         .rst_l,
         .issue_valid(int_issue_valid[ISSUE_DIV]),
@@ -1995,6 +2027,10 @@ module riscv_core_ooo
     );
 
     niigo_fp_unit FpUnit (
+`ifdef CSWHY
+        .cswhy_probe_valid, .cswhy_probe_id(cswhy_head_id),
+        .cswhy_fu_busy(cswhy_fp_busy), .cswhy_fu_wb(cswhy_fp_wb),
+`endif
         .clk,
         .rst_l,
         .issue_valid(int_issue_valid[ISSUE_FP]),
@@ -2082,6 +2118,9 @@ module riscv_core_ooo
 `endif
 
     load_store_queue #(.COHERENT(COHERENT)) LoadStoreQueue (
+`ifdef CSWHY
+        .cswhy_lsq_head_id, .cswhy_lsq_head_valid, .cswhy_lsq_reason,
+`endif
         .clk,
         .rst_l,
         .insert_valid(mem_insert_valid),
@@ -3476,6 +3515,13 @@ module riscv_core_ooo
 
         pc_next = pc_q;
         fetch_flush = 1'b0;
+`ifdef DISPATCH_STATS
+        // Last-writer-wins: the redirect chain below is sequential-override, so whichever
+        // arm assigns ff_src last is the one that actually determined pc_next. FF_OTHER
+        // catches a fetch_flush raised by a site this instrumentation does not know about
+        // -- it is a REACHABLE catch-all, so a nonzero ff_other means a missed setter.
+        ff_src = FF_OTHER;
+`endif
         fetch_consume = 1'b0;
         fetch_issue = 1'b0;
         ifetch_inval = 1'b0;
@@ -3524,6 +3570,9 @@ module riscv_core_ooo
             // Branch recovery: every outstanding/buffered fetch is wrong-path.
             pc_next = redirect_pc;
             fetch_flush = 1'b1;
+            `ifdef DISPATCH_STATS
+            ff_src = FF_REDIRECT;
+            `endif
         end else begin
             // Group consumption and dispatch-time prediction redirects. Gated
             // on !dispatch_stall (zero lanes dispatch under a stall, so the
@@ -3540,13 +3589,22 @@ module riscv_core_ooo
                 if (ras_redirect_valid) begin
                     pc_next = ras_redirect_pc;
                     fetch_flush = 1'b1;
+                    `ifdef DISPATCH_STATS
+                    ff_src = FF_RAS;
+                    `endif
                 end else if (predictor_redirect_valid && !btb_suppress) begin
                     pc_next = predictor_redirect_pc;
                     fetch_flush = 1'b1;
+                    `ifdef DISPATCH_STATS
+                    ff_src = FF_PRED;
+                    `endif
                 end else if (dispatched_unpredicted_control) begin
                     // Unpredicted JAL/JALR dispatched: younger fetches are
                     // dead; pc holds until the control transfer resolves.
                     fetch_flush = 1'b1;
+                    `ifdef DISPATCH_STATS
+                    ff_src = FF_UNPRED;
+                    `endif
 `ifdef BTB
                 end else if (btb_mis_steer) begin
                     // BTB steered wrong: flush the wrongly steered target stream and
@@ -3554,6 +3612,9 @@ module riscv_core_ooo
                     // terminator, or base+16 / base+14 for an aliased/stale steer).
                     pc_next = btb_mis_recover_pc;
                     fetch_flush = 1'b1;
+                    `ifdef DISPATCH_STATS
+                    ff_src = FF_BTBMIS;
+                    `endif
 `endif
 `ifdef RVC
                 end else begin
@@ -3576,6 +3637,9 @@ module riscv_core_ooo
                     // first undispatched instruction.
                     pc_next = decode_lanes[2'(dispatch_count)].pc;
                     fetch_flush = 1'b1;
+                    `ifdef DISPATCH_STATS
+                    ff_src = FF_PARTIAL;
+                    `endif
                     fetch_consume = 1'b1;
                 end else if (fgrp_valid) begin
                     // Fully dispatched (or no decodable lanes): pop it.
@@ -3653,6 +3717,9 @@ module riscv_core_ooo
 `else
                     pc_next = active_commit_packet[i].pc + 32'd4;
                     fetch_flush = 1'b1;
+                    `ifdef DISPATCH_STATS
+                    ff_src = FF_FENCEI;
+                    `endif
                     // Flash-invalidate the L1I so the refetch past this fence.i
                     // sees instruction memory as modified by prior stores. The
                     // refetch is naturally >= 1 cycle later (redirect to pc+4),
@@ -3671,6 +3738,9 @@ module riscv_core_ooo
                     tlb_flush = 1'b1;
                     pc_next = active_commit_packet[i].pc + 32'd4;
                     fetch_flush = 1'b1;
+                    `ifdef DISPATCH_STATS
+                    ff_src = FF_SFENCE;
+                    `endif
                 end
                 // A satp write switches address space; flush both TLBs and
                 // refetch pc+4 so younger fetches re-translate, without needing a
@@ -3682,6 +3752,9 @@ module riscv_core_ooo
                     tlb_flush = 1'b1;
                     pc_next = active_commit_packet[i].pc + 32'd4;
                     fetch_flush = 1'b1;
+                    `ifdef DISPATCH_STATS
+                    ff_src = FF_SATP;
+                    `endif
                 end
             end
         end
@@ -3694,6 +3767,9 @@ module riscv_core_ooo
         if (commit_take_trap || commit_take_int || commit_take_ret) begin
             pc_next = trap_redirect_pc;
             fetch_flush = 1'b1;
+            `ifdef DISPATCH_STATS
+            ff_src = FF_TRAP;
+            `endif
         end
 
 `ifdef NIIGO_DSIDE_WB
@@ -3704,6 +3780,9 @@ module riscv_core_ooo
         // to the instruction after the fence.i.
         if (fencei_pending_q) begin
             fetch_flush = 1'b1;
+            `ifdef DISPATCH_STATS
+            ff_src = FF_FENCEI_HOLD;
+            `endif
             if (dcache_flush_done) begin
                 pc_next = fencei_pc_q;
                 ifetch_inval = 1'b1;
@@ -4041,8 +4120,102 @@ module riscv_core_ooo
     logic [63:0] perf_cs_window;   // head NOT done AND ROB full -> can't dispatch behind it = SMALL WINDOW
     logic [63:0] perf_cs_latency;  // head NOT done AND ROB has room -> head waiting on its op/deps (ILP / FU latency)
 `endif
+
+`ifdef CSWHY
+    // ---- CSWHY probe wires (all driven by the module that OWNS the fact) ----
+    active_id_t  cswhy_head_id;
+    logic        cswhy_head_present, cswhy_head_done, cswhy_head_pending, cswhy_head_xclass_ok;
+    logic [5:0]  cswhy_head_class;
+    logic        cswhy_iq_present, cswhy_iq_ready, cswhy_iq_picked, cswhy_iq_multi;
+    logic        cswhy_mul_busy, cswhy_mul_wb, cswhy_div_busy, cswhy_div_wb;
+    logic        cswhy_fp_busy,  cswhy_fp_wb;
+    active_id_t  cswhy_lsq_head_id;
+    logic        cswhy_lsq_head_valid;
+    logic [5:0]  cswhy_lsq_reason;
+    logic [$clog2(ACTIVE_LIST_SIZE+1)-1:0] cswhy_head_count;
+    // ALU S2: the head is in an ALU execute stage. The issue bus is the core's own
+    // fact, so this one term is legitimately computed here.
+    logic        cswhy_alu_s2_head;
+    // The ALU REGISTERS its writeback (ooo_alu_pipe.sv:196-203), unlike mul/div which
+    // drive combinationally off the last pipe stage. So there is one cycle where the
+    // head's result is on the bus but: its IQ slot was freed at select, alu_issue_valid_q
+    // is already 0, and entries_q.done is not set until NEXT cycle. Nothing claimed it.
+    logic        cswhy_alu_wb_head;
+    // XC-2: the LSQ head must be an in-flight ROB entry, never OLDER than the ROB
+    // head. Ring distance from the ROB head must be inside the live window. The
+    // YOUNGER direction is legal (a load pops the LSQ on its writeback cycle while
+    // the ROB done write is still in entries_next) and shows up as M_DRAINED.
+    logic        cswhy_lsq_in_window;
+    always_comb begin
+        cswhy_alu_s2_head = 1'b0;
+        for (int p = 0; p < ALU_ISSUE_PORTS; p += 1) begin
+            if (alu_issue_valid_q[p] &&
+                    (alu_issue_entry_q[p].active_id == cswhy_head_id))
+                cswhy_alu_s2_head = 1'b1;
+        end
+        cswhy_alu_wb_head = cswhy_probe_valid &&
+            ((alu0_writeback.valid && (alu0_writeback.active_id == cswhy_head_id)) ||
+             (alu1_writeback.valid && (alu1_writeback.active_id == cswhy_head_id))
+`ifdef ALU4
+             || (alu2_writeback.valid && (alu2_writeback.active_id == cswhy_head_id))
+`endif
+            );
+        cswhy_lsq_in_window =
+            ({1'b0, ACTIVE_ID_BITS'(cswhy_lsq_head_id - cswhy_head_id)} <
+             {1'b0, cswhy_head_count});
+    end
+    // The probe is only meaningful when there IS a live head entry.
+    wire         cswhy_probe_valid = cswhy_head_present;
+`endif
+`ifdef CSWHY
+    // The histogram: [arm][class][state]. Printed nonzero-only with an RTL-emitted
+    // legend so the dump keys cannot drift from the enum.
+    logic [63:0] cswhy_cell [3][CSWHY_NCLASS][CSWHY_NSTATE];
+    logic [63:0] cswhy_visits [CSWHY_NCLASS];
+    logic [63:0] cswhy_depart_retire, cswhy_depart_other;
+    logic [63:0] cswhy_xc_class, cswhy_xc_multi, cswhy_xc_mem_outside, cswhy_xc_pending_bad;
+    // Visit tracking closes at DEPARTURE on the REGISTERED class, with explicit
+    // present rise/fall so drain-to-empty -> refill-at-the-same-index is caught.
+    logic        cswhy_seen_q, cswhy_retired_q;
+    active_id_t  cswhy_hid_q;
+    logic [4:0]  cswhy_hcls_q;
+`endif
     logic [63:0] perf_retire_hist [OOO_WIDTH+1];
     logic [63:0] perf_dispatch_hist [OOO_WIDTH+1];
+`ifdef DISPATCH_STATS
+    // Decompose dispatch_hist[0] (zero-dispatch cycles) into mutually exclusive
+    // reasons. INVARIANT, checked at end of sim: sum(all buckets below) ==
+    // dispatch_hist_0. `ds_*` = dispatch_stall asserted (whole-group stall);
+    // `dn_*` = NOT stalled yet nothing dispatched (frontend starve / lane-0 cut).
+    logic [63:0] perf_ds_redirect, perf_ds_trap, perf_ds_bstack_late, perf_ds_wfi;
+    logic [63:0] perf_ds_irqdrain, perf_ds_terminal, perf_ds_control, perf_ds_serial;
+    logic [63:0] perf_ds_fencei, perf_ds_predict, perf_ds_fflags, perf_ds_supp_other;
+    logic [63:0] perf_ds_robfull, perf_ds_iqfull, perf_ds_memqfull, perf_ds_bstack;
+    logic [63:0] perf_ds_other, perf_ds_supp_shadowed;
+    logic [63:0] perf_dn_nolanes, perf_dn_other;
+    logic [63:0] perf_dn_cut [16];   // zero-dispatch, no stall, by DCUT_* code
+    // Group truncation: partial groups (1..W-1 dispatched) -- the width that is
+    // silently lost today. lost = popcount(lane_valid & ~dispatch_valid).
+    logic [63:0] perf_dt_cut [16];               // by DCUT_* code
+    logic [63:0] perf_dt_lost [OOO_WIDTH+1];     // cycles by #lanes lost
+    logic [63:0] perf_dt_slots;                  // total lost dispatch slots
+    // Fetch-flush accounting. ff[] partitions the flush CYCLES by winning redirect arm;
+    // The decision metric is ff_dead + ff_hold (NOT ff_dead alone):
+    // ff_dead[] charges each flush the FRONTEND-STARVED
+    // cycles that follow it (zero dispatch, no backend stall, no valid lanes), i.e. the
+    // refetch bubble it actually cost; ff_hold[] charges the cycles where the flush's OWN
+    // recovery suppress term (control_pending/fencei/serial/predict_stall) held dispatch
+    // with no queue full. Only genuine backend pressure (a full queue) is uncharged. sum(ff_dead) <= dn_nolanes, and the difference is
+    // frontend starvation NOT caused by a flush (cold miss, fetch-credit, xlate).
+    logic [63:0] perf_ff [16];
+    logic [63:0] perf_ff_dead [16];
+    logic [63:0] perf_ff_hold [16];
+    logic [63:0] perf_ff_total;
+    logic [63:0] perf_btb_suppress;   // predictor redirects the BTB already steered (no flush)
+    logic [63:0] perf_pred_raw;       // raw predictor_redirect_valid events
+    logic        perf_ffp_valid;      // a flush is awaiting frontend recovery
+    logic [3:0]  perf_ffp_src;        // ...and which arm caused it
+`endif
     logic [63:0] perf_compressed_retired;     // RVC (16-bit) instructions retired
     logic [63:0] perf_l1i_miss_cnt, perf_l1d_miss_cnt, perf_l1d_wb_cnt;
     logic [63:0] perf_load_lat_sum, perf_load_lat_count;  // avg load accept->resp latency
@@ -4127,6 +4300,38 @@ module riscv_core_ooo
                 perf_retire_hist[i] = 64'b0;
                 perf_dispatch_hist[i] = 64'b0;
             end
+`ifdef CSWHY
+            for (int a = 0; a < 3; a += 1)
+                for (int c = 0; c < CSWHY_NCLASS; c += 1)
+                    for (int st = 0; st < CSWHY_NSTATE; st += 1) cswhy_cell[a][c][st] = 64'b0;
+            for (int c = 0; c < CSWHY_NCLASS; c += 1) cswhy_visits[c] = 64'b0;
+            cswhy_depart_retire = 64'b0; cswhy_depart_other = 64'b0;
+            cswhy_xc_class = 64'b0; cswhy_xc_multi = 64'b0;
+            cswhy_xc_mem_outside = 64'b0; cswhy_xc_pending_bad = 64'b0;
+            cswhy_seen_q = 1'b0; cswhy_retired_q = 1'b0;
+            cswhy_hid_q = '0; cswhy_hcls_q = C_NOHEAD;
+`endif
+`ifdef DISPATCH_STATS
+            perf_ds_redirect = 64'b0; perf_ds_trap     = 64'b0; perf_ds_bstack_late = 64'b0;
+            perf_ds_wfi      = 64'b0; perf_ds_irqdrain = 64'b0; perf_ds_terminal = 64'b0;
+            perf_ds_control  = 64'b0; perf_ds_serial   = 64'b0; perf_ds_fencei = 64'b0;
+            perf_ds_predict  = 64'b0; perf_ds_fflags   = 64'b0; perf_ds_supp_other = 64'b0;
+            perf_ds_robfull  = 64'b0; perf_ds_iqfull   = 64'b0; perf_ds_memqfull = 64'b0;
+            perf_ds_bstack   = 64'b0; perf_ds_other    = 64'b0; perf_ds_supp_shadowed = 64'b0;
+            perf_dn_nolanes  = 64'b0; perf_dn_other    = 64'b0; perf_dt_slots  = 64'b0;
+            for (int i = 0; i < 16; i += 1) begin
+                perf_dn_cut[i] = 64'b0;
+                perf_dt_cut[i] = 64'b0;
+            end
+            for (int i = 0; i <= OOO_WIDTH; i += 1) perf_dt_lost[i] = 64'b0;
+            for (int i = 0; i < 16; i += 1) begin
+                perf_ff[i] = 64'b0;
+                perf_ff_dead[i] = 64'b0;
+                perf_ff_hold[i] = 64'b0;
+            end
+            perf_ff_total = 64'b0; perf_btb_suppress = 64'b0; perf_pred_raw = 64'b0;
+            perf_ffp_valid = 1'b0; perf_ffp_src = FF_NONE;
+`endif
             for (int i = 0; i < PERF_STALL_BUCKETS; i += 1) begin
                 perf_stall_instr[i] = 64'b0;
             end
@@ -4226,8 +4431,89 @@ module riscv_core_ooo
                     else if (active_full)       perf_cs_window  = perf_cs_window  + 64'd1; // head stalled + ROB full
                     else                        perf_cs_latency = perf_cs_latency + 64'd1; // head stalled, window has room
 `endif
+`ifdef CSWHY
+                    // ---- CSWHY bin. The 3-way ladder above is FOLLOWED, not modified.
+                    // The core performs ZERO classification: every term below is a
+                    // reason bit emitted by the module that owns the fact.
+                    begin
+                        logic [1:0] cswhy_arm;
+                        logic [5:0] cswhy_state;
+                        logic       is_mem_c, lsq_is_head;
+                        cswhy_arm = active_commit_valid[0] ? ARM_GATED :
+                                    (active_full ? ARM_WINDOW : ARM_LAT);
+                        is_mem_c = (cswhy_head_class == C_LOAD)  || (cswhy_head_class == C_FLOAD) ||
+                                   (cswhy_head_class == C_STORE) || (cswhy_head_class == C_FSTORE) ||
+                                   (cswhy_head_class == C_ATOMIC);
+                        // Memory states are admitted ONLY when the LSQ head IS the ROB
+                        // head -- they are different queues with independent pointers.
+                        lsq_is_head = cswhy_lsq_head_valid && (cswhy_lsq_head_id == cswhy_head_id);
+
+                        if ((cswhy_head_class == C_NOHEAD) || (cswhy_head_class == C_UNWRITTEN) ||
+                                (cswhy_head_class == C_ABORTED))          cswhy_state = S_NA;
+                        else if (cswhy_head_done)                          cswhy_state = S_DONE;
+                        // S_SELECT MUST outrank the IQ arms: the IQ clears a slot only
+                        // in entries_sel, so entries_wake still claims it on the select
+                        // cycle and the cycle would be mis-billed as IQ residency.
+                        else if (cswhy_iq_picked)                          cswhy_state = S_SELECT;
+                        else if (is_mem_c && lsq_is_head)                  cswhy_state = cswhy_lsq_reason;
+                        else if (is_mem_c)                                 cswhy_state = M_DRAINED;
+                        else if (cswhy_alu_s2_head)                        cswhy_state = S_ALU_EXEC;
+                        else if (cswhy_alu_wb_head)                        cswhy_state = S_ALU_WB;
+                        else if (cswhy_mul_wb || cswhy_div_wb || cswhy_fp_wb) cswhy_state = S_FU_WB;
+                        else if (cswhy_mul_busy)                           cswhy_state = S_MUL_EXEC;
+                        else if (cswhy_div_busy)                           cswhy_state = S_DIV_EXEC;
+                        else if (cswhy_fp_busy)                            cswhy_state = S_FP_EXEC;
+                        else if (cswhy_iq_present && cswhy_iq_ready)       cswhy_state = S_IQ_PICK;
+                        else if (cswhy_iq_present)                         cswhy_state = S_IQ_OPWAIT;
+                        else                                               cswhy_state = S_NOWHERE;
+
+                        cswhy_cell[cswhy_arm][cswhy_head_class][cswhy_state] =
+                            cswhy_cell[cswhy_arm][cswhy_head_class][cswhy_state] + 64'd1;
+
+                        // ---- cross-checks (counted, NEVER used as guards: as a guard
+                        // XC-1 would structurally kill C_NOHEAD/C_UNWRITTEN/S_DONE).
+                        if (!cswhy_head_xclass_ok) cswhy_xc_class = cswhy_xc_class + 64'd1;
+                        if (cswhy_iq_multi) cswhy_xc_multi = cswhy_xc_multi + 64'd1;
+                        else begin
+                            logic [3:0] claims;
+                            // The IQ still claims the slot on the select cycle, so it is
+                            // excluded when the select term fires (else multi != 0 by
+                            // construction).
+                            claims = 4'(cswhy_iq_present && !cswhy_iq_picked) +
+                                     4'(cswhy_alu_s2_head) + 4'(cswhy_alu_wb_head) +
+                                     4'(cswhy_mul_busy || cswhy_mul_wb) +
+                                     4'(cswhy_div_busy || cswhy_div_wb) +
+                                     4'(cswhy_fp_busy || cswhy_fp_wb) + 4'(lsq_is_head);
+                            if (claims > 4'd1) cswhy_xc_multi = cswhy_xc_multi + 64'd1;
+                        end
+                        if (cswhy_lsq_head_valid && !lsq_is_head &&
+                                !cswhy_lsq_in_window) cswhy_xc_mem_outside = cswhy_xc_mem_outside + 64'd1;
+                        if ((cswhy_arm == ARM_LAT) && !cswhy_head_pending)
+                            cswhy_xc_pending_bad = cswhy_xc_pending_bad + 64'd1;
+                    end
+`endif
                 end
             end
+`ifdef CSWHY
+            // ---- visit accounting: closes at DEPARTURE on the REGISTERED class, with
+            // explicit present rise/fall so a drain-to-empty then refill at the same
+            // index is not silently merged into one visit.
+            if (cswhy_seen_q && (!cswhy_head_present || (cswhy_head_id != cswhy_hid_q))) begin
+                cswhy_visits[cswhy_hcls_q] = cswhy_visits[cswhy_hcls_q] + 64'd1;
+                // Departure is observed the cycle AFTER the retire, so the cause is the
+                // twice-registered retire flag.
+                // head_postskip is PRE-pop, so a retire at N advances the head at N+1 and
+                // the departure edge is seen at N+1 -- the cause is retire(N), which is
+                // exactly cswhy_retired_q here (this read precedes its update below).
+                // Using the twice-registered flag misfiled every ISOLATED retire.
+                if (cswhy_retired_q) cswhy_depart_retire = cswhy_depart_retire + 64'd1;
+                else                  cswhy_depart_other  = cswhy_depart_other  + 64'd1;
+            end
+            cswhy_seen_q     = cswhy_head_present;
+            cswhy_hid_q      = cswhy_head_id;
+            cswhy_hcls_q     = cswhy_head_class;
+            cswhy_retired_q  = (retire_count != 3'd0);
+`endif
             begin
                 logic [2:0] dcnt;
                 dcnt = 3'd0;
@@ -4235,6 +4521,116 @@ module riscv_core_ooo
                     if (dispatch_valid[i]) dcnt = dcnt + 3'd1;
                 end
                 perf_dispatch_hist[dcnt] = perf_dispatch_hist[dcnt] + 64'd1;
+`ifdef DISPATCH_STATS
+                begin
+                    logic [2:0] lost_c;
+                    logic       any_valid_c;
+                    lost_c = 3'd0; any_valid_c = 1'b0;
+                    for (int i = 0; i < OOO_WIDTH; i += 1) begin
+                        if (lane_valid[i]) begin
+                            any_valid_c = 1'b1;
+                            if (!dispatch_valid[i]) lost_c = lost_c + 3'd1;
+                        end
+                    end
+
+                    if (dcnt == 3'd0) begin
+                        if (dispatch_stall) begin
+                            // Whole-group stall. dstat_stall_reason gives the structural
+                            // term; DSTL_SUPPRESS is decomposed here in the OR order of
+                            // the suppress_dispatch expression at the instantiation.
+                            case (dstat_stall_reason)
+                            DSTL_ROB_FULL:  perf_ds_robfull  = perf_ds_robfull  + 64'd1;
+                            DSTL_IQ_FULL:   perf_ds_iqfull   = perf_ds_iqfull   + 64'd1;
+                            DSTL_MEMQ_FULL: perf_ds_memqfull = perf_ds_memqfull + 64'd1;
+                            DSTL_BSTACK:    perf_ds_bstack   = perf_ds_bstack   + 64'd1;
+                            // Stall asserted by a branch-stack arm firing on a lane that
+                            // an EARLIER cut had already killed -- the branch stack was
+                            // not the real cause (that lane could not dispatch anyway).
+                            // The true cause is dstat_cut_reason; kept as its own bucket
+                            // so sum(ds_*) == dispatch_stall_cycles still holds exactly.
+                            DSTL_NONE:      perf_ds_bstack_late = perf_ds_bstack_late + 64'd1;
+                            DSTL_SUPPRESS: begin
+                                // Deliberate severity priority (machine-recovering first),
+                                // NOT the textual OR order of suppress_dispatch -- the
+                                // terms co-assert, so the order picks which one is blamed.
+                                // halted_q is absent on purpose: this whole block is gated
+                                // on !halted_q, so halt cycles are not measured at all.
+                                if      (redirect_valid)     perf_ds_redirect = perf_ds_redirect + 64'd1;
+                                else if (commit_take_trap)   perf_ds_trap     = perf_ds_trap     + 64'd1;
+                                else if (wfi_wait_q)         perf_ds_wfi      = perf_ds_wfi      + 64'd1;
+                                else if (irq_drain_q)        perf_ds_irqdrain = perf_ds_irqdrain + 64'd1;
+                                else if (terminal_pending_q) perf_ds_terminal = perf_ds_terminal + 64'd1;
+                                else if (control_pending_q)  perf_ds_control  = perf_ds_control  + 64'd1;
+                                else if (serial_pending_q)   perf_ds_serial   = perf_ds_serial   + 64'd1;
+                                else if (fencei_block)       perf_ds_fencei   = perf_ds_fencei   + 64'd1;
+                                else if (predict_stall)      perf_ds_predict  = perf_ds_predict  + 64'd1;
+                                else if (fflags_drain_stall) perf_ds_fflags   = perf_ds_fflags   + 64'd1;
+                                else                         perf_ds_supp_other = perf_ds_supp_other + 64'd1;
+                                // Co-occurrence: a suppress term got the credit, but a
+                                // structural queue was ALSO full, so removing the suppress
+                                // cause alone would NOT have converted this cycle. Without
+                                // this the ds_* split reads as more recoverable than it is.
+                                if (active_full || int_iq_full || mem_queue_full)
+                                    perf_ds_supp_shadowed = perf_ds_supp_shadowed + 64'd1;
+                            end
+                            default:        perf_ds_other    = perf_ds_other    + 64'd1;
+                            endcase
+                        end else if (!any_valid_c) begin
+                            // Frontend delivered nothing -- NOT backend pressure.
+                            perf_dn_nolanes = perf_dn_nolanes + 64'd1;
+                        end else if (dstat_cut_valid) begin
+                            // Valid lanes present but stop_prefix cut at/before the
+                            // first one, so the group produced nothing.
+                            perf_dn_cut[dstat_cut_reason] = perf_dn_cut[dstat_cut_reason] + 64'd1;
+                        end else begin
+                            perf_dn_other = perf_dn_other + 64'd1;
+                        end
+                    end else if (lost_c != 3'd0) begin
+                        // Partial group: some lanes went, some valid lanes were cut.
+                        perf_dt_lost[lost_c] = perf_dt_lost[lost_c] + 64'd1;
+                        perf_dt_slots = perf_dt_slots + 64'(lost_c);
+                        if (dstat_cut_valid)
+                            perf_dt_cut[dstat_cut_reason] = perf_dt_cut[dstat_cut_reason] + 64'd1;
+                    end
+
+                    // ---- fetch-flush accounting (shares any_valid_c / dcnt above) ----
+                    if (predictor_redirect_valid) perf_pred_raw = perf_pred_raw + 64'd1;
+                    if (btb_suppress)             perf_btb_suppress = perf_btb_suppress + 64'd1;
+                    if (fetch_flush) begin
+                        perf_ff[ff_src] = perf_ff[ff_src] + 64'd1;
+                        perf_ff_total   = perf_ff_total + 64'd1;
+                        // (Re-)arm the bubble charge against the NEWEST flush: a later
+                        // redirect supersedes an older one's refetch.
+                        perf_ffp_valid  = 1'b1;
+                        perf_ffp_src    = ff_src;
+                    end else if (perf_ffp_valid) begin
+                        if (dcnt != 3'd0) begin
+                            perf_ffp_valid = 1'b0;      // frontend recovered; stop charging
+                        end else if (!dispatch_stall && !any_valid_c) begin
+                            // Zero dispatch, backend willing, no instructions delivered:
+                            // this cycle is the refetch bubble of that flush.
+                            perf_ff_dead[perf_ffp_src] = perf_ff_dead[perf_ffp_src] + 64'd1;
+                        end else if (dispatch_stall && !active_full && !int_iq_full &&
+                                     !mem_queue_full) begin
+                            // `dispatch_stall` is NOT a clean "backend's fault" guard: it
+                            // CONTAINS the suppress terms a flush arm itself raises. The
+                            // worst case is FF_UNPRED -- dispatched_unpredicted_control
+                            // raises the flush AND sets control_pending_q, which is a
+                            // suppress term, so the whole JALR freeze is dispatch_stall=1
+                            // and ff_dead charges it NOTHING; then the freeze always exits
+                            // via a forced mispredict (ooo_alu_pipe.sv:481-484 hardcodes
+                            // branch_mispredict_for=1 for unpredicted PC_uncond/PC_indirect)
+                            // which re-arms to FF_REDIRECT and bills it the whole bubble.
+                            // So: when the machine is held by a SUPPRESS term and no
+                            // structural queue is full, charge the flush a HOLD cycle.
+                            // (Same sole-cause shape as perf_ps_sole.)
+                            perf_ff_hold[perf_ffp_src] = perf_ff_hold[perf_ffp_src] + 64'd1;
+                        end
+                        // else: a structural queue is full -- genuinely backend pressure,
+                        // the cycle was lost regardless of the flush. Stay armed.
+                    end
+                end
+`endif
             end
 
             // Average cacheable-load latency (accept -> response); one load is
@@ -4544,6 +4940,126 @@ module riscv_core_ooo
                     $fdisplay(pfd, "retire_hist_%0d=%0d", i, perf_retire_hist[i]);
                 for (int i = 0; i <= OOO_WIDTH; i += 1)
                     $fdisplay(pfd, "dispatch_hist_%0d=%0d", i, perf_dispatch_hist[i]);
+`ifdef DISPATCH_STATS
+                $fdisplay(pfd, "ds_redirect=%0d", perf_ds_redirect);
+                $fdisplay(pfd, "ds_trap=%0d", perf_ds_trap);
+                $fdisplay(pfd, "ds_bstack_late=%0d", perf_ds_bstack_late);
+                $fdisplay(pfd, "ds_wfi=%0d", perf_ds_wfi);
+                $fdisplay(pfd, "ds_irqdrain=%0d", perf_ds_irqdrain);
+                $fdisplay(pfd, "ds_terminal=%0d", perf_ds_terminal);
+                $fdisplay(pfd, "ds_control=%0d", perf_ds_control);
+                $fdisplay(pfd, "ds_serial=%0d", perf_ds_serial);
+                $fdisplay(pfd, "ds_fencei=%0d", perf_ds_fencei);
+                $fdisplay(pfd, "ds_predict=%0d", perf_ds_predict);
+                $fdisplay(pfd, "ds_fflags=%0d", perf_ds_fflags);
+                $fdisplay(pfd, "ds_supp_other=%0d", perf_ds_supp_other);
+                $fdisplay(pfd, "ds_robfull=%0d", perf_ds_robfull);
+                $fdisplay(pfd, "ds_iqfull=%0d", perf_ds_iqfull);
+                $fdisplay(pfd, "ds_memqfull=%0d", perf_ds_memqfull);
+                $fdisplay(pfd, "ds_bstack=%0d", perf_ds_bstack);
+                $fdisplay(pfd, "ds_other=%0d", perf_ds_other);
+                $fdisplay(pfd, "ds_supp_shadowed=%0d", perf_ds_supp_shadowed);
+                $fdisplay(pfd, "dn_nolanes=%0d", perf_dn_nolanes);
+                $fdisplay(pfd, "dn_other=%0d", perf_dn_other);
+                for (int i = 0; i < 16; i += 1)
+                    if (perf_dn_cut[i] != 64'd0)
+                        $fdisplay(pfd, "dn_cut_%0d=%0d", i, perf_dn_cut[i]);
+                for (int i = 0; i < 16; i += 1)
+                    if (perf_dt_cut[i] != 64'd0)
+                        $fdisplay(pfd, "dt_cut_%0d=%0d", i, perf_dt_cut[i]);
+                for (int i = 0; i <= OOO_WIDTH; i += 1)
+                    $fdisplay(pfd, "dt_lost_%0d=%0d", i, perf_dt_lost[i]);
+                $fdisplay(pfd, "dt_slots=%0d", perf_dt_slots);
+`ifdef CSWHY
+                // RTL-emitted legend so the dump keys can never drift from the enum.
+                $fdisplay(pfd, "cswhy_classes=NOHEAD,UNWRITTEN,ABORTED,ZERO,LOAD,FLOAD,STORE,FSTORE,ATOMIC,BRANCH,JUMP,MUL,DIV,FP,SER,ALU,UNKNOWN");
+                $fdisplay(pfd, "cswhy_states=NA,DONE,SELECT,ALUEXEC,MULEXEC,DIVEXEC,FPEXEC,FUWB,IQPICK,IQOPWAIT,ALUWB,NOWHERE,-,-,-,-,SKEW,RETIRING,ADDRWAIT,STDATA,PARK,LOADWAIT,MLPWAIT,XLATEWALK,XLATEREG,PORT,XFAULT,MEMOTHER,DRAINED,COMPLETING,STWAIT,LOADBLK,TWOBEAT,LOADFIRE");
+                $fdisplay(pfd, "cswhy_arms=GATED,WINDOW,LAT");
+                for (int a = 0; a < 3; a += 1)
+                    for (int c = 0; c < CSWHY_NCLASS; c += 1)
+                        for (int st = 0; st < CSWHY_NSTATE; st += 1)
+                            if (cswhy_cell[a][c][st] != 64'd0)
+                                $fdisplay(pfd, "cswhy_%0d_%0d_%0d=%0d", a, c, st, cswhy_cell[a][c][st]);
+                for (int c = 0; c < CSWHY_NCLASS; c += 1)
+                    if (cswhy_visits[c] != 64'd0)
+                        $fdisplay(pfd, "cswhy_visits_%0d=%0d", c, cswhy_visits[c]);
+                $fdisplay(pfd, "cswhy_depart_retire=%0d", cswhy_depart_retire);
+                $fdisplay(pfd, "cswhy_depart_other=%0d", cswhy_depart_other);
+                // Cross-checks. XC-CLASS and XC-2 compare DIFFERENT modules'
+                // derivations, so they are not tautologies; all must be 0.
+                $fdisplay(pfd, "cswhy_xc_class=%0d", cswhy_xc_class);
+                $fdisplay(pfd, "cswhy_xc_multi=%0d", cswhy_xc_multi);
+                $fdisplay(pfd, "cswhy_xc_mem_outside=%0d", cswhy_xc_mem_outside);
+                $fdisplay(pfd, "cswhy_xc_pending_bad=%0d", cswhy_xc_pending_bad);
+                // XC-3: head-pointer edge count vs the commit unit's own retire
+                // histogram -- different blocks, neither derived from the other.
+                $fdisplay(pfd, "cswhy_xc3_lhs=%0d", cswhy_depart_retire);
+                $fdisplay(pfd, "cswhy_xc3_rhs=%0d", perf_cycle_counter - perf_retire_hist[0]);
+`endif
+                // Fetch-flush by winning redirect arm: ff_<code> = flush cycles,
+                // ffdead_<code> = frontend-starved cycles charged to it (the real cost).
+                for (int i = 0; i < 16; i += 1)
+                    if (perf_ff[i] != 64'd0) $fdisplay(pfd, "ff_%0d=%0d", i, perf_ff[i]);
+                for (int i = 0; i < 16; i += 1)
+                    if (perf_ff_dead[i] != 64'd0) $fdisplay(pfd, "ffdead_%0d=%0d", i, perf_ff_dead[i]);
+                for (int i = 0; i < 16; i += 1)
+                    if (perf_ff_hold[i] != 64'd0) $fdisplay(pfd, "ffhold_%0d=%0d", i, perf_ff_hold[i]);
+                for (int i = 0; i < 16; i += 1)
+                    if ((perf_ff_dead[i] + perf_ff_hold[i]) != 64'd0)
+                        $fdisplay(pfd, "ffcost_%0d=%0d", i, perf_ff_dead[i] + perf_ff_hold[i]);
+                $fdisplay(pfd, "ff_total=%0d", perf_ff_total);
+                $fdisplay(pfd, "ff_other=%0d", perf_ff[FF_OTHER]);
+                $fdisplay(pfd, "btb_suppress_cnt=%0d", perf_btb_suppress);
+                $fdisplay(pfd, "pred_redirect_raw=%0d", perf_pred_raw);
+                begin
+                    logic [63:0] fsum, fdsum, fhsum;
+                    fsum = 64'd0; fdsum = 64'd0; fhsum = 64'd0;
+                    for (int i = 0; i < 16; i += 1) begin
+                        fsum  = fsum  + perf_ff[i];
+                        fdsum = fdsum + perf_ff_dead[i];
+                        fhsum = fhsum + perf_ff_hold[i];
+                    end
+                    // ff_other MUST be 0 (a nonzero value means a fetch_flush site this
+                    // instrumentation does not know about -- a REACHABLE catch-all, unlike
+                    // dstat_zero_residual). ffdead_sum must not exceed dn_nolanes.
+                    $fdisplay(pfd, "ff_sum=%0d", fsum);
+                    $fdisplay(pfd, "ffdead_sum=%0d", fdsum);
+                    $fdisplay(pfd, "ffhold_sum=%0d", fhsum);
+                    $fdisplay(pfd, "ffcost_sum=%0d", fdsum + fhsum);
+                    $fdisplay(pfd, "ffdead_vs_nolanes=%0d", perf_dn_nolanes - fdsum);
+                end
+                // Self-checks. NOTE: dstat_zero_residual alone is a TAUTOLOGY -- the
+                // ladder has catch-alls on every arm, so it sums to dispatch_hist_0 by
+                // construction and can never flag a misattribution. The load-bearing
+                // check is dstat_stall_residual, which compares sum(ds_*) against
+                // perf_dispatch_stall_cycles -- a counter incremented independently
+                // from the raw dispatch_stall signal. Both must be 0.
+                begin
+                    logic [63:0] ssum;
+                    ssum = perf_ds_redirect + perf_ds_trap + perf_ds_bstack_late
+                         + perf_ds_wfi + perf_ds_irqdrain + perf_ds_terminal
+                         + perf_ds_control + perf_ds_serial + perf_ds_fencei
+                         + perf_ds_predict + perf_ds_fflags + perf_ds_supp_other
+                         + perf_ds_robfull + perf_ds_iqfull + perf_ds_memqfull
+                         + perf_ds_bstack + perf_ds_other;
+                    $fdisplay(pfd, "dstat_stall_sum=%0d", ssum);
+                    $fdisplay(pfd, "dstat_stall_residual=%0d",
+                              perf_dispatch_stall_cycles - ssum);
+                end
+                begin
+                    logic [63:0] zsum;
+                    zsum = perf_ds_redirect + perf_ds_trap + perf_ds_bstack_late + perf_ds_wfi
+                         + perf_ds_irqdrain + perf_ds_terminal + perf_ds_control
+                         + perf_ds_serial + perf_ds_fencei + perf_ds_predict
+                         + perf_ds_fflags + perf_ds_supp_other + perf_ds_robfull
+                         + perf_ds_iqfull + perf_ds_memqfull + perf_ds_bstack
+                         + perf_ds_other + perf_dn_nolanes + perf_dn_other;
+                    for (int i = 0; i < 16; i += 1) zsum = zsum + perf_dn_cut[i];
+                    $fdisplay(pfd, "dstat_zero_sum=%0d", zsum);
+                    $fdisplay(pfd, "dstat_zero_residual=%0d",
+                              perf_dispatch_hist[0] - zsum);
+                end
+`endif
                 // P3-M0: LSQ head-blocking reason histogram (0 empty, 1 ready,
                 // 2 loadwait, 3 storepark, 4 xlate, 5 memport, 6 other).
                 for (int i = 0; i < 7; i += 1)

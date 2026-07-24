@@ -25,6 +25,18 @@ module int_issue_queue
     // every queued instruction (all are younger than the trapping instruction).
     input wire logic                 flush,
     output logic                 full,
+`ifdef CSWHY
+    // CSWHY IQ probe: is the ROB head resident here, ready, and picked? Reads
+    // entries_wake (post squash+wakeup) -- NOT entries_q (would miss this cycle's
+    // wakeup => S_IQ_PICK mis-billed as S_IQ_OPWAIT) and NOT entries_sel (post-select
+    // => would delete the select cycle). Instrumentation only.
+    input  wire logic            cswhy_probe_valid,
+    input  wire active_id_t      cswhy_probe_id,
+    output logic                 cswhy_iq_present,
+    output logic                 cswhy_iq_ready,
+    output logic                 cswhy_iq_picked,
+    output logic                 cswhy_iq_multi,
+`endif
     output logic [FU_ISSUE_PORTS-1:0] issue_valid,
     output issue_entry_t         issue_entry [FU_ISSUE_PORTS]
 `ifdef LOAD_SPEC_WAKE
@@ -700,5 +712,32 @@ module int_issue_queue
 `endif
         end
     end
+
+`ifdef CSWHY
+    // CSWHY IQ residency/readiness probe. Emitted beside the logic that computes
+    // sel_rdy and the picks -- these are the IQ's own facts (rule 1).
+    always_comb begin
+        cswhy_iq_present = 1'b0;
+        cswhy_iq_ready   = 1'b0;
+        cswhy_iq_picked  = 1'b0;
+        cswhy_iq_multi   = 1'b0;
+        if (cswhy_probe_valid) begin
+            for (int i = 0; i < INT_IQ_SIZE; i += 1) begin
+                if (entries_wake[i].valid && (entries_wake[i].active_id == cswhy_probe_id)) begin
+                    if (cswhy_iq_present) cswhy_iq_multi = 1'b1;  // same id twice = alias bug
+                    cswhy_iq_present = 1'b1;
+                    if (sel_rdy[i]) cswhy_iq_ready = 1'b1;
+                    // "picked" = selected by ANY port this cycle. alu_taken is the
+                    // running union of the ALU picks; the long-latency picks are
+                    // separate indices.
+                    if (alu_taken[i]) cswhy_iq_picked = 1'b1;
+                    if (issue_valid[ISSUE_MUL] && (mul_idx == iq_idx_t'(i))) cswhy_iq_picked = 1'b1;
+                    if (issue_valid[ISSUE_DIV] && (div_idx == iq_idx_t'(i))) cswhy_iq_picked = 1'b1;
+                    if (issue_valid[ISSUE_FP]  && (fp_idx  == iq_idx_t'(i))) cswhy_iq_picked = 1'b1;
+                end
+            end
+        end
+    end
+`endif
 
 endmodule: int_issue_queue
