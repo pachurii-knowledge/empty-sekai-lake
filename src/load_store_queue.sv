@@ -812,7 +812,20 @@ module load_store_queue
         // stage was implicitly sequencing. A plain load at the head has all older ops
         // drained, so issuing it a cycle early cannot reorder against an older store.
         if (!xlate_ready && mem_req_valid && head_match && !xlate_stall &&
+`ifdef XLATE_BYPASS_ST
+                // XLATE_BYPASS_ST: admit PLAIN STORES too. (memRead||memWrite)&&!AMO ==
+                // {plain load, plain store}; AMO/LR/SC (EXEC_AMO) stay on the registered
+                // path (they carry reservation / commit-serialization state). A plain
+                // store captures store_lo_pa from xlate_pa_eff (:1171/:1182/:1187) and
+                // completes 1 cyc early on a DTLB HIT (the !xlate_stall gate above blocks
+                // the bypass on any walk, so a cross-page/miss beat falls to the unchanged
+                // registered/PTW+fault path). The memory WRITE is unchanged: it happens in
+                // program order at store_commit_fires, never at translate. This only
+                // shortens the head-completion window; nothing reorders.
+                (headq.entry.ctrl.memRead || headq.entry.ctrl.memWrite) &&
+`else
                 headq.entry.ctrl.memRead && !headq.entry.ctrl.memWrite &&
+`endif
                 (headq.entry.ctrl.exec_class != EXEC_AMO)
 `ifdef LSQ_MLP2
                 // BLOCKER 2: only bypass when the live translate is the HEAD's (the port

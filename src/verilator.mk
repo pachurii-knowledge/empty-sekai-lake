@@ -89,6 +89,10 @@ ifeq ($(PERF),1)
 	BIG_LSQ := 1
 	BTB := 1
 	XLATE_BYPASS := 1
+	# 2026-07-24: store-translate bypass folded in (gauntlet-green: Dhrystone +12.1%,
+	# Embench geomean +4.2%; ACT rv64 289 + rv32 247, Sv39 zero-regression + Sv32 28/28,
+	# riscv-dv 15/15 lockstep). Requires XLATE_BYPASS (set above). Fmax-costly like it.
+	XLATE_BYPASS_ST := 1
 	FP_OOO := 1
 	ALU4 := 1
 	LSQ_MLP2 := 1
@@ -229,6 +233,21 @@ endif
 # path (Fmax cost). Default OFF is bit-identical (all gated by -DXLATE_BYPASS). OOO only.
 ifeq ($(XLATE_BYPASS),1)
 	VERILATOR_CFLAGS += -DXLATE_BYPASS
+endif
+
+# XLATE_BYPASS_ST=1 (-DXLATE_BYPASS_ST): extend the XLATE_BYPASS DTLB-hit bypass from plain
+# LOADS to plain STORES -- a store completes/captures its PA the cycle it presents instead of
+# eating the FB2b registered-translate +1 bubble (CSWHY: stores spend 58467 cyc = 14.6% of
+# cs_latency in the registered-translate stage). AMO/LR/SC stay on the registered path
+# (reservation/commit-serialization state). The store WRITE is unchanged: in program order at
+# store_commit_fires. REQUIRES XLATE_BYPASS (the bypass block is gated on it). Same
+# functional-sim/Fmax character as XLATE_BYPASS -> an FPGA/ASIC build drops it. Default OFF is
+# bit-identical (the -else arm is the verbatim prior loads-only condition). OOO only.
+ifeq ($(XLATE_BYPASS_ST),1)
+ifneq ($(XLATE_BYPASS),1)
+$(error XLATE_BYPASS_ST=1 requires XLATE_BYPASS=1 (it extends the loads-only translate bypass to stores))
+endif
+	VERILATOR_CFLAGS += -DXLATE_BYPASS_ST
 endif
 
 # CF_OOO=1 (-DCF_OOO): out-of-order control-flow issue. The baseline (int_issue_queue.sv)
